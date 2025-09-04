@@ -27,8 +27,6 @@ class DragonConfig(PretrainedConfig):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 8192):
             Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 36):
-            Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the Transformer encoder.
         num_key_value_heads (`int`, *optional*, defaults to 8):
@@ -99,8 +97,7 @@ class DragonConfig(PretrainedConfig):
         hidden_size=2048,
         intermediate_size=8192,
         expand_factor=2,
-        num_hidden_layers=36,
-        num_global_layers=4,
+        layers_config=4*"lrdlr",
         num_attention_heads=32,
         num_key_value_heads=8,
         mlp_hidden_act="relu2",
@@ -122,7 +119,6 @@ class DragonConfig(PretrainedConfig):
         uscaling_tau=0.2,
         attention_dropout=0.,
         hidden_dropout=0.,
-        use_gdn_kernels=True,
         gdn_d_conv=4,
         gdn_dt_min=0.001,
         gdn_dt_max=0.1,
@@ -133,7 +129,6 @@ class DragonConfig(PretrainedConfig):
 
         self.rope_theta = rope_theta_local
         self.qk_norm = True
-        self._attn_implementation = "flash_attention_2"
         self.softcap_local_attn=softcap_local_attn
         self.softcap_global_attn=softcap_global_attn
         self.use_uscaling = use_uscaling
@@ -145,9 +140,7 @@ class DragonConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.expand_factor = expand_factor
-        self.num_hidden_layers = num_hidden_layers
-        self.layers_config = "lrlrdlrlr" * 4 # 36 layers with 4 diff attention in the middle of 8 local attention layers with kv_sharing
-        #TODO: either use this OR num_global_layers. not both.
+        self.layers_config = layers_config
         self.num_attention_heads = num_attention_heads
         self.sliding_window_size = sliding_window_size
         self.attention_dropout = attention_dropout
@@ -186,3 +179,5 @@ class DragonConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+# todo : update docstrings
