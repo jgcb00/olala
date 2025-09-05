@@ -543,7 +543,7 @@ class DragonAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[HybridDragonAttentionDynamicCache] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_swa=True,
+        window_size: Optional[int] = None,
         **kwargs,
     ):
         # Q, K, V projections.
@@ -594,7 +594,7 @@ class DragonAttention(nn.Module):
             key_states.bfloat16(),
             value_states.bfloat16(),
             causal=True,
-            window_size=(self.window_size, self.window_size) if use_swa else None,
+            window_size=(min(window_size, self.window_size), 0) if window_size is not None else (self.window_size, 0),
             softcap=self.config.softcap_local_attn,
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
             **kwargs,
@@ -720,6 +720,7 @@ class DragonDifferentialAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[HybridDragonAttentionDynamicCache] = None,
+        window_size: Optional[int] = None,
         **kwargs,
     ):
         # Q, K, V projections.
@@ -736,8 +737,10 @@ class DragonDifferentialAttention(nn.Module):
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
             _, T, _, _ = query_states.shape
-            log_pos = torch.arange(start_pos+1, start_pos+T+1, device=query_states.device).view(1, T, 1, 1).float().log()
+            pos = torch.arange(start_pos+1, start_pos+T+1, device=query_states.device).view(1, T, 1, 1).float()
+            log_pos = pos.log() if window_size <= 0 else torch.clamp_max(pos, window_size).log()
             query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
+            # TODO: caching mechanism for log_pos
 
         # KV-cache.
         if cache_params is not None:
@@ -749,8 +752,22 @@ class DragonDifferentialAttention(nn.Module):
         key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
         # compute
         if DIFF_ATTN_IMPL == "flex_head":
-            y1 = flex_head_fa.flash_attn_func(query1_states.bfloat16(), key1_states.bfloat16(), value_states.bfloat16(), causal=True, softcap=self.softcap, softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
-            y2 = flex_head_fa.flash_attn_func(query2_states.bfloat16(), key2_states.bfloat16(), value_states.bfloat16(), causal=True, softcap=self.softcap, softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
+            y1 = flex_head_fa.flash_attn_func(
+                query1_states.bfloat16(),
+                key1_states.bfloat16(),
+                value_states.bfloat16(),
+                causal=True,
+                window_size=(window_size, 0) if window_size is not None else None,
+                softcap=self.softcap,
+                softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
+            y2 = flex_head_fa.flash_attn_func(
+                query2_states.bfloat16(),
+                key2_states.bfloat16(),
+                value_states.bfloat16(),
+                causal=True,
+                window_size=(window_size, 0) if window_size is not None else None,
+                softcap=self.softcap,
+                softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
             lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H)
             lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H)
             lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
@@ -989,6 +1006,7 @@ class DragonBlock(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        window_size: Optional[int] = None,
         **kwargs,
     ):
         # MIXER.
@@ -1000,6 +1018,7 @@ class DragonBlock(GradientCheckpointingLayer):
             position_ids=position_ids,
             cache_params=cache_params,
             key_value_last_layer=key_value_last_layer,
+            window_size=window_size,
         ) # (B, L, E*D)
         y_lin_attn = self.lin_attn(
             hidden_states=hidden_states,
@@ -1007,7 +1026,7 @@ class DragonBlock(GradientCheckpointingLayer):
         ) # (B, L, E*D)
         y_attn = self.attn_group_norm(y_attn).view(y_attn.size(0), y_attn.size(1), -1)
         y_lin_attn = self.lin_attn_group_norm(y_lin_attn).view(y_lin_attn.size(0), y_lin_attn.size(1), -1)
-        y_mixer = self.mixer_proj(self.sqrt_2_2 * (y_attn + y_attn))
+        y_mixer = self.mixer_proj(self.sqrt_2_2 * (y_attn + y_lin_attn))
         hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mixer
 
         # MLP.
@@ -1106,6 +1125,7 @@ class DragonModel(DragonPreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         past_key_values: Optional[HybridDragonAttentionDynamicCache] = None,
@@ -1152,7 +1172,7 @@ class DragonModel(DragonPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         shared_kv = (None, None)
-        for i, block in enumerate(self.layers):
+        for block in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1163,6 +1183,7 @@ class DragonModel(DragonPreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 key_value_last_layer=shared_kv,
+                window_size=window_size,
                 **kwargs,
             )
             shared_kv = (last_k, last_v)
@@ -1199,6 +1220,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
         **kwargs,
     ) -> DragonCausalLMOutput:
         """
@@ -1220,7 +1242,8 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             inputs_embeds=inputs_embeds,
             output_hidden_states=output_hidden_states,
-            **kwargs,   
+            window_size=window_size,
+            **kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
