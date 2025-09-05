@@ -17,7 +17,7 @@ from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.utils import ModelOutput, logging
 
-from dragon.configuration_dragon import DragonConfig
+from .configuration_dragon import DragonConfig
 
 logger = logging.get_logger(__name__)
 
