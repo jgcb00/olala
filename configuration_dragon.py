@@ -115,6 +115,7 @@ class DragonConfig(PretrainedConfig):
         bos_token_id=1,
         eos_token_id=2,
         sliding_window_size=1024,
+        slw_wsize=-1,
         rope_theta_local=163.,
         uscaling_tau=0.2,
         attention_dropout=0.,
@@ -143,6 +144,7 @@ class DragonConfig(PretrainedConfig):
         self.layers_config = layers_config
         self.num_attention_heads = num_attention_heads
         self.sliding_window_size = sliding_window_size
+        self.slw_wsize = slw_wsize
         self.attention_dropout = attention_dropout
         self.hidden_dropout = hidden_dropout
 
