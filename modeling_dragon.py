@@ -279,11 +279,8 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
         k: torch.Tensor, # (B, L, h, D)
         v: torch.Tensor, # (B, L, h, D)
         layer_idx: int,
-        cache_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+    ):
         added_len = k.size(1)
-
         # grab cache
         k_cache = self._key_cache[layer_idx]
         v_cache = self._value_cache[layer_idx]
@@ -293,18 +290,20 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
         else:
             k_cache = torch.cat([k_cache, k], dim=1)
             v_cache = torch.cat([v_cache, v], dim=1)
-        # discard old keys/values
-        window_size = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
-        if self.layers_config[layer_idx] == 'l':
-            if k_cache.size(1) > window_size:
-                k_cache = k_cache[:, -window_size:, ...].contiguous()
-                v_cache = v_cache[:, -window_size:, ...].contiguous()
         # save cache
         self._key_cache[layer_idx] = k_cache
         self._value_cache[layer_idx] = v_cache
         # update cache length
         self.past_length[layer_idx] += added_len
         return k_cache, v_cache
+
+    def trim(self, layer_idx: int):
+        # discard old keys/values
+        window_size = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
+        if self.layers_config[layer_idx] == 'l':
+            if self._key_cache[layer_idx].size(1) > window_size:
+                self._key_cache[layer_idx] = self._key_cache[layer_idx][:, -window_size:, ...].contiguous()
+                self._value_cache[layer_idx] = self._value_cache[layer_idx][:, -window_size:, ...].contiguous()
 
     def update_ssm_cache(
         self,
@@ -596,6 +595,9 @@ class DragonAttention(nn.Module):
             **kwargs,
         )
 
+        if cache_params is not None and not self.reuse_kv:
+            cache_params.trim(self.layer_idx)
+
         return attn_output, last_key_states, last_value_states
 
 # heavily adapted from official differential attention implementation
@@ -773,6 +775,9 @@ class DragonDifferentialAttention(nn.Module):
             raise NotImplementedError()
         elif DIFF_ATTN_IMPL == "eager":
             raise NotImplementedError()
+
+        if cache_params is not None:
+            cache_params.trim(self.layer_idx)
 
         return attn_output, None, None
 
@@ -1258,3 +1263,4 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
         )
+DragonForCausalLM.register_for_auto_class("AutoModelForCausalLM")
