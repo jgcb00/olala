@@ -327,7 +327,7 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
             self.v_conv_states[layer_idx],
             self.ssm_states[layer_idx],
         )
-    
+
     def get_total_seen(self, layer_idx: int) -> int:
         return self.past_length[layer_idx]
 
@@ -338,70 +338,41 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
     def from_legacy_cache(cls, cache_params: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
         raise NotImplementedError("HybridDragonAttentionDynamicCache does not have a legacy cache equivalent.")
 
+class DragonRotaryEmbedding(torch.nn.Module):
+    def __init__(self, config: DragonConfig, head_dim: int):
+        super().__init__()
+
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        self.seq_len_cached = 0
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x, position_ids):
+        max_pos = int(position_ids.max().item()) + 1
+        if max_pos > self.seq_len_cached:
+            self.seq_len_cached = max(2 * max_pos, 16)
+            t = torch.arange(self.seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().to(torch.bfloat16)
+            self.sin_cached = freqs.sin().to(torch.bfloat16)
+
+        cos = self.cos_cached[position_ids] # (B, T, head_dim/2)
+        sin = self.sin_cached[position_ids]
+        cos = cos[..., None, :]       # (B, T, 1, head_dim/2), broadcasts over heads
+        sin = sin[..., None, :]
+
+        return cos, sin
+
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4 # multihead attention
-    d = x.shape[3] // 2
+    d = x.shape[3]//2 # head dim
     x1 = x[..., :d]
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
-
-class DragonRotaryEmbedding(nn.Module):
-    def __init__(self, config: DragonConfig, head_dim: int):
-        super().__init__()
-        self.half_dim = head_dim // 2
-
-        inv = torch.arange(0, self.half_dim, dtype=torch.float32)
-        self.register_buffer("inv_freq", 1.0 / (config.rope_theta ** (inv / self.half_dim)), persistent=False)
-
-        self.seq_len_cached = 0
-        self.register_buffer("cos_cached", None, persistent=False)
-        self.register_buffer("sin_cached", None, persistent=False)
-
-    @torch.no_grad()
-    def _maybe_grow_cache(self, total_len: int, device, dtype=torch.bfloat16):
-        if total_len <= self.seq_len_cached:
-            return
-        new_len = max(2 * total_len, 16)
-        t = torch.arange(new_len, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)  # [new_len, half_dim]
-        cos = freqs.cos().to(dtype)
-        sin = freqs.sin().to(dtype)
-        self.cos_cached = cos
-        self.sin_cached = sin
-        self.seq_len_cached = new_len
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
-        """
-        x: [B, L, ...]
-        position_ids: [B, L]
-        """
-        B, L = position_ids.shape
-        device = x.device
-        #x_dtype = x.dtype
-
-        start_pos = int(position_ids.min().item())
-        contiguous = (
-            position_ids.max().item() == start_pos + L - 1
-            and (position_ids[:, 0] == start_pos).all()
-            and (position_ids == (start_pos + torch.arange(L, device=device)[None, :])).all()
-        )
-
-        total_len = start_pos + L if contiguous else int(position_ids.max().item()) + 1
-        self._maybe_grow_cache(total_len, device=device)
-
-        if contiguous:
-            cos = self.cos_cached[start_pos:start_pos+L].unsqueeze(0).unsqueeze(2)
-            sin = self.sin_cached[start_pos:start_pos+L].unsqueeze(0).unsqueeze(2)
-        else:
-            idx = position_ids.to(torch.long)
-            cos = self.cos_cached.index_select(0, idx.reshape(-1)).view(B, L, self.half_dim).unsqueeze(2)
-            sin = self.sin_cached.index_select(0, idx.reshape(-1)).view(B, L, self.half_dim).unsqueeze(2)
-
-        #return cos.to(dtype=x_dtype), sin.to(dtype=x_dtype)
-        return cos, sin
 
 # heavily adapated from Gemma3
 def eager_attention_forward(
@@ -566,7 +537,7 @@ class DragonAttention(nn.Module):
         if not self.reuse_kv:
             key_states = apply_rotary_emb(key_states, cos, sin)
 
-        # KV-cache. # todo: why putting a kv cache makes the computations wrong ?????????? discuss with JG
+        # KV-cache.
         if not self.reuse_kv and cache_params is not None:
             key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
 
@@ -730,11 +701,10 @@ class DragonDifferentialAttention(nn.Module):
             key_states = self.k_norm(key_states)
 
         # scalable softmax.
-        start_pos = 0 if cache_params is None else cache_params.get_total_seen(self.layer_idx)
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            _, T, _, _ = query_states.shape
-            pos = torch.arange(start_pos+1, start_pos+T+1, device=query_states.device).view(1, T, 1, 1).float()
+            T = query_states.size(1)
+            pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
             log_pos = pos.log() if self.config.slw_wsize <= 0 else torch.clamp_max(pos, self.config.slw_wsize).log()
             query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
             # TODO: caching mechanism for log_pos
@@ -1220,14 +1190,6 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> DragonCausalLMOutput:
-        """
-        print("fwd")
-        print(past_key_values is None)
-        if past_key_values is not None:
-            print(type(past_key_values))
-            print(past_key_values)
-        """
-
         output_hidden_states = (output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states)
 
         outputs: DragonOutput = self.model(
