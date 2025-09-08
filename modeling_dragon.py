@@ -966,7 +966,7 @@ class DragonBlock(GradientCheckpointingLayer):
         self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
         self.mlp = DragonMLP(config)
 
-        self.register_buffer("lns", torch.tensor(1.0) if config.use_uscaling else torch.tensor(1. / math.sqrt(layer_idx+1)))
+        self.register_buffer("lns", torch.tensor(1.0 if config.use_uscaling else 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))))
         self.register_buffer("sqrt_2_2", torch.tensor(math.sqrt(2)/2) if config.use_uscaling else torch.tensor(1/2))
         self.register_buffer("sqrt_tau", torch.sqrt(torch.tensor(self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0))
         self.register_buffer("sqrt_one_minus_tau", torch.sqrt(torch.tensor(1.0 - self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0))

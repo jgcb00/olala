@@ -124,6 +124,7 @@ class DragonConfig(PretrainedConfig):
         gdn_dt_max=0.1,
         gdn_dt_init_floor=1e-4,
         gdn_A_init_range=(1, 16),
+        old_lns=False,
         **kwargs,
     ):
 
@@ -167,6 +168,8 @@ class DragonConfig(PretrainedConfig):
         self.time_step_max = gdn_dt_max
         self.time_step_floor = gdn_dt_init_floor
         self.A_init_range = gdn_A_init_range
+
+        self.old_lns = old_lns
 
         assert self.hidden_size % self.num_attention_heads == 0
         assert self.num_attention_heads % self.num_key_value_heads == 0
