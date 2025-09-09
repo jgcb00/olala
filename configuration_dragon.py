@@ -142,6 +142,7 @@ class DragonConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.expand_factor = expand_factor
         self.layers_config = layers_config
+        self.num_hidden_layers = len(layers_config)
         self.num_attention_heads = num_attention_heads
         self.sliding_window_size = sliding_window_size
         self.slw_wsize = slw_wsize
