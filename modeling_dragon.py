@@ -46,6 +46,7 @@ try:
     DIFF_ATTN_IMPL = "flex_head"
 except ImportError:
     DIFF_ATTN_IMPL = ATTN_IMPL # if we don't have flex_head_fa, fallback to the best attention impl we have
+DIFF_ATTN_IMPL = ATTN_IMPL
 print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 
 # Gated DeltaNet
@@ -770,34 +771,6 @@ class DragonDifferentialAttention(nn.Module):
         lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
         lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
         attn_output = (y1 - lambda_full * y2).contiguous()
-    
-        """if DIFF_ATTN_IMPL == "flex_head":
-            y1 = flex_head_fa.flash_attn_func(
-                query1_states.bfloat16(),
-                key1_states.bfloat16(),
-                value_states.bfloat16(),
-                causal=True,
-                window_size=(self.config.slw_wsize, 0),
-                softcap=self.softcap,
-                softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
-            y2 = flex_head_fa.flash_attn_func(
-                query2_states.bfloat16(),
-                key2_states.bfloat16(),
-                value_states.bfloat16(),
-                causal=True,
-                window_size=(self.config.slw_wsize, 0),
-                softcap=self.softcap,
-                softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
-            lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H)
-            lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H)
-            lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
-            attn_output = (y1 - lambda_full * y2).contiguous()
-        elif DIFF_ATTN_IMPL == "fa2":
-            raise NotImplementedError()
-        elif DIFF_ATTN_IMPL == "fa3":
-            raise NotImplementedError()
-        elif DIFF_ATTN_IMPL == "eager":
-            raise NotImplementedError()"""
 
         if cache_params is not None:
             cache_params.trim(self.layer_idx)
