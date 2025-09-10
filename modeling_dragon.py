@@ -376,7 +376,7 @@ def apply_rotary_emb(x, cos, sin):
 
 # heavily adapated from Gemma3
 def eager_attention_forward(
-    module: nn.Module,
+    module: nn.Module, # TODO: remove module
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -545,7 +545,7 @@ class DragonAttention(nn.Module):
         if not self.reuse_kv:
             last_key_states, last_value_states = key_states, value_states
 
-        # attention computation.
+        # attention computation. # TODO: do that in init ?
         if ATTN_IMPL == "eager":
             attention_interface = lambda q, k, v, **kw: eager_attention_forward(self, q, k, v, **kw)
         elif ATTN_IMPL == "fa2":
@@ -718,7 +718,60 @@ class DragonDifferentialAttention(nn.Module):
         query1_states, query2_states = query_states[:, :, torch.arange(0, self.num_heads, 2)].contiguous(), query_states[:, :, torch.arange(1, self.num_heads, 2)].contiguous()
         key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
         # compute
+        # TODO: do that in init ?
         if DIFF_ATTN_IMPL == "flex_head":
+            def diff_attention_interface(q, k, v, **kw):
+                return flex_head_fa.flash_attn_func(q, k, v, **kw)
+        elif DIFF_ATTN_IMPL == "fa2":
+            def diff_attention_interface(q, k, v, **kw):
+                D = v.size(3)
+                v1 = v[:, :, :, :D//2]#.contiguous()
+                v2 = v[:, :, :, D//2:]#.contiguous()
+                o1 = flash_attn_func(q, k, v1, **kw)
+                o2 = flash_attn_func(q, k, v2, **kw)
+                o = torch.cat([o1, o2], dim=-1)
+                return o
+        elif DIFF_ATTN_IMPL == "fa3":
+            def diff_attention_interface(q, k, v, **kw):
+                D = v.size(3)
+                v1 = v[:, :, :, :D//2]#.contiguous()
+                v2 = v[:, :, :, D//2:]#.contiguous()
+                o1 = flash_attn_func(q, k, v1, **kw)[0]
+                o2 = flash_attn_func(q, k, v2, **kw)[0]
+                o = torch.cat([o1, o2], dim=-1)
+                return o
+        elif DIFF_ATTN_IMPL == "eager":
+            def diff_attention_interface(q, k, v, **kw):
+                D = v.size(3)
+                v1 = v[:, :, :, :D//2]#.contiguous()
+                v2 = v[:, :, :, D//2:]#.contiguous()
+                o1 = eager_attention_forward(self, q, k, v1, **kw)
+                o2 = eager_attention_forward(self, q, k, v2, **kw)
+                o = torch.cat([o1, o2], dim=-1)
+                return o
+
+        y1 = diff_attention_interface(
+            query1_states.bfloat16(),
+            key1_states.bfloat16(),
+            value_states.bfloat16(),
+            causal=True,
+            window_size=(self.config.slw_wsize, 0),
+            softcap=self.softcap,
+            softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
+        y2 = diff_attention_interface(
+            query2_states.bfloat16(),
+            key2_states.bfloat16(),
+            value_states.bfloat16(),
+            causal=True,
+            window_size=(self.config.slw_wsize, 0),
+            softcap=self.softcap,
+            softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
+        lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H/2)
+        lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
+        lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
+        attn_output = (y1 - lambda_full * y2).contiguous()
+    
+        """if DIFF_ATTN_IMPL == "flex_head":
             y1 = flex_head_fa.flash_attn_func(
                 query1_states.bfloat16(),
                 key1_states.bfloat16(),
@@ -744,7 +797,7 @@ class DragonDifferentialAttention(nn.Module):
         elif DIFF_ATTN_IMPL == "fa3":
             raise NotImplementedError()
         elif DIFF_ATTN_IMPL == "eager":
-            raise NotImplementedError()
+            raise NotImplementedError()"""
 
         if cache_params is not None:
             cache_params.trim(self.layer_idx)
