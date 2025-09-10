@@ -46,7 +46,6 @@ try:
     DIFF_ATTN_IMPL = "flex_head"
 except ImportError:
     DIFF_ATTN_IMPL = ATTN_IMPL # if we don't have flex_head_fa, fallback to the best attention impl we have
-DIFF_ATTN_IMPL = ATTN_IMPL
 print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 
 # Gated DeltaNet
@@ -81,6 +80,17 @@ class DragonRMSNorm(nn.RMSNorm):
         """
         super().__init__(normalized_shape=hidden_size, eps=eps)
 
+class _ScaleFB(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha_fwd: torch.Tensor, alpha_bwd: torch.Tensor):
+        ctx.save_for_backward(alpha_bwd)
+        return x * alpha_fwd
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (alpha_bwd,) = ctx.saved_tensors
+        return grad_output * alpha_bwd, None, None
+
 class _ScaledLinearFB(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, alpha_fwd, alpha_bwd_x, alpha_bwd_w):
@@ -113,8 +123,8 @@ class DragonLinear(nn.Linear):
         if not config.use_uscaling:
             alpha_fwd, alpha_bwd = 1, 1
 
-        self.register_buffer("alpha_fwd", torch.tensor(float(alpha_fwd)))
-        self.register_buffer("alpha_bwd", torch.tensor(float(alpha_bwd if alpha_bwd is not None else alpha_fwd)))
+        self.register_buffer("alpha_fwd", torch.tensor(float(alpha_fwd)), persistent=False)
+        self.register_buffer("alpha_bwd", torch.tensor(float(alpha_bwd if alpha_bwd is not None else alpha_fwd)), persistent=False)
 
     def forward(self, x):
         return _ScaledLinearFB.apply(x, self.weight, self.bias, self.alpha_fwd, self.alpha_bwd, self.alpha_bwd)
@@ -202,7 +212,7 @@ class DragonConv1D(nn.Conv1d):
             # [B, T]
             seq_idx = kwargs.get('seq_idx', None)
             x = causal_conv1d_fn(
-                x=x,
+                x=x.contiguous(),
                 weight=rearrange(self.weight, "d 1 w -> d w"),
                 bias=self.bias,
                 activation="silu",
@@ -221,7 +231,7 @@ class DragonConv1D(nn.Conv1d):
     ):
         shape = x.shape
         x = x.squeeze(0) if cu_seqlens is not None else x.squeeze(1)
-        if causal_conv1d_fn is not None:
+        if causal_conv1d_update is not None:
             x = causal_conv1d_update(
                 x=x,
                 conv_state=cache,
@@ -351,7 +361,7 @@ class DragonRotaryEmbedding(torch.nn.Module):
         self.sin_cached = None
 
     def forward(self, x, position_ids):
-        max_pos = int(position_ids.max().item()) + 1
+        max_pos = 10000 #int(position_ids.max().item()) + 1 # TODO
         if max_pos > self.seq_len_cached:
             self.seq_len_cached = max(2 * max_pos, 16)
             t = torch.arange(self.seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
@@ -679,7 +689,7 @@ class DragonDifferentialAttention(nn.Module):
         if self.scalable_softmax:
             self.softmax_scaler = nn.Parameter(torch.ones(self.num_heads, dtype=torch.float32))
 
-        self.register_buffer("lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * (layer_idx+1))))
+        self.register_buffer("lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * (layer_idx+1))), persistent=False)
         self.lambda_q1 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_k1 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_q2 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
@@ -958,7 +968,7 @@ class DragonMLP(nn.Module):
         super().__init__()
         self.fc_1 = DragonLinear(config, config.hidden_size, config.intermediate_size, bias=False)
         self.fc_2 = DragonLinear(config, config.intermediate_size, config.hidden_size, bias=False)
-        self.register_buffer("_2_sqrt_5", torch.tensor(2/math.sqrt(5)) if config.use_uscaling else torch.tensor(1.))
+        self.register_buffer("_2_sqrt_5", torch.tensor(2/math.sqrt(5)) if config.use_uscaling else torch.tensor(1.), persistent=False)
 
     def forward(self, hidden_states):
         hidden_states = self.fc_1(hidden_states)
@@ -992,10 +1002,10 @@ class DragonBlock(GradientCheckpointingLayer):
         self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
         self.mlp = DragonMLP(config)
 
-        self.register_buffer("lns", torch.tensor(1.0 if config.use_uscaling else 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))))
-        self.register_buffer("sqrt_2_2", torch.tensor(math.sqrt(2)/2) if config.use_uscaling else torch.tensor(1/2))
-        self.register_buffer("sqrt_tau", torch.sqrt(torch.tensor(self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0))
-        self.register_buffer("sqrt_one_minus_tau", torch.sqrt(torch.tensor(1.0 - self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0))
+        self.register_buffer("lns", torch.tensor(1.0 if config.use_uscaling else 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))), persistent=False)
+        self.register_buffer("sqrt_2_2", torch.tensor(math.sqrt(2)/2) if config.use_uscaling else torch.tensor(1/2), persistent=False)
+        self.register_buffer("sqrt_tau", torch.sqrt(torch.tensor(self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
+        self.register_buffer("sqrt_one_minus_tau", torch.sqrt(torch.tensor(1.0 - self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
 
     def forward(
         self,
@@ -1115,8 +1125,19 @@ class DragonModel(DragonPreTrainedModel):
         self.rotary_emb = DragonRotaryEmbedding(config, head_dim=(config.expand_factor*config.hidden_size)//config.num_attention_heads) # only for SWA
         self.final_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
 
+        alpha_fwd_out = 1. / float(self.config.hidden_size) if self.config.use_uscaling else 1.0
+        alpha_bwd_out = 1. / math.sqrt(float(self.config.hidden_size)) if self.config.use_uscaling else 1.0
+        self.register_buffer("alpha_fwd_out", torch.tensor(alpha_fwd_out), persistent=False)
+        self.register_buffer("alpha_bwd_out", torch.tensor(alpha_bwd_out), persistent=False)
+
         self.gradient_checkpointing = False
         self.post_init()
+    
+    def get_input_embeddings(self):
+        return self.embedding
+
+    def set_input_embeddings(self, new_embeddings):
+        self.embedding = new_embeddings
 
     def forward(
         self,
@@ -1183,6 +1204,7 @@ class DragonModel(DragonPreTrainedModel):
             shared_kv = (last_k, last_v)
 
         hidden_states = self.final_norm(hidden_states)
+        hidden_states = _ScaleFB.apply(hidden_states, self.alpha_fwd_out, self.alpha_bwd_out)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1192,14 +1214,15 @@ class DragonModel(DragonPreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
         )
+DragonModel.register_for_auto_class("AutoModel")
 
 class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
     def __init__(self, config: DragonConfig):
         super().__init__(config)
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=1/math.sqrt(config.hidden_size))
-
+        #self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=1/math.sqrt(config.hidden_size))
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
     def forward(
@@ -1252,3 +1275,5 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
         )
 DragonForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+
+__all__ = ["DragonModel", "DragonForCausalLM", "DragonPreTrainedModel"]

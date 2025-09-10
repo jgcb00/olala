@@ -184,5 +184,12 @@ class DragonConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        # TODO: better way to handle those?
+        self.auto_map = dict(getattr(self, "auto_map", {}))
+        self.auto_map.setdefault("AutoConfig", "configuration_dragon.DragonConfig")
+        self.auto_map.setdefault("AutoModel", "modeling_dragon.DragonModel")
+        self.auto_map.setdefault("AutoModelForCausalLM", "modeling_dragon.DragonForCausalLM")
+
 DragonConfig.register_for_auto_class("AutoConfig")
+__all__ = ["DragonConfig"]
 # todo : update docstrings
