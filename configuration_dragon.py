@@ -92,6 +92,7 @@ class DragonConfig(PretrainedConfig):
         self,
         vocab_size=151936,
         tie_word_embeddings=False,
+        max_position_embeddings=8192,
         use_uscaling=True,
         hidden_size=2048,
         intermediate_size=8192,
@@ -148,6 +149,7 @@ class DragonConfig(PretrainedConfig):
         self.slw_wsize = slw_wsize
         self.attention_dropout = attention_dropout
         self.hidden_dropout = hidden_dropout
+        self.max_position_embeddings = max_position_embeddings
 
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads

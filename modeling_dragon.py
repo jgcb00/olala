@@ -352,6 +352,7 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
 class DragonRotaryEmbedding(torch.nn.Module):
     def __init__(self, config: DragonConfig, head_dim: int):
         super().__init__()
+        self.config = config
 
         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -361,7 +362,7 @@ class DragonRotaryEmbedding(torch.nn.Module):
         self.sin_cached = None
 
     def forward(self, x, position_ids):
-        max_pos = 10000 #int(position_ids.max().item()) + 1 # TODO
+        max_pos = self.config.max_position_embeddings
         if max_pos > self.seq_len_cached:
             self.seq_len_cached = max(2 * max_pos, 16)
             t = torch.arange(self.seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
