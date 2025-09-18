@@ -1,5 +1,7 @@
 # coding=utf-8
 """Dragon model configuration"""
+# TODO : TP (cf qwen)
+# TODO : init
 
 import re
 
