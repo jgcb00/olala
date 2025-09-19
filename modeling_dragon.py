@@ -815,12 +815,11 @@ class DragonGatedDeltaNet(nn.Module):
 
         self.dk = self.head_k_dim
         self.dv = self.head_v_dim # todo : duplicate variables
-        self.per_head_proj = 2*self.dk + self.dv + 2 # [q k v b a] per head
+        self.per_head_proj = 2*self.dk + self.dv + 2 + self.dv # [q k v b a g] per head
         in_proj_dim_global = self.n_heads * self.per_head_proj
 
         # todo: rename d_head => head_dim (for consistency with other classes)
-
-        self.in_proj = DragonLinear(config, config.hidden_size, in_proj_dim_global, bias=False)
+        self.in_gate_proj = DragonLinear(config, config.hidden_size, in_proj_dim_global, bias=False)
 
         dt_min = config.time_step_min
         dt_max = config.time_step_max
@@ -857,7 +856,6 @@ class DragonGatedDeltaNet(nn.Module):
                 kernel_size=self.conv_size,
             )
 
-        self.g_proj = DragonLinear(config, config.hidden_size, config.hidden_size*config.expand_factor, bias=False)
         self.act_func_gate = F.silu
 
     def forward(self,
@@ -870,15 +868,16 @@ class DragonGatedDeltaNet(nn.Module):
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
         # input projection (TP-aware)
-        qkvba = self.in_proj(hidden_states) # (l, b, H_local * per_head_proj)
+        qkvbag = self.in_gate_proj(hidden_states) # (l, b, H_local * per_head_proj)
         # [L,B,(H*P)] -> [B,L,H,P]
-        qkvba = rearrange(qkvba, "b l (h p) -> b l h p", h=self.n_heads_local).contiguous()
+        qkvbag = rearrange(qkvbag, "b l (h p) -> b l h p", h=self.n_heads_local).contiguous()
         # split per head: [B,L,H,dk/dk/dv/1/1]
-        q_proj = qkvba[..., 0:self.dk]
-        k_proj = qkvba[..., self.dk:2*self.dk]
-        v_proj = qkvba[..., 2*self.dk:2*self.dk+self.dv]
-        b_proj = qkvba[..., 2*self.dk+self.dv:2*self.dk+self.dv+1]
-        a_proj = qkvba[..., 2*self.dk+self.dv+1:]  
+        q_proj = qkvbag[..., 0:self.dk]
+        k_proj = qkvbag[..., self.dk:2*self.dk]
+        v_proj = qkvbag[..., 2*self.dk:2*self.dk+self.dv]
+        b_proj = qkvbag[..., 2*self.dk+self.dv:2*self.dk+self.dv+1]
+        a_proj = qkvbag[..., 2*self.dk+self.dv+1:2*self.dk+self.dv+2]
+        g_proj = qkvbag[..., 2*self.dk+self.dv+2:]
         # concat for conv
         q_proj = rearrange(q_proj, "b l h d -> b l (h d)")
         k_proj = rearrange(k_proj, "b l h d -> b l (h d)")
@@ -950,8 +949,7 @@ class DragonGatedDeltaNet(nn.Module):
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        g = self.g_proj(hidden_states).view(o.size(0), o.size(1), o.size(2), o.size(3)) # (B, L, H, D)
-        o = o * self.act_func_gate(g)
+        o = o * self.act_func_gate(g_proj)
 
         if cache_params is not None:
             cache_params.update_ssm_cache(
