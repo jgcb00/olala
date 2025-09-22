@@ -843,18 +843,8 @@ class DragonGatedDeltaNet(nn.Module):
         A_log = torch.log(A)  # Keep A_log in fp32
         self.A_log = nn.Parameter(A_log)
 
-        self.q_conv1d = DragonConv1D(
-                hidden_size=self.key_dim,
-                kernel_size=self.conv_size,
-            )
-        self.k_conv1d = DragonConv1D(
-                hidden_size=self.key_dim,
-                kernel_size=self.conv_size,
-            )
-        self.v_conv1d = DragonConv1D(
-                hidden_size=self.value_dim,
-                kernel_size=self.conv_size,
-            )
+        self.qkv_hidden = self.key_dim + self.key_dim + self.value_dim
+        self.qkv_conv1d = DragonConv1D(hidden_size=self.qkv_hidden, kernel_size=self.conv_size)
 
         self.act_func_gate = F.silu
 
@@ -885,25 +875,25 @@ class DragonGatedDeltaNet(nn.Module):
         b_proj = rearrange(b_proj, "b l h d -> b l (h d)") # d=1
         a_proj = rearrange(a_proj, "b l h d -> b l (h d)")
 
+        qkv_in = torch.cat([q_proj, k_proj, v_proj], dim=-1) # [B, L, qd+kd+vd] # TODO we deconcat and then concat...
+
+        qkv_cache = None
         q_conv_cache, k_conv_cache, v_conv_cache, ssm_cache = (None, None, None, None)
         if cache_params is not None:
             q_conv_cache, k_conv_cache, v_conv_cache, ssm_cache = cache_params.get_ssm_cache(self.layer_idx)
+            if q_conv_cache is not None:
+                qkv_cache = torch.cat([q_conv_cache, k_conv_cache, v_conv_cache], dim=1) # [N, qd+kd+vd, W] 
+            # TODO: update caching mechanism to avoid concat/split of the cache
 
-        q, q_conv_cache = self.q_conv1d(
-            x=q_proj,
-            mask=None, 
-            cache=q_conv_cache,
-            output_final_state=(cache_params is not None))
-        k, k_conv_cache = self.k_conv1d(
-            x=k_proj,
+        y, qkv_cache = self.qkv_conv1d(
+            x=qkv_in,
             mask=None,
-            cache=k_conv_cache,
-            output_final_state=(cache_params is not None))
-        v, v_conv_cache = self.v_conv1d(
-            x=v_proj,
-            mask=None,
-            cache=v_conv_cache,
-            output_final_state=(cache_params is not None))
+            cache=qkv_cache,
+            output_final_state=(cache_params is not None)
+        )
+
+        # split back
+        q, k, v = torch.split(y, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
 
         # back to per-head for kernels
         q = rearrange(q, "b l (h d) -> b l h d", d=self.dk)
@@ -952,10 +942,13 @@ class DragonGatedDeltaNet(nn.Module):
         o = o * self.act_func_gate(g_proj)
 
         if cache_params is not None:
+            q_cache_new, k_cache_new, v_cache_new = torch.split(
+                qkv_cache, [self.key_dim, self.key_dim, self.value_dim], dim=1
+            )
             cache_params.update_ssm_cache(
-                q_conv_states=q_conv_cache,
-                k_conv_states=k_conv_cache,
-                v_conv_states=v_conv_cache,
+                q_conv_states=q_cache_new,
+                k_conv_states=k_cache_new,
+                v_conv_states=v_cache_new,
                 ssm_states=ssm_cache,
                 layer_idx=self.layer_idx,
             )
