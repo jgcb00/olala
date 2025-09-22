@@ -1117,11 +1117,6 @@ class DragonModel(DragonPreTrainedModel):
         self.rotary_emb = DragonRotaryEmbedding(config, head_dim=(config.expand_factor*config.hidden_size)//config.num_attention_heads) # only for SWA
         self.final_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
 
-        alpha_fwd_out = 1. / float(self.config.hidden_size) if self.config.use_uscaling else 1.0
-        alpha_bwd_out = 1. / math.sqrt(float(self.config.hidden_size)) if self.config.use_uscaling else 1.0
-        self.register_buffer("alpha_fwd_out", torch.tensor(alpha_fwd_out), persistent=False)
-        self.register_buffer("alpha_bwd_out", torch.tensor(alpha_bwd_out), persistent=False)
-
         self.gradient_checkpointing = False
         self.post_init()
     
@@ -1196,7 +1191,6 @@ class DragonModel(DragonPreTrainedModel):
             shared_kv = (last_k, last_v)
 
         hidden_states = self.final_norm(hidden_states)
-        hidden_states = _ScaleFB.apply(hidden_states, self.alpha_fwd_out, self.alpha_bwd_out)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1213,8 +1207,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
-        #self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=1/math.sqrt(config.hidden_size))
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=1/math.sqrt(config.hidden_size))
         self.post_init()
 
     def forward(

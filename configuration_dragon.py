@@ -10,7 +10,6 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-#@register_for_auto_class("AutoConfig")
 class DragonConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`DragonModel`]. It is used to instantiate a
