@@ -22,6 +22,7 @@ from .configuration_dragon import DragonConfig
 logger = logging.get_logger(__name__)
 
 ATTN_IMPL = "eager"
+"""
 try:
     from flash_attn import flash_attn_func # FA2
     ATTN_IMPL = "fa2"
@@ -38,8 +39,13 @@ except ImportError:
             "Flash attention is not installed, using eager attention implementation. "
             "For better performance, consider installing flash_attn."
         )
+try: # TODO: eager > flash > flex ? or eager > flex > flash ?
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
+    flex_attention = torch.compile(flex_attention)
+    ATTN_IMPL = "flex"
+except ImportError:
+    print("Uh oh.")"""
 print(f"Using attention implementation: {ATTN_IMPL}")
-
 DIFF_ATTN_IMPL = None
 try:
     import flex_head_fa
@@ -79,17 +85,6 @@ class DragonRMSNorm(nn.RMSNorm):
         DragonRMSNorm is equivalent to RMSNorm
         """
         super().__init__(normalized_shape=hidden_size, eps=eps)
-
-class _ScaleFB(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha_fwd: torch.Tensor, alpha_bwd: torch.Tensor):
-        ctx.save_for_backward(alpha_bwd)
-        return x * alpha_fwd
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (alpha_bwd,) = ctx.saved_tensors
-        return grad_output * alpha_bwd, None, None
 
 class _ScaledLinearFB(torch.autograd.Function):
     @staticmethod
@@ -520,6 +515,25 @@ class DragonAttention(nn.Module):
             if not reuse_kv:
                 self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon)
 
+        if ATTN_IMPL == "flex":
+            # score mod (for softcap)
+            def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+                if self.config.softcap_local_attn > 0.:
+                    score = self.config.softcap_local_attn * torch.tanh(score / self.config.softcap_local_attn)
+                return score
+            self.score_mod = score_mod
+            # block mask (for causal & sliding window)
+            def build_mask(wsize):
+                def sliding_window(b, h, q_idx, kv_idx):
+                    return q_idx - kv_idx <= wsize
+                def causal_mask(b, h, q_idx, kv_idx):
+                    return q_idx >= kv_idx
+                attn_mask = and_masks(causal_mask, sliding_window)
+                self.block_mask = create_block_mask(attn_mask, B=None, H=None, Q_LEN=self.config.max_position_embeddings, KV_LEN=self.config.max_position_embeddings)
+                return wsize
+            self.build_mask = build_mask
+            self.last_wsize = self.build_mask(min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -558,12 +572,17 @@ class DragonAttention(nn.Module):
             last_key_states, last_value_states = key_states, value_states
 
         # attention computation. # TODO: do that in init ?
+        wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
         if ATTN_IMPL == "eager":
-            attention_interface = lambda q, k, v, **kw: eager_attention_forward(self, q, k, v, **kw)
+            attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(self, q, k, v, window_size=(window_size, 0), **kw)
+        elif ATTN_IMPL == "flex":
+            if wsize != self.last_wsize:
+                self.last_wsize = self.build_mask(wsize)
+            attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            attention_interface = lambda q, k, v, **kw: flash_attn_func(q, k, v, **kw)
+            attention_interface = lambda q, k, v, window_size, **kw: flash_attn_func(q, k, v, window_size=(window_size, 0), **kw)
         elif ATTN_IMPL == "fa3":
-            attention_interface = lambda q, k, v, **kw: flash_attn_func(q, k, v, **kw)[0]
+            attention_interface = lambda q, k, v, window_size, **kw: flash_attn_func(q, k, v, window_size=(window_size, 0), **kw)[0]
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
@@ -572,7 +591,7 @@ class DragonAttention(nn.Module):
             key_states.bfloat16(),
             value_states.bfloat16(),
             causal=True,
-            window_size=(min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size, 0),
+            window_size=wsize,
             softcap=self.config.softcap_local_attn,
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
             **kwargs,
