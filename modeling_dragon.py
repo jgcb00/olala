@@ -21,31 +21,32 @@ from .configuration_dragon import DragonConfig
 
 logger = logging.get_logger(__name__)
 
+# attention backend selection
 ATTN_IMPL = "eager"
-"""
 try:
-    from flash_attn import flash_attn_func # FA2
-    ATTN_IMPL = "fa2"
+    import flash_attn_interface # FA3
+    flash_attn_func = flash_attn_interface.flash_attn_func
+    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+    if not _flash_supports_window_size:
+        raise ImportError("flash_attn_func does not support window_size parameter. Please update to more recent flash_attn version")
+    ATTN_IMPL = "fa3"
 except ImportError:
     try:
-        import flash_attn_interface # FA3
-        flash_attn_func = flash_attn_interface.flash_attn_func
-        _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
-        if not _flash_supports_window_size:
-            raise ImportError("flash_attn_func does not support window_size parameter. Please update to more recent flash_attn version")
-        ATTN_IMPL = "fa3"
+        from flash_attn import flash_attn_func # FA2
+        ATTN_IMPL = "fa2"
     except ImportError:
-        logger.warning_once(
-            "Flash attention is not installed, using eager attention implementation. "
-            "For better performance, consider installing flash_attn."
-        )
-try: # TODO: eager > flash > flex ? or eager > flex > flash ?
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
-    flex_attention = torch.compile(flex_attention)
-    ATTN_IMPL = "flex"
-except ImportError:
-    print("Uh oh.")"""
+        try:
+            from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
+            flex_attention = torch.compile(flex_attention)
+            ATTN_IMPL = "flex"
+        except Exception:
+            logger.warning_once(
+                "Neither Flash Attention nor Flex Attention is not installed, using eager attention implementation. "
+                "For better performance, consider installing flash-attention (https://github.com/Dao-AILab/flash-attention)."
+            )
 print(f"Using attention implementation: {ATTN_IMPL}")
+
+# differential attention backend selection
 DIFF_ATTN_IMPL = None
 try:
     import flex_head_fa
@@ -54,14 +55,14 @@ except ImportError:
     DIFF_ATTN_IMPL = ATTN_IMPL # if we don't have flex_head_fa, fallback to the best attention impl we have
 print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 
-# Gated DeltaNet
+# Gated DeltaNet backend selection
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 except ImportError:
     logger.warning_once("Falling back to Torch implementation for Gated DeltaNet as flash-linear-attention module was not found.")
     chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
 
-# 1D short convolution
+# 1D short convolution backend selection
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
@@ -383,7 +384,6 @@ def apply_rotary_emb(x, cos, sin):
 
 # heavily adapated from Gemma3
 def eager_attention_forward(
-    module: nn.Module, # TODO: remove module
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -394,18 +394,20 @@ def eager_attention_forward(
     **kwargs,
 ) -> torch.Tensor:
     if softmax_scale is None:
-        softmax_scale = module.head_dim**-0.5
+        softmax_scale = query.size(3)**-0.5
+    if window_size == (-1, 0):
+        window_size = None
 
     query = query.transpose(1, 2) # (B, H, L, D)
-    key = key.transpose(1, 2) # (B, H, L, D)
-    value = value.transpose(1, 2) # (B, H, L, D)
+    key = key.transpose(1, 2) # (B, h, L, D)
+    value = value.transpose(1, 2) # (B, h, L, D)
 
-    key = key.repeat_interleave(module.num_heads // module.num_key_value_heads, dim=1)
-    value = value.repeat_interleave(module.num_heads // module.num_key_value_heads, dim=1)
+    key = key.repeat_interleave(query.size(1) // key.size(1), dim=1)
+    value = value.repeat_interleave(query.size(1) // value.size(1), dim=1)
 
     attn_weights = torch.matmul(query, key.transpose(2, 3)) * softmax_scale
 
-    if softcap is not None:
+    if softcap is not None and softcap > 0.:
         attn_weights = torch.tanh(attn_weights / softcap) * softcap
 
     if causal or (window_size is not None):
@@ -524,6 +526,8 @@ class DragonAttention(nn.Module):
             self.score_mod = score_mod
             # block mask (for causal & sliding window)
             def build_mask(wsize):
+                if wsize == -1:
+                    wsize = self.config.max_position_embeddings
                 def sliding_window(b, h, q_idx, kv_idx):
                     return q_idx - kv_idx <= wsize
                 def causal_mask(b, h, q_idx, kv_idx):
@@ -574,15 +578,15 @@ class DragonAttention(nn.Module):
         # attention computation. # TODO: do that in init ?
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
         if ATTN_IMPL == "eager":
-            attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(self, q, k, v, window_size=(window_size, 0), **kw)
+            attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            attention_interface = lambda q, k, v, window_size, **kw: flash_attn_func(q, k, v, window_size=(window_size, 0), **kw)
+            attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "fa3":
-            attention_interface = lambda q, k, v, window_size, **kw: flash_attn_func(q, k, v, window_size=(window_size, 0), **kw)[0]
+            attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
@@ -591,90 +595,15 @@ class DragonAttention(nn.Module):
             key_states.bfloat16(),
             value_states.bfloat16(),
             causal=True,
-            window_size=wsize,
+            wsize=wsize,
             softcap=self.config.softcap_local_attn,
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
-            **kwargs,
         )
 
         if cache_params is not None and not self.reuse_kv:
             cache_params.trim(self.layer_idx)
 
         return attn_output, last_key_states, last_value_states
-
-# heavily adapted from official differential attention implementation
-"""def eager_differential_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
-    softcap: Optional[float] = None,
-    softmax_scale: Optional[float] = None,    
-    **kwargs,
-) -> torch.Tensor:
-    if softmax_scale is None:
-        softmax_scale = module.head_dim ** -0.5
-
-    B, H2, Lq, Dh = query.shape # H2 = 2 * H
-    H = module.num_heads
-    Hkv = module.num_key_value_heads
-    assert H2 == 2 * H, "query must have 2*num_heads heads"
-    assert key.shape[-1] == Dh, "key head_dim must match query"
-    assert value.shape[-1] == 2 * Dh, "value must have 2*head_dim"
-
-    # repeat K to 2H (for the two "channels") and V to H (final combined heads)
-    n_rep = H // Hkv
-    k_2H = repeat_kv(key, 2 * n_rep) # [B, 2H, Lk, Dh]
-    v_H  = repeat_kv(value, n_rep) # [B,  H, Lk, 2Dh]
-
-    # raw attention logits for the 2 channels
-    attn_weights = torch.matmul(query, k_2H.transpose(2, 3)) * softmax_scale  # [B, 2H, Lq, Lk]
-
-    if softcap is not None:
-        attn_weights = torch.tanh(attn_weights / softcap) * softcap
-
-    # masking (causal and/or sliding window)
-    if causal or (window_size is not None):
-        Lk = k_2H.size(2)
-        i = torch.arange(Lq, device=attn_weights.device).unsqueeze(1)  # [Lq,1]
-        j = torch.arange(Lk, device=attn_weights.device).unsqueeze(0)  # [1,Lk]
-        allowed = torch.ones((Lq, Lk), dtype=torch.bool, device=attn_weights.device)
-        if causal:
-            allowed &= (j <= i)
-        if window_size is not None:
-            w_left, w_right = window_size
-            if w_left is None:  w_left = Lk
-            if w_right is None: w_right = Lk
-            allowed &= (j >= i - w_left) & (j <= i + w_right)
-        attn_weights = attn_weights.masked_fill(~allowed, float("-inf"))
-
-    # softmax in fp32 then cast back
-    attn_probs = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype) # [B,2H,Lq,Lk]
-
-    # reshape to [B, H, 2, Lq, Lk] and combine the two channels with learned lambda
-    attn_probs = attn_probs.view(B, H, 2, Lq, -1)  # -1 = Lk
-
-
-
-    # per-head scalar lambdas: exp(<λ_q1,λ_k1>) - exp(<λ_q2,λ_k2>) + λ_init
-    lambda_1 = torch.exp(torch.sum(module.lambda_q1 * module.lambda_k1, dim=-1).float()).to(query.dtype)  # [H]
-    lambda_2 = torch.exp(torch.sum(module.lambda_q2 * module.lambda_k2, dim=-1).float()).to(query.dtype)  # [H]
-    lambda_full = (lambda_1 - lambda_2 + module.lambda_init).view(1, H, 1, 1)  # [1,H,1,1] for broadcast
-
-    combined_probs = attn_probs[:, :, 0] - lambda_full * attn_probs[:, :, 1]  # [B,H,Lq,Lk]
-
-    # weighted sum over V (note: V has 2*Dh per head)
-    attn = torch.matmul(combined_probs, v_H)  # [B,H,Lq,2Dh]
-
-    # sub-layer norm (or similar) then final scaling
-    attn = module.subln(attn)
-    attn = attn * (1 - module.lambda_init)
-
-    # (B,Lq,H*2Dh)
-    attn = attn.transpose(1, 2).contiguous().view(B, Lq, H * 2 * Dh)
-    return attn"""
 
 class DragonDifferentialAttention(nn.Module):
     """
@@ -715,6 +644,27 @@ class DragonDifferentialAttention(nn.Module):
         self.lambda_q2 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_k2 = torch.nn.Parameter(torch.zeros(self.head_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
 
+        if ATTN_IMPL == "flex":
+            # score mod (for softcap)
+            def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+                if self.config.softcap_global_attn > 0.:
+                    score = self.config.softcap_global_attn * torch.tanh(score / self.config.softcap_global_attn)
+                return score
+            self.score_mod = score_mod
+            # block mask (for causal & sliding window)
+            def build_mask(wsize):
+                if wsize == -1:
+                    wsize = self.config.max_position_embeddings
+                def sliding_window(b, h, q_idx, kv_idx):
+                    return q_idx - kv_idx <= wsize
+                def causal_mask(b, h, q_idx, kv_idx):
+                    return q_idx >= kv_idx
+                attn_mask = and_masks(causal_mask, sliding_window)
+                self.block_mask = create_block_mask(attn_mask, B=None, H=None, Q_LEN=self.config.max_position_embeddings, KV_LEN=self.config.max_position_embeddings)
+                return wsize
+            self.build_mask = build_mask
+            self.last_wsize = self.build_mask(self.config.slw_wsize)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -731,12 +681,13 @@ class DragonDifferentialAttention(nn.Module):
             query_states = self.q_norm(query_states)
             key_states = self.k_norm(key_states)
 
+        wsize = self.config.slw_wsize
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
             T = query_states.size(1)
             pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
-            log_pos = pos.log() if self.config.slw_wsize <= 0 else torch.clamp_max(pos, self.config.slw_wsize).log()
+            log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
             query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
             # TODO: caching mechanism for log_pos
 
@@ -751,52 +702,51 @@ class DragonDifferentialAttention(nn.Module):
         # compute
         # TODO: do that in init ?
         if DIFF_ATTN_IMPL == "flex_head":
-            def diff_attention_interface(q, k, v, **kw):
-                return flex_head_fa.flash_attn_func(q, k, v, **kw)
+            diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
         elif DIFF_ATTN_IMPL == "fa2":
-            def diff_attention_interface(q, k, v, **kw):
+            def diff_attention_interface(q, k, v, wsize, **kw):
                 D = v.size(3)
-                v1 = v[:, :, :, :D//2]#.contiguous()
-                v2 = v[:, :, :, D//2:]#.contiguous()
-                o1 = flash_attn_func(q, k, v1, **kw)
-                o2 = flash_attn_func(q, k, v2, **kw)
+                v1 = v[:, :, :, :D//2]
+                v2 = v[:, :, :, D//2:]
+                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
+                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
                 o = torch.cat([o1, o2], dim=-1)
                 return o
         elif DIFF_ATTN_IMPL == "fa3":
-            def diff_attention_interface(q, k, v, **kw):
+            def diff_attention_interface(q, k, v, wsize, **kw):
                 D = v.size(3)
-                v1 = v[:, :, :, :D//2]#.contiguous()
-                v2 = v[:, :, :, D//2:]#.contiguous()
-                o1 = flash_attn_func(q, k, v1, **kw)[0]
-                o2 = flash_attn_func(q, k, v2, **kw)[0]
+                v1 = v[:, :, :, :D//2]
+                v2 = v[:, :, :, D//2:]
+                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)[0]
+                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)[0]
                 o = torch.cat([o1, o2], dim=-1)
                 return o
+        elif DIFF_ATTN_IMPL == "flex":
+            if wsize != self.last_wsize:
+                self.last_wsize = self.build_mask(wsize)
+            diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif DIFF_ATTN_IMPL == "eager":
-            def diff_attention_interface(q, k, v, **kw):
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]#.contiguous()
-                v2 = v[:, :, :, D//2:]#.contiguous()
-                o1 = eager_attention_forward(self, q, k, v1, **kw)
-                o2 = eager_attention_forward(self, q, k, v2, **kw)
-                o = torch.cat([o1, o2], dim=-1)
-                return o
+            diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
 
+        # attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(q, k, v, window_size=(window_size, 0), **kw)
         y1 = diff_attention_interface(
             query1_states.bfloat16(),
             key1_states.bfloat16(),
             value_states.bfloat16(),
             causal=True,
-            window_size=(self.config.slw_wsize, 0),
+            wsize=wsize,
             softcap=self.softcap,
-            softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
+            softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
+        )
         y2 = diff_attention_interface(
             query2_states.bfloat16(),
             key2_states.bfloat16(),
             value_states.bfloat16(),
             causal=True,
-            window_size=(self.config.slw_wsize, 0),
+            wsize=wsize,
             softcap=self.softcap,
-            softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim)
+            softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
+        )
         lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H/2)
         lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
         lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
@@ -806,6 +756,135 @@ class DragonDifferentialAttention(nn.Module):
             cache_params.trim(self.layer_idx)
 
         return attn_output, None, None
+
+# the following torch formulations of GDN are taken from Qwen3Next
+def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    """This function is intended to align with the l2norm implementation in the FLA library."""
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
+
+def torch_chunk_gated_delta_rule(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale=None,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    initial_dtype = q.dtype
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm(q, dim=-1, eps=1e-6)
+        k = l2norm(k, dim=-1, eps=1e-6)
+    q, k, v, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
+    ]
+
+    batch_size, sequence_length, num_heads, k_head_dim = k.shape
+    v_head_dim = v.shape[-1]
+    pad_size = (chunk_size - num_heads % chunk_size) % chunk_size
+    q = F.pad(q, (0, 0, 0, pad_size))
+    k = F.pad(k, (0, 0, 0, pad_size))
+    v = F.pad(v, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    tot_heads = num_heads + pad_size
+    q = q * scale
+
+    v_beta = v * beta.unsqueeze(-1)
+    k_beta = k * beta.unsqueeze(-1)
+    # reshape to chunks
+    q, k, v, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (q, k, v, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0)
+
+    # chunk decay
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ k.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
+
+    # for each chunk
+    for i in range(0, tot_heads // chunk_size):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :num_heads]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+def torch_recurrent_gated_delta_rule(
+    q, k, v, g, beta, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+):
+    initial_dtype = q.dtype
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm(q, dim=-1, eps=1e-6)
+        k = l2norm(k, dim=-1, eps=1e-6)
+    q, k, v, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
+    ]
+
+    batch_size, sequence_length, num_heads, k_head_dim = k.shape
+    v_head_dim = v.shape[-1]
+    q = q * scale
+
+    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(v)
+    last_recurrent_state = (
+        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(v)
+        if initial_state is None
+        else initial_state.to(v)
+    )
+
+    for i in range(num_heads):
+        q_t = q[:, :, i]
+        k_t = k[:, :, i]
+        v_t = v[:, :, i]
+        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta[:, :, i].unsqueeze(-1)
+
+        last_recurrent_state = last_recurrent_state * g_t
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta_t
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
 
 class DragonGatedDeltaNet(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
@@ -819,25 +898,20 @@ class DragonGatedDeltaNet(nn.Module):
                 "when creating this class."
             )
 
-        self.conv_size = config.conv_kernel
-        self.conv_bias = config.use_bias
-
         self.n_heads = config.num_attention_heads
+        self.head_dim = int(config.hidden_size * (config.expand_factor/2)) // self.n_heads
+        self.dk = self.head_dim
+        self.dv = 2*self.head_dim
+        self.key_dim = self.n_heads * self.dk
+        self.value_dim = self.n_heads * self.dv
+
         self.n_heads_local = self.n_heads // 1
-        self.d_head = int(config.hidden_size * (config.expand_factor/2)) // self.n_heads
+        self.key_dim_local = self.n_heads_local * self.dk
+        self.value_dim_local = self.n_heads_local * self.dv
 
-        self.key_dim = int(self.n_heads * self.d_head)
-        self.value_dim = int(2*self.key_dim) # todo refactor
-        self.head_k_dim = self.d_head
-        self.head_v_dim = int(2*self.d_head)
-        self.silu = nn.SiLU()
-
-        self.dk = self.head_k_dim
-        self.dv = self.head_v_dim # todo : duplicate variables
         self.per_head_proj = 2*self.dk + self.dv + 2 + self.dv # [q k v b a g] per head
         in_proj_dim_global = self.n_heads * self.per_head_proj
 
-        # todo: rename d_head => head_dim (for consistency with other classes)
         self.in_gate_proj = DragonLinear(config, config.hidden_size, in_proj_dim_global, bias=False)
 
         dt_min = config.time_step_min
@@ -862,10 +936,12 @@ class DragonGatedDeltaNet(nn.Module):
         A_log = torch.log(A)  # Keep A_log in fp32
         self.A_log = nn.Parameter(A_log)
 
-        self.qkv_hidden = self.key_dim + self.key_dim + self.value_dim
-        self.qkv_conv1d = DragonConv1D(hidden_size=self.qkv_hidden, kernel_size=self.conv_size)
+        self.conv_size = config.conv_kernel
+        self.conv_bias = config.use_bias
+        self.qkv_conv1d = DragonConv1D(hidden_size=2*self.key_dim+self.value_dim, kernel_size=self.conv_size)
 
-        self.act_func_gate = F.silu
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -902,7 +978,7 @@ class DragonGatedDeltaNet(nn.Module):
             q_conv_cache, k_conv_cache, v_conv_cache, ssm_cache = cache_params.get_ssm_cache(self.layer_idx)
             if q_conv_cache is not None:
                 qkv_cache = torch.cat([q_conv_cache, k_conv_cache, v_conv_cache], dim=1) # [N, qd+kd+vd, W] 
-            # TODO: update caching mechanism to avoid concat/split of the cache
+            # TODO: update caching mechanism to avoid concat/split of the cache (cf qwen)
 
         y, qkv_cache = self.qkv_conv1d(
             x=qkv_in,
@@ -913,7 +989,6 @@ class DragonGatedDeltaNet(nn.Module):
 
         # split back
         q, k, v = torch.split(y, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-
         # back to per-head for kernels
         q = rearrange(q, "b l (h d) -> b l h d", d=self.dk)
         k = rearrange(k, "b l (h d) -> b l h d", d=self.dk)
@@ -923,46 +998,35 @@ class DragonGatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(a_proj.float() + self.dt_bias)
 
         if mode == 'chunk':
-            if chunk_gated_delta_rule is not None:
-                o, ssm_cache = chunk_gated_delta_rule(
-                    q=q.bfloat16(),
-                    k=k.bfloat16(),
-                    v=v.bfloat16(),
-                    g=g,
-                    beta=beta,
-                    scale=None if not self.config.use_uscaling else 1/self.head_k_dim,
-                    initial_state=ssm_cache,
-                    output_final_state=(cache_params is not None),
-                    cu_seqlens=None, # for varlen training
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True
-                ) # (B L H D) where d is head_v_dim
-            else:
-                raise NotImplementedError("PyTorch implementation of chunked GDN is not available.")
+            o, ssm_cache = self.chunk_gated_delta_rule(
+                q=q.bfloat16(),
+                k=k.bfloat16(),
+                v=v.bfloat16(),
+                g=g,
+                beta=beta,
+                scale=None if not self.config.use_uscaling else 1/self.dk,
+                initial_state=ssm_cache,
+                output_final_state=(cache_params is not None),
+                use_qk_l2norm_in_kernel=True
+            ) # (B L H dv)
         elif mode == 'fused_recurrent':
-            if fused_recurrent_gated_delta_rule is not None:
-                o, ssm_cache = fused_recurrent_gated_delta_rule(
-                    q=q.bfloat16(),
-                    k=k.bfloat16(),
-                    v=v.bfloat16(),
-                    g=g,
-                    beta=beta,
-                    scale=None if not self.config.use_uscaling else 1/self.head_k_dim,
-                    initial_state=ssm_cache,
-                    output_final_state=(cache_params is not None),
-                    cu_seqlens=None,
-                    use_qk_l2norm_in_kernel=True
-                ) # (B L H D) where d is head_v_dim
-            else:
-                raise NotImplementedError("PyTorch implementation of recurrent GDN is not available.")
-        else:
-            raise NotImplementedError(f"Not supported mode `{mode}`.")
+            o, ssm_cache = self.recurrent_gated_delta_rule(
+                q=q.bfloat16(),
+                k=k.bfloat16(),
+                v=v.bfloat16(),
+                g=g,
+                beta=beta,
+                scale=None if not self.config.use_uscaling else 1/self.dk,
+                initial_state=ssm_cache,
+                output_final_state=(cache_params is not None),
+                use_qk_l2norm_in_kernel=True
+            ) # (B L H dv)
 
-        o = o * self.act_func_gate(g_proj)
+        o = o * F.silu(g_proj)
 
         if cache_params is not None:
             q_cache_new, k_cache_new, v_cache_new = torch.split(
-                qkv_cache, [self.key_dim, self.key_dim, self.value_dim], dim=1
+                qkv_cache, [self.key_dim_local, self.key_dim_local, self.value_dim_local], dim=1
             )
             cache_params.update_ssm_cache(
                 q_conv_states=q_cache_new,
@@ -1007,7 +1071,7 @@ class DragonBlock(GradientCheckpointingLayer):
             self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads//2, d_head=2*self.attn.head_dim, eps=config.norm_epsilon)
         else:
             self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads, d_head=self.attn.head_dim, eps=config.norm_epsilon)
-        self.lin_attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.lin_attn.n_heads, d_head=self.lin_attn.head_v_dim, eps=config.norm_epsilon)
+        self.lin_attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.lin_attn.n_heads, d_head=self.lin_attn.dv, eps=config.norm_epsilon)
 
         self.input_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
         self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
