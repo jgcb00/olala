@@ -9,7 +9,7 @@ import math
 from einops import rearrange
 import torch
 import torch.nn.functional as F
-from torch import nn
+import torch.nn as nn
 
 from transformers.modeling_utils import PreTrainedModel
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -125,127 +125,7 @@ class DragonLinear(nn.Linear):
     def forward(self, x):
         return _ScaledLinearFB.apply(x, self.weight, self.bias, self.alpha_fwd, self.alpha_bwd, self.alpha_bwd)
 
-# heavily adapted from flash-linear-attention
-def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
-    return cu_seqlens[1:] - cu_seqlens[:-1]
-
-def prepare_position_ids(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
-    return torch.cat([
-        torch.arange(n, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
-        for n in prepare_lens(cu_seqlens).unbind()
-    ])
-
-def prepare_sequence_ids(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
-    return prepare_position_ids(cu_seqlens).eq(0).cumsum(0) - 1
-
-class DragonConv1D(nn.Conv1d):
-    """Wrapper around nn.Conv1d (for definition) and causal_conv1d (for forward)"""
-    def __init__(
-        self,
-        hidden_size: int,
-        kernel_size: int,
-        bias: bool = False,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ):
-        super().__init__(
-            in_channels=hidden_size,
-            out_channels=hidden_size,
-            kernel_size=kernel_size,
-            groups=hidden_size,
-            bias=bias,
-            padding=kernel_size - 1,
-            device=device,
-            dtype=dtype,
-        )
-        self.hidden_size = hidden_size
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        cache: Optional[torch.Tensor] = None,
-        output_final_state: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x (`torch.Tensor`):
-                Tensor of shape `[B, T, D]`.
-                If `seq_idx` is provided, `B` must be 1.
-            mask (`Optional[torch.Tensor]`):
-                Attention mask dealing with padded positions.
-            cache (`Optional[torch.Tensor]`):
-                Previous cache tensor of shape `[N, D, W]`, where `W` is the kernel size.
-                If provided, the cache is updated **inplace**.
-            output_final_state (Optional[bool]):
-                Whether to output the final state of shape `[N, D, W]`. Default: `False`.
-
-        Returns:
-            Tensor of shape `[B, T, D]`.
-        """
-
-        B, T, D, W = *x.shape, self.kernel_size[0]
-        N = B
-        if mask is not None:
-            x = x.mul_(mask.unsqueeze(-1))
-        if output_final_state and cache is None:
-            cache = x.new_zeros(N, D, W)
-        # during the decoding phase, we assume the batch is composed of sequences of length 1
-        if cache is not None and T == 1:
-            return self.step(x, cache)
-
-        if cache is not None:
-            cache[:, :, -min(W, T):].copy_(rearrange(x[..., -min(W, T):, :], 'n w d -> n d w'))
-
-        x = rearrange(x, 'b t d -> b d t')
-        if causal_conv1d_fn is not None:
-            # Sequence index for each token. Used for varlen.
-            # Suppose a batch consists of two sequences with lengths 3 and 4,
-            # seq_idx=[0, 0, 0, 1, 1, 1, 1] for this batch.
-            # NOTE: No need to provide this arg if `cu_seqlens` is passed.
-            # This arg is just for BC, and will be removed in the future.
-            # [B, T]
-            seq_idx = kwargs.get('seq_idx', None)
-            x = causal_conv1d_fn(
-                x=x.contiguous(),
-                weight=rearrange(self.weight, "d 1 w -> d w"),
-                bias=self.bias,
-                activation="silu",
-                seq_idx=seq_idx,
-            )
-        else:
-            x = self._conv_forward(x, self.weight, self.bias)[..., :x.shape[-1]]
-            x = F.silu(x)
-        return rearrange(x, "b d t -> b t d"), cache
-
-    def step(
-        self,
-        x: torch.Tensor,
-        cache: torch.Tensor,
-        cu_seqlens: Optional[torch.LongTensor] = None
-    ):
-        shape = x.shape
-        x = x.squeeze(0) if cu_seqlens is not None else x.squeeze(1)
-        if causal_conv1d_update is not None:
-            x = causal_conv1d_update(
-                x=x,
-                conv_state=cache,
-                weight=rearrange(self.weight, "d 1 w -> d w"),
-                bias=self.bias,
-                activation="silu",
-            )
-        else:
-            # we follow the fast mode that updates the cache in-place
-            cache.copy_(cache.roll(shifts=-1, dims=-1))
-            cache[:, :, -1] = x
-            x = torch.sum(cache * rearrange(self.weight, "d 1 w -> d w"), dim=-1)
-            if self.bias is not None:
-                x = x + self.bias
-            x = F.silu(x)
-        return x.view(shape), cache
-
-class HybridDragonAttentionDynamicCache(DynamicCache):
+class HybridDragonDynamicCache(DynamicCache):
     """
     A dynamic cache that handle both the attention cache (which has a seq_len dimension) and the GDN cache
     (which has a constant shape regardless of seq_len).
@@ -256,14 +136,11 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
     while `conv_states` represents the convolution state and has a shape of `(batch_size, d_inner, d_conv)`,
     and `ssm_states` represents the ssm state and has a shape of `(batch_size, d_inner, d_state)`.
     """
-    def __init__(self, config: DragonConfig, dtype=torch.bfloat16):
+    def __init__(self, config: DragonConfig):
         super().__init__()
         self.config = config
-        self.dtype = dtype
-        self.q_conv_states = []
-        self.k_conv_states = []
-        self.v_conv_states = []
-        self.ssm_states = []
+        self.conv_caches = []
+        self.ssm_caches = []
         self._key_cache = {}
         self._value_cache = {}
 
@@ -272,10 +149,8 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
                 self._key_cache[idx] = None
                 self._value_cache[idx] = None
 
-            self.q_conv_states.append(None)
-            self.k_conv_states.append(None)
-            self.v_conv_states.append(None)
-            self.ssm_states.append(None)
+            self.conv_caches.append(None)
+            self.ssm_caches.append(None)
 
         self.window_size = config.sliding_window_size
         self.layers_config = config.layers_config
@@ -312,20 +187,6 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
                 self._key_cache[layer_idx] = self._key_cache[layer_idx][:, -window_size:, ...].contiguous()
                 self._value_cache[layer_idx] = self._value_cache[layer_idx][:, -window_size:, ...].contiguous()
 
-    def update_ssm_cache(
-        self,
-        q_conv_states: torch.Tensor,
-        k_conv_states: torch.Tensor,
-        v_conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
-        layer_idx: int,
-    ) -> None:
-        # Update the SSM cache
-        self.q_conv_states[layer_idx] = q_conv_states
-        self.k_conv_states[layer_idx] = k_conv_states
-        self.v_conv_states[layer_idx] = v_conv_states
-        self.ssm_states[layer_idx] = ssm_states
-
     def get_ssm_cache(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Get the SSM cache for the specified layer
         return (
@@ -339,11 +200,11 @@ class HybridDragonAttentionDynamicCache(DynamicCache):
         return self.past_length[layer_idx]
 
     def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
-        raise NotImplementedError("HybridDragonAttentionDynamicCache does not have a legacy cache equivalent.")
+        raise NotImplementedError("HybridDragonDynamicCache does not have a legacy cache equivalent.")
 
     @classmethod
     def from_legacy_cache(cls, cache_params: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
-        raise NotImplementedError("HybridDragonAttentionDynamicCache does not have a legacy cache equivalent.")
+        raise NotImplementedError("HybridDragonDynamicCache does not have a legacy cache equivalent.")
 
 class DragonRotaryEmbedding(torch.nn.Module):
     def __init__(self, config: DragonConfig, head_dim: int):
@@ -543,7 +404,7 @@ class DragonAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonAttentionDynamicCache] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
@@ -575,8 +436,9 @@ class DragonAttention(nn.Module):
         if not self.reuse_kv:
             last_key_states, last_value_states = key_states, value_states
 
-        # attention computation. # TODO: do that in init ?
+        # attention computation.
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
+
         if ATTN_IMPL == "eager":
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
@@ -669,7 +531,7 @@ class DragonDifferentialAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonAttentionDynamicCache] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
         **kwargs,
     ):
         # Q, K, V projections.
@@ -699,8 +561,7 @@ class DragonDifferentialAttention(nn.Module):
         # split q,k heads into two groups
         query1_states, query2_states = query_states[:, :, torch.arange(0, self.num_heads, 2)].contiguous(), query_states[:, :, torch.arange(1, self.num_heads, 2)].contiguous()
         key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
-        # compute
-        # TODO: do that in init ?
+    
         if DIFF_ATTN_IMPL == "flex_head":
             diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
         elif DIFF_ATTN_IMPL == "fa2":
@@ -758,6 +619,23 @@ class DragonDifferentialAttention(nn.Module):
         return attn_output, None, None
 
 # the following torch formulations of GDN are taken from Qwen3Next
+def torch_causal_conv1d_update(
+    hidden_states,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+):
+    _, hidden_size, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    conv_state.copy_(hidden_states_new[:, :, -state_len:])
+    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+    out = F.silu(out[:, :, -seq_len:])
+    out = out.to(hidden_states.dtype)
+    return out
+
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
     """This function is intended to align with the l2norm implementation in the FLA library."""
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
@@ -937,20 +815,27 @@ class DragonGatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(A_log)
 
         self.conv_size = config.conv_kernel
-        self.conv_bias = config.use_bias
-        self.qkv_conv1d = DragonConv1D(hidden_size=2*self.key_dim+self.value_dim, kernel_size=self.conv_size)
+        self.conv_dim = 2*self.key_dim+self.value_dim
+        self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
 
+        self.causal_conv1d_fn = causal_conv1d_fn
+        self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
     def forward(self,
                 hidden_states: torch.Tensor,
-                cache_params: Optional[HybridDragonAttentionDynamicCache] = None,
+                cache_params: Optional[HybridDragonDynamicCache] = None,
     ):
         _, q_len, _ = hidden_states.shape
         mode = 'fused_recurrent' if q_len <= 64 else 'chunk'
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
+
+        use_precomputed_states = (
+            cache_params is not None
+            and q_len == 1
+        )
 
         # input projection (TP-aware)
         qkvbag = self.in_gate_proj(hidden_states) # (l, b, H_local * per_head_proj)
@@ -970,25 +855,39 @@ class DragonGatedDeltaNet(nn.Module):
         b_proj = rearrange(b_proj, "b l h d -> b l (h d)") # d=1
         a_proj = rearrange(a_proj, "b l h d -> b l (h d)")
 
-        qkv_in = torch.cat([q_proj, k_proj, v_proj], dim=-1) # [B, L, qd+kd+vd] # TODO we deconcat and then concat...
+        mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1) # [B, L, qd+kd+vd]
+        mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        qkv_cache = None
-        q_conv_cache, k_conv_cache, v_conv_cache, ssm_cache = (None, None, None, None)
         if cache_params is not None:
-            q_conv_cache, k_conv_cache, v_conv_cache, ssm_cache = cache_params.get_ssm_cache(self.layer_idx)
-            if q_conv_cache is not None:
-                qkv_cache = torch.cat([q_conv_cache, k_conv_cache, v_conv_cache], dim=1) # [N, qd+kd+vd, W] 
-            # TODO: update caching mechanism to avoid concat/split of the cache (cf qwen)
+            conv_cache = cache_params.conv_caches[self.layer_idx]
+            ssm_cache = cache_params.ssm_caches[self.layer_idx]
 
-        y, qkv_cache = self.qkv_conv1d(
-            x=qkv_in,
-            mask=None,
-            cache=qkv_cache,
-            output_final_state=(cache_params is not None)
-        )
+        if use_precomputed_states:
+            mixed_qkv = self.causal_conv1d_update(
+                mixed_qkv,
+                conv_cache,
+                self.qkv_conv1d.weight.squeeze(1),
+                self.qkv_conv1d.bias,
+                'silu',
+            ) # conv_cache is updated in-place here
+        else:
+            if cache_params is not None:
+                conv_cache = F.pad(mixed_qkv, (self.conv_size - mixed_qkv.shape[-1], 0))
+                cache_params.conv_caches[self.layer_idx] = conv_cache
+            if self.causal_conv1d_fn is not None:
+                mixed_qkv = self.causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=self.qkv_conv1d.weight.squeeze(1),
+                    bias=self.qkv_conv1d.bias,
+                    activation='silu',
+                    seq_idx=None,
+                )
+            else:
+                mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :q_len])
 
         # split back
-        q, k, v = torch.split(y, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         # back to per-head for kernels
         q = rearrange(q, "b l (h d) -> b l h d", d=self.dk)
         k = rearrange(k, "b l (h d) -> b l h d", d=self.dk)
@@ -997,7 +896,8 @@ class DragonGatedDeltaNet(nn.Module):
         beta = b_proj.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a_proj.float() + self.dt_bias)
 
-        if mode == 'chunk':
+        # GDN main computation
+        if not use_precomputed_states:
             o, ssm_cache = self.chunk_gated_delta_rule(
                 q=q.bfloat16(),
                 k=k.bfloat16(),
@@ -1005,11 +905,11 @@ class DragonGatedDeltaNet(nn.Module):
                 g=g,
                 beta=beta,
                 scale=None if not self.config.use_uscaling else 1/self.dk,
-                initial_state=ssm_cache,
-                output_final_state=(cache_params is not None),
+                initial_state=None,
+                output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True
             ) # (B L H dv)
-        elif mode == 'fused_recurrent':
+        else:
             o, ssm_cache = self.recurrent_gated_delta_rule(
                 q=q.bfloat16(),
                 k=k.bfloat16(),
@@ -1018,23 +918,15 @@ class DragonGatedDeltaNet(nn.Module):
                 beta=beta,
                 scale=None if not self.config.use_uscaling else 1/self.dk,
                 initial_state=ssm_cache,
-                output_final_state=(cache_params is not None),
+                output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True
             ) # (B L H dv)
 
         o = o * F.silu(g_proj)
 
+        # update GDN cache
         if cache_params is not None:
-            q_cache_new, k_cache_new, v_cache_new = torch.split(
-                qkv_cache, [self.key_dim_local, self.key_dim_local, self.value_dim_local], dim=1
-            )
-            cache_params.update_ssm_cache(
-                q_conv_states=q_cache_new,
-                k_conv_states=k_cache_new,
-                v_conv_states=v_cache_new,
-                ssm_states=ssm_cache,
-                layer_idx=self.layer_idx,
-            )
+            cache_params.ssm_caches[self.layer_idx] = ssm_cache
 
         return o
 
@@ -1086,7 +978,7 @@ class DragonBlock(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonAttentionDynamicCache] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -1136,7 +1028,7 @@ class DragonPreTrainedModel(PreTrainedModel):
     }
 
     def _init_weights(self, module):
-        if isinstance(module, (DragonLinear, DragonConv1D)):
+        if isinstance(module, (DragonLinear, nn.Conv1d)):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
             nn.init.normal_(module.weight, mean=0., std=1. if self.config.use_uscaling else 0.006)
@@ -1150,7 +1042,7 @@ class DragonOutput(ModelOutput):
     Args:
         last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        cache_params (`HybridDragonAttentionDynamicCache`):
+        cache_params (`HybridDragonDynamicCache`):
             The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
             avoid providing the old `input_ids`.
             Includes both the RNN-like state matrices after the selective scan, and the conv states
@@ -1161,7 +1053,7 @@ class DragonOutput(ModelOutput):
     """
 
     last_hidden_state: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[HybridDragonAttentionDynamicCache] = None
+    past_key_values: Optional[HybridDragonDynamicCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 @dataclass
@@ -1173,7 +1065,7 @@ class DragonCausalLMOutput(ModelOutput):
             Language modeling loss (for next-token prediction).
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        cache_params (`HybridDragonAttentionDynamicCache`):
+        cache_params (`HybridDragonDynamicCache`):
             The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
             avoid providing the old `input_ids`.
             Includes both the State space model state matrices after the selective scan, and the Convolutional states
@@ -1185,7 +1077,7 @@ class DragonCausalLMOutput(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[HybridDragonAttentionDynamicCache] = None
+    past_key_values: Optional[HybridDragonDynamicCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 class DragonModel(DragonPreTrainedModel):
@@ -1215,7 +1107,7 @@ class DragonModel(DragonPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        past_key_values: Optional[HybridDragonAttentionDynamicCache] = None,
+        past_key_values: Optional[HybridDragonDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         output_hidden_states: Optional[bool] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1237,12 +1129,11 @@ class DragonModel(DragonPreTrainedModel):
 
         if use_cache:
             if past_key_values is None:
-                past_key_values = HybridDragonAttentionDynamicCache(self.config, dtype=self.dtype)
-            elif not isinstance(past_key_values, HybridDragonAttentionDynamicCache):
-                # recreate (todo: upcast instead of recreate)
+                past_key_values = HybridDragonDynamicCache(self.config)
+            elif not isinstance(past_key_values, HybridDragonDynamicCache):
                 if type(past_key_values) is DynamicCache:
-                    print("upgrading DynamicCache → HybridDragonAttentionDynamicCache")
-                    past_key_values = HybridDragonAttentionDynamicCache(self.config, dtype=self.dtype)
+                    del past_key_values
+                    past_key_values = HybridDragonDynamicCache(self.config)
                 else:
                     raise TypeError(f"Unsupported cache type: {type(past_key_values)}")
 
@@ -1301,7 +1192,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         use_cache: Optional[bool] = None,
-        past_key_values: Optional[HybridDragonAttentionDynamicCache] = None,
+        past_key_values: Optional[HybridDragonDynamicCache] = None,
         cache_position: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         attention_mask: Optional[torch.Tensor] = None,
