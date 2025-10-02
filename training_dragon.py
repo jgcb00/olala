@@ -74,8 +74,8 @@ class NanoConfig:
     use_patch_level_training: bool = False
     patch_size: int = 4
     patch_training_fraction: float = 0.67
-    input_bin: str = None
-    input_val_bin: str = None
+    input_bin: Optional[str] = None
+    input_val_bin: Optional[str] = None
 
     # evaluation and logging
     val_loss_every: int = 125
@@ -222,7 +222,7 @@ if master_process:
     wandb.init(project=config.wandb_project, name=config.run_name, config={**vars(config)}, mode=None if config.log_wandb else 'disabled', id=run_id, resume="allow" if ckpt is not None else None)
 
 # define convenience variables.
-B, T = config.device_bsz, config.sequence_length
+B, T = config.device_batch_size, config.sequence_length
 assert config.batch_size % (B * ddp_world_size) == 0
 accumulation_steps = config.batch_size // (B * ddp_world_size)
 
@@ -279,11 +279,11 @@ print0(f"number of total parameters:  {num_params}")
 print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
 
 # DDP & compile.
-model = torch.compile(model, dynamic=config.torch_compile_dynamic) if config.torch_compile else model
+model = torch.compile(model, dynamic=False)
 model.train()
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module
-ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if config.bf16_training else nullcontext()
+ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # load optimizers & schedulers.
 hidden_matrix_params = [p for n, p in raw_model.model.layers.named_parameters() if p.ndim >= 2 and "embedding" not in n and "conv" not in n]
@@ -381,7 +381,7 @@ for iter_ in range(start_iter, config.total_iterations+1):
         t0 = time.perf_counter()
 
     # ----------- SAVING SECTION -----------
-    if master_process and (last_iter or (config.save_every > 0 and iter_ % config.save_every == 0)):
+    if master_process and iter_ > start_iter and (last_iter or (config.save_every > 0 and iter_ % config.save_every == 0)):
         # stop the clock.
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)

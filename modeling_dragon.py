@@ -965,7 +965,7 @@ class DragonBlock(GradientCheckpointingLayer):
         self.mixer_proj = DragonLinear(config, int(self.expand_factor*config.hidden_size), config.hidden_size, bias=False)
 
         if isinstance(self.attn, (DragonDifferentialAttention)):
-            self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads//2, d_head=2*self.attn.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma) # todo
+            self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads//2, d_head=2*self.attn.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         else:
             self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads, d_head=self.attn.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         self.lin_attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.lin_attn.n_heads, d_head=self.lin_attn.dv, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
