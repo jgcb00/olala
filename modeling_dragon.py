@@ -70,22 +70,27 @@ except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
 class DragonHeadWiseRMSNorm(nn.Module):
-    def __init__(self, n_heads, d_head, eps=1e-6):
+    def __init__(self, n_heads, d_head, eps=1e-6, zero_centered_gamma=False):
         super().__init__()
         self.rms = nn.RMSNorm(d_head, eps=eps, elementwise_affine=False)
-        self.weight = nn.Parameter(torch.ones(n_heads, d_head))
+        self.weight = nn.Parameter(torch.zeros(n_heads, d_head)) if zero_centered_gamma else nn.Parameter(torch.ones(n_heads, d_head))
+        self.zero_centered_gamma = zero_centered_gamma
 
     def forward(self, hidden_states):
         B, L, H, D = hidden_states.shape
-        y = self.rms(hidden_states) * self.weight.view(1, 1, H, D)
+        y = self.rms(hidden_states) * (1.0 + self.weight.view(1, 1, H, D)) if self.zero_centered_gamma else self.rms(hidden_states) * self.weight.view(1, 1, H, D)
         return y.view(B, L, H, D)
 
-class DragonRMSNorm(nn.RMSNorm):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        DragonRMSNorm is equivalent to RMSNorm
-        """
-        super().__init__(normalized_shape=hidden_size, eps=eps)
+class DragonRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, zero_centered_gamma=False):
+        super().__init__()
+        self.rms = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
+        self.weight = nn.Parameter(torch.zeros(hidden_size)) if zero_centered_gamma else nn.Parameter(torch.ones(hidden_size))
+        self.zero_centered_gamma = zero_centered_gamma
+
+    def forward(self, hidden_states):
+        y = self.rms(hidden_states) * (1.0 + self.weight) if self.zero_centered_gamma else self.rms(hidden_states) * self.weight
+        return y
 
 class _ScaledLinearFB(torch.autograd.Function):
     @staticmethod
@@ -374,9 +379,9 @@ class DragonAttention(nn.Module):
         self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
 
         if self.qk_norm:
-            self.q_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon)
+            self.q_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
             if not reuse_kv:
-                self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon)
+                self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
 
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
@@ -452,6 +457,9 @@ class DragonAttention(nn.Module):
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
+        if wsize > 200:
+            print("FOERFGERGOERGKRGOREG")
+
         attn_output = attention_interface(
             query_states.bfloat16(),
             key_states.bfloat16(),
@@ -494,8 +502,8 @@ class DragonDifferentialAttention(nn.Module):
         self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
 
         if self.qk_norm:
-            self.q_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon)
-            self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon)
+            self.q_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+            self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
 
         if self.scalable_softmax:
             self.softmax_scaler = nn.Parameter(torch.ones(self.num_heads, dtype=torch.float32))
@@ -588,6 +596,9 @@ class DragonDifferentialAttention(nn.Module):
             diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif DIFF_ATTN_IMPL == "eager":
             diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
+
+        if wsize > 200:
+            print("CCCCCCCCCCCCCCCCCCDDD")
 
         # attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(q, k, v, window_size=(window_size, 0), **kw)
         y1 = diff_attention_interface(
@@ -842,20 +853,15 @@ class DragonGatedDeltaNet(nn.Module):
         # [L,B,(H*P)] -> [B,L,H,P]
         qkvbag = rearrange(qkvbag, "b l (h p) -> b l h p", h=self.n_heads_local).contiguous()
         # split per head: [B,L,H,dk/dk/dv/1/1]
-        q_proj = qkvbag[..., 0:self.dk]
-        k_proj = qkvbag[..., self.dk:2*self.dk]
-        v_proj = qkvbag[..., 2*self.dk:2*self.dk+self.dv]
+        qkv_proj = qkvbag[..., 0:2*self.dk+self.dv]
         b_proj = qkvbag[..., 2*self.dk+self.dv:2*self.dk+self.dv+1]
         a_proj = qkvbag[..., 2*self.dk+self.dv+1:2*self.dk+self.dv+2]
         g_proj = qkvbag[..., 2*self.dk+self.dv+2:]
         # concat for conv
-        q_proj = rearrange(q_proj, "b l h d -> b l (h d)")
-        k_proj = rearrange(k_proj, "b l h d -> b l (h d)")
-        v_proj = rearrange(v_proj, "b l h d -> b l (h d)")
+        mixed_qkv = rearrange(qkv_proj, "b l h d -> b l (h d)")
         b_proj = rearrange(b_proj, "b l h d -> b l (h d)") # d=1
         a_proj = rearrange(a_proj, "b l h d -> b l (h d)")
 
-        mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1) # [B, L, qd+kd+vd]
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         if cache_params is not None:
@@ -887,11 +893,10 @@ class DragonGatedDeltaNet(nn.Module):
 
         # split back
         mixed_qkv = mixed_qkv.transpose(1, 2)
-        q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        # back to per-head for kernels
-        q = rearrange(q, "b l (h d) -> b l h d", d=self.dk)
-        k = rearrange(k, "b l (h d) -> b l h d", d=self.dk)
-        v = rearrange(v, "b l (h d) -> b l h d", d=self.dv)
+        mixed_qkv = rearrange(mixed_qkv, "b l (h d) -> b l h d", h=self.n_heads_local).contiguous()
+        q = mixed_qkv[..., 0:self.dk]
+        k = mixed_qkv[..., self.dk:2*self.dk]
+        v = mixed_qkv[..., 2*self.dk:2*self.dk+self.dv]
 
         beta = b_proj.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a_proj.float() + self.dt_bias)
@@ -960,13 +965,13 @@ class DragonBlock(GradientCheckpointingLayer):
         self.mixer_proj = DragonLinear(config, int(self.expand_factor*config.hidden_size), config.hidden_size, bias=False)
 
         if isinstance(self.attn, (DragonDifferentialAttention)):
-            self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads//2, d_head=2*self.attn.head_dim, eps=config.norm_epsilon)
+            self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads//2, d_head=2*self.attn.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma) # todo
         else:
-            self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads, d_head=self.attn.head_dim, eps=config.norm_epsilon)
-        self.lin_attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.lin_attn.n_heads, d_head=self.lin_attn.dv, eps=config.norm_epsilon)
-
-        self.input_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
-        self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
+            self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads, d_head=self.attn.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        self.lin_attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.lin_attn.n_heads, d_head=self.lin_attn.dv, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+    
+        self.input_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         self.mlp = DragonMLP(config)
 
         self.register_buffer("lns", torch.tensor(1.0 if config.use_uscaling else 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))), persistent=False)
@@ -1090,7 +1095,7 @@ class DragonModel(DragonPreTrainedModel):
         self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
 
         self.rotary_emb = DragonRotaryEmbedding(config, head_dim=(config.expand_factor*config.hidden_size)//config.num_attention_heads) # only for SWA
-        self.final_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.final_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
 
         self.gradient_checkpointing = False
         self.post_init()

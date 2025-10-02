@@ -91,6 +91,7 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        zero_centered_gamma=False,
         vocab_size=151936,
         tie_word_embeddings=False,
         max_position_embeddings=8192,
@@ -129,7 +130,7 @@ class DragonConfig(PretrainedConfig):
         old_lns=False,
         **kwargs,
     ):
-
+        self.zero_centered_gamma = zero_centered_gamma
         self.rope_theta = rope_theta_local
         self.qk_norm = True
         self.softcap_local_attn=softcap_local_attn
