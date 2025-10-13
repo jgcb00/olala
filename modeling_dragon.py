@@ -17,6 +17,12 @@ from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.utils import ModelOutput, logging
 
+from fast_hadamard_transform import hadamard_transform
+from flash_dmattn.flash_dmattn_interface import flash_dmattn_func
+from flash_dmattn.integrations.flash_dynamic_mask_attention import flash_dynamic_mask_attention_forward
+
+from cut_cross_entropy import linear_cross_entropy
+
 from .configuration_dragon import DragonConfig
 
 logger = logging.get_logger(__name__)
@@ -92,7 +98,18 @@ class DragonRMSNorm(nn.Module):
         y = self.rms(hidden_states) * (1.0 + self.weight) if self.zero_centered_gamma else self.rms(hidden_states) * self.weight
         return y
 
-class _ScaledLinearFB(torch.autograd.Function):
+class DragonLayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6): # TODO: ZCG ?
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor):
+        return F.layer_norm(x.float(), (self.hidden_size,), self.weight, self.bias, self.eps).type_as(x)
+
+"""class _ScaledLinearFB(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, alpha_fwd, alpha_bwd_x, alpha_bwd_w):
         ctx.save_for_backward(x, weight, bias)
@@ -104,7 +121,7 @@ class _ScaledLinearFB(torch.autograd.Function):
     def backward(ctx, grad_out):
         x, weight, bias = ctx.saved_tensors
         # -------- grads ----------
-        grad_x = torch.matmul(grad_out * ctx.alpha_bwd_x, weight)
+        grad_x = torch.matmul(grad_out * ctx.alpha_bwd_x.to(grad_out.dtype), weight)
 
         go_flat = (grad_out * ctx.alpha_bwd_w).reshape(-1, grad_out.shape[-1])
         x_flat  = x.reshape(-1, x.shape[-1])
@@ -112,6 +129,33 @@ class _ScaledLinearFB(torch.autograd.Function):
         grad_bias   = go_flat.sum(0) if bias is not None else None
 
         return grad_x, grad_weight, grad_bias, None, None, None
+
+class DragonLinear(nn.Linear):
+    Linear layer with different forward/backward scalings.
+    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, alpha_fwd=None, alpha_bwd=None):
+        super().__init__(in_features, out_features, bias)
+
+        if alpha_fwd is None:
+            alpha_fwd = 1.0 / math.sqrt(in_features)
+
+        if not config.use_uscaling:
+            alpha_fwd, alpha_bwd = 1, 1
+
+        self.register_buffer("alpha_fwd", torch.tensor(float(alpha_fwd)), persistent=False)
+        self.register_buffer("alpha_bwd", torch.tensor(float(alpha_bwd if alpha_bwd is not None else alpha_fwd)), persistent=False)
+
+    def forward(self, x):
+        return _ScaledLinearFB.apply(x, self.weight, self.bias, self.alpha_fwd.to(x.dtype), self.alpha_bwd, self.alpha_bwd)"""
+
+class ScaledGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, forward_scale, backward_scale):
+        ctx.backward_scale = backward_scale
+        return x * forward_scale
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.backward_scale, None, None
 
 class DragonLinear(nn.Linear):
     """Linear layer with different forward/backward scalings."""
@@ -128,7 +172,8 @@ class DragonLinear(nn.Linear):
         self.register_buffer("alpha_bwd", torch.tensor(float(alpha_bwd if alpha_bwd is not None else alpha_fwd)), persistent=False)
 
     def forward(self, x):
-        return _ScaledLinearFB.apply(x, self.weight, self.bias, self.alpha_fwd, self.alpha_bwd, self.alpha_bwd)
+        out = super().forward(x)
+        return ScaledGrad.apply(out, self.alpha_fwd, self.alpha_bwd)
 
 class HybridDragonDynamicCache(DynamicCache):
     """
@@ -191,15 +236,6 @@ class HybridDragonDynamicCache(DynamicCache):
             if self._key_cache[layer_idx].size(1) > window_size:
                 self._key_cache[layer_idx] = self._key_cache[layer_idx][:, -window_size:, ...].contiguous()
                 self._value_cache[layer_idx] = self._value_cache[layer_idx][:, -window_size:, ...].contiguous()
-
-    def get_ssm_cache(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Get the SSM cache for the specified layer
-        return (
-            self.q_conv_states[layer_idx],
-            self.k_conv_states[layer_idx],
-            self.v_conv_states[layer_idx],
-            self.ssm_states[layer_idx],
-        )
 
     def get_total_seen(self, layer_idx: int) -> int:
         return self.past_length[layer_idx]
@@ -457,9 +493,6 @@ class DragonAttention(nn.Module):
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
-        if wsize > 200:
-            print("FOERFGERGOERGKRGOREG")
-
         attn_output = attention_interface(
             query_states.bfloat16(),
             key_states.bfloat16(),
@@ -468,6 +501,267 @@ class DragonAttention(nn.Module):
             wsize=wsize,
             softcap=self.config.softcap_local_attn,
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
+        )
+
+        if cache_params is not None and not self.reuse_kv:
+            cache_params.trim(self.layer_idx)
+
+        return attn_output, last_key_states, last_value_states
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16
+    hidden_size = x.size(-1)
+    return hadamard_transform(x, scale=hidden_size ** -0.5)
+
+class DragonDeepSeekSparseAttention(nn.Module):
+    def __init__(self, config: DragonConfig, reuse_kv: bool, layer_idx: Optional[int], **kwargs):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+        # indexer attention
+        self.indexer_num_heads = config.num_attention_heads_indexer
+        self.indexer_head_dim = config.head_dim_indexer
+        self.q_lora_rank = config.dsa_q_lora_rank
+        self.topk = config.dsa_topk
+        self.indexer_q_proj_down = DragonLinear(config, config.hidden_size, self.q_lora_rank, bias=False) # TODO fuse projs
+        self.indexer_q_proj_up = DragonLinear(config, self.q_lora_rank, self.indexer_num_heads * self.indexer_head_dim, bias=False)
+        self.indexer_q_norm = DragonRMSNorm(self.q_lora_rank, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        self.indexer_k_proj = DragonLinear(config, config.hidden_size, self.indexer_head_dim, bias=False)
+        self.indexer_k_norm = DragonLayerNorm(self.indexer_head_dim, eps=config.norm_epsilon)
+        self.indexer_weights_proj = DragonLinear(config, config.hidden_size, self.indexer_num_heads, bias=False)
+
+        # normal attention
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.hidden_size = config.hidden_size
+        self.projection_dim = config.hidden_size * config.expand_factor
+        self.head_dim = self.projection_dim // self.num_heads
+        self.rope_theta = config.rope_theta
+        self.qk_norm = config.qk_norm
+        self.window_size = config.sliding_window_size
+        self.reuse_kv = reuse_kv
+
+        projection_dim = self.head_dim * (self.num_heads + 2 * (0 if reuse_kv else self.num_key_value_heads))
+        self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
+
+        if self.qk_norm:
+            self.q_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+            if not reuse_kv:
+                self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+
+        self.causal_mask = None
+
+    def compute_index_scores_pytorch(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute index scores using pure PyTorch (matches official implementation).
+        
+        Args:
+            x: Input tokens [batch, seq_len, d_model]
+            qr: Low-rank query representation [batch, seq_len, q_lora_rank]
+            
+        Returns:
+            index_scores: [batch, seq_len, seq_len]
+        """
+        batch_size, seq_len, _ = x.shape
+
+        q_indexer = self.indexer_q_proj_up(self.indexer_q_norm(self.indexer_q_proj_down(x))).view(
+            batch_size, seq_len, self.indexer_num_heads, self.indexer_head_dim
+        )
+        k_indexer = self.indexer_k_norm(self.indexer_k_proj(x)).view(
+            batch_size, seq_len, 1, self.indexer_head_dim
+        )
+        q_indexer = rotate_activation(q_indexer.to(torch.bfloat16))
+        k_indexer = rotate_activation(k_indexer.to(torch.bfloat16))
+
+        weights = self.indexer_weights_proj(x) * (self.indexer_num_heads ** -0.5) * (self.indexer_head_dim ** -0.5) # [batch, seq_len, num_heads]
+
+        dots = torch.matmul(q_indexer, k_indexer.permute(0, 2, 3, 1)) # -> [batch, seq_len, num_heads, seq_len]
+        dots = dots.transpose(-2, -1) # [batch, seq_len, seq_len, num_heads]
+        dots = F.relu(dots)
+        weighted_dots = dots * weights.unsqueeze(2)
+        index_scores = weighted_dots.sum(dim=-1) # [batch, seq_len, seq_len]
+
+        return index_scores
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
+        key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ):
+        _, seq_len, _ = hidden_states.size()
+
+        # compute index scores
+        index_scores = self.compute_index_scores_pytorch(hidden_states) # (B, L, L)
+        if self.causal_mask is None or self.causal_mask.size(-1) != seq_len:
+            self.causal_mask = torch.triu(torch.full((1, seq_len, seq_len), -100, device=hidden_states.device), diagonal=1) # (1, L, L)
+        index_scores = index_scores + self.causal_mask # TODO: possible to add it inside the kernel?
+
+        # Q, K, V projections.
+        if not self.reuse_kv:
+            query_states, key_states, value_states = get_query_key_value_tensors(self, hidden_states)
+        else:
+            query_states = get_query_key_value_tensors(self, hidden_states)
+            key_states, value_states = key_value_last_layer
+            last_key_states, last_value_states = None, None
+
+        # QK-norm.
+        if self.qk_norm:
+            query_states = self.q_norm(query_states)
+            if not self.reuse_kv:
+                key_states = self.k_norm(key_states)
+
+        # RoPE.
+        cos, sin = position_embeddings
+        query_states = apply_rotary_emb(query_states, cos, sin)
+        if not self.reuse_kv:
+            key_states = apply_rotary_emb(key_states, cos, sin)
+
+        # KV-cache.
+        if not self.reuse_kv and cache_params is not None:
+            key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
+
+        # save k,v for next layer (*after* norm and RoPE and kv-cache update)
+        if not self.reuse_kv:
+            last_key_states, last_value_states = key_states, value_states
+
+        # sparse attention mask/bias from top-k index scores
+        #dtype = x.dtype
+        #min_dtype = torch.finfo(dtype).min
+        index_scores = index_scores.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        topk = min(self.topk, index_scores.size(-1))
+        _, topk_indices = torch.topk(index_scores, topk, dim=-1, largest=True, sorted=False) # (batch, n_heads, seq_len, top_k)
+        attn_mask = torch.zeros_like(index_scores, dtype=torch.bool)
+        attn_mask = attn_mask.scatter(-1, topk_indices, True) # todo: remove True, replace by topk_values != min_dtype??
+        attn_bias_const = torch.where(attn_mask, torch.zeros_like(index_scores), torch.full_like(index_scores, -100))
+        attn_bias_pass  = torch.where(attn_mask, index_scores,                   torch.full_like(index_scores, -100))
+        attn_bias = attn_bias_pass + (attn_bias_const - attn_bias_pass).detach() # STE
+
+        # attention computation.
+        #wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size #TODO
+
+        attn_output = flash_dmattn_func(
+                query=query_states.bfloat16(),
+                key=key_states.bfloat16(),
+                value=value_states.bfloat16(),
+                #attn_mask=attn_mask,
+                attn_bias=attn_bias.bfloat16(),
+                is_causal=True,
+                scale=1.0/math.sqrt(self.head_dim) if not self.config.use_uscaling else 1/self.head_dim,
+                softcap=self.config.softcap_global_attn,
+                deterministic=False,
+            )
+
+        if cache_params is not None and not self.reuse_kv:
+            cache_params.trim(self.layer_idx)
+
+        return attn_output, last_key_states, last_value_states
+    
+class DragonDynamicMaskAttention(nn.Module):
+    def __init__(self, config: DragonConfig, reuse_kv: bool, layer_idx: Optional[int], **kwargs):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.hidden_size = config.hidden_size
+        self.projection_dim = config.hidden_size * config.expand_factor
+        self.head_dim = self.projection_dim // self.num_heads
+        self.rope_theta = config.rope_theta
+        self.qk_norm = config.qk_norm
+        self.window_size = config.sliding_window_size
+        self.reuse_kv = reuse_kv
+        self.topk = config.dsa_topk
+
+        # read by flash_dmattn_func wrapper
+        self.keep_window_size = self.topk
+        self.is_causal = True
+
+        self.A = nn.Parameter(torch.zeros(config.num_key_value_heads))
+        self.dt_proj = DragonLinear(config, config.num_key_value_heads*self.head_dim, config.num_key_value_heads, bias=False)
+
+        projection_dim = self.head_dim * (self.num_heads + 2 * (0 if reuse_kv else self.num_key_value_heads))
+        self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
+
+        if self.qk_norm:
+            self.q_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+            if not reuse_kv:
+                self.k_norm = DragonRMSNorm(self.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
+        key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ):
+        # Q, K, V projections.
+        if not self.reuse_kv:
+            query_states, key_states, value_states = get_query_key_value_tensors(self, hidden_states)
+        else:
+            query_states = get_query_key_value_tensors(self, hidden_states)
+            key_states, value_states = key_value_last_layer
+            last_key_states, last_value_states = None, None
+
+        # QK-norm.
+        if self.qk_norm:
+            query_states = self.q_norm(query_states)
+            if not self.reuse_kv:
+                key_states = self.k_norm(key_states)
+
+        # RoPE.
+        cos, sin = position_embeddings
+        query_states = apply_rotary_emb(query_states, cos, sin)
+        if not self.reuse_kv:
+            key_states = apply_rotary_emb(key_states, cos, sin)
+
+        # KV-cache.
+        if not self.reuse_kv and cache_params is not None:
+            key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
+
+        # save k,v for next layer (*after* norm and RoPE and kv-cache update)
+        if not self.reuse_kv:
+            last_key_states, last_value_states = key_states, value_states
+
+        # attention computation.
+        #wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size # TODO
+
+        # sampling dt_states from value_states to generate attention bias
+        dt_states = self.dt_proj(value_states.reshape(value_states.size(0), value_states.size(1), -1)) # (B, L, h)
+        print(dt_states.shape)
+        attn_bias = torch.exp(self.A * F.softplus(dt_states)).transpose(-1, -2).to(hidden_states.dtype)
+
+        print(attn_bias.shape)
+
+        attn_output = flash_dynamic_mask_attention_forward(
+            self,
+            query_states.bfloat16(),
+            key_states.bfloat16(),
+            value_states.bfloat16(),
+            attention_mask=None,
+            attention_bias=attn_bias.bfloat16(),
+            scaling=1.0/math.sqrt(self.head_dim) if not self.config.use_uscaling else 1/self.head_dim,
+            softcap=self.config.softcap_global_attn,
         )
 
         if cache_params is not None and not self.reuse_kv:
@@ -596,9 +890,6 @@ class DragonDifferentialAttention(nn.Module):
             diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif DIFF_ATTN_IMPL == "eager":
             diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
-
-        if wsize > 200:
-            print("CCCCCCCCCCCCCCCCCCDDD")
 
         # attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(q, k, v, window_size=(window_size, 0), **kw)
         y1 = diff_attention_interface(
@@ -837,6 +1128,7 @@ class DragonGatedDeltaNet(nn.Module):
     def forward(self,
                 hidden_states: torch.Tensor,
                 cache_params: Optional[HybridDragonDynamicCache] = None,
+                **kwargs,
     ):
         _, q_len, _ = hidden_states.shape
         mode = 'fused_recurrent' if q_len <= 64 else 'chunk'
@@ -933,7 +1225,7 @@ class DragonGatedDeltaNet(nn.Module):
         if cache_params is not None:
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
 
-        return o
+        return o, None, None
 
 class DragonMLP(nn.Module):
     def __init__(self, config: DragonConfig):
@@ -947,6 +1239,72 @@ class DragonMLP(nn.Module):
         hidden_states = self._2_sqrt_5 * F.relu(hidden_states).square()
         hidden_states = self.fc_2(hidden_states)
         return hidden_states
+
+class DragonMonoBlock(GradientCheckpointingLayer):
+    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.expand_factor = config.expand_factor
+
+        if layer_type == 'g':
+            self.mixer = DragonGatedDeltaNet(config, layer_idx=layer_idx)
+        elif layer_type == 'f':
+            self.mixer = DragonDifferentialAttention(config, layer_idx=layer_idx)
+        elif layer_type == 's':
+            self.mixer = DragonDeepSeekSparseAttention(config, reuse_kv=False, layer_idx=layer_idx)
+        elif layer_type == 'm':
+            self.mixer = DragonDynamicMaskAttention(config, reuse_kv=False, layer_idx=layer_idx)
+        else:
+            raise ValueError(f"Unknown layer type: {layer_type}")
+        self.mixer_proj = DragonLinear(config, int(self.expand_factor*config.hidden_size), config.hidden_size, bias=False)
+
+        if isinstance(self.mixer, DragonDifferentialAttention):
+            self.mixer_group_norm = DragonHeadWiseRMSNorm(n_heads=self.mixer.num_heads//2, d_head=2*self.mixer.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        elif isinstance(self.mixer, DragonAttention) or isinstance(self.mixer, DragonDeepSeekSparseAttention) or isinstance(self.mixer, DragonDynamicMaskAttention):
+            self.mixer_group_norm = DragonHeadWiseRMSNorm(n_heads=self.mixer.num_heads, d_head=self.mixer.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        elif isinstance(self.mixer, DragonGatedDeltaNet):
+            self.mixer_group_norm = DragonHeadWiseRMSNorm(n_heads=self.mixer.n_heads, d_head=self.mixer.dv, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+
+        self.input_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+        self.mlp = DragonMLP(config)
+
+        self.register_buffer("lns", torch.tensor(1.0 if config.use_uscaling else 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))), persistent=False)
+        self.register_buffer("sqrt_tau", torch.sqrt(torch.tensor(self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
+        self.register_buffer("sqrt_one_minus_tau", torch.sqrt(torch.tensor(1.0 - self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ):
+        # MIXER.
+        residual = hidden_states
+        hidden_states = self.lns * self.input_norm(hidden_states) # (B, L, D)
+        y_mixer, last_key_states, last_value_states = self.mixer(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            cache_params=cache_params,
+            key_value_last_layer=key_value_last_layer,
+        ) # (B, L, E*D)
+        y_mixer = self.mixer_group_norm(y_mixer).view(y_mixer.size(0), y_mixer.size(1), -1)
+        y_mixer = self.mixer_proj(y_mixer)
+        hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mixer
+
+        # MLP.
+        residual = hidden_states
+        hidden_states = self.lns * self.postmixer_norm(hidden_states)
+        y_mlp = self.mlp(hidden_states) # (B, L, D)
+        hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mlp
+
+        return hidden_states, last_key_states, last_value_states
 
 class DragonBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str):
@@ -969,7 +1327,7 @@ class DragonBlock(GradientCheckpointingLayer):
         else:
             self.attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.attn.num_heads, d_head=self.attn.head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         self.lin_attn_group_norm = DragonHeadWiseRMSNorm(n_heads=self.lin_attn.n_heads, d_head=self.lin_attn.dv, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
-    
+
         self.input_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         self.postmixer_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         self.mlp = DragonMLP(config)
@@ -999,7 +1357,7 @@ class DragonBlock(GradientCheckpointingLayer):
             cache_params=cache_params,
             key_value_last_layer=key_value_last_layer,
         ) # (B, L, E*D)
-        y_lin_attn = self.lin_attn(
+        y_lin_attn, _, _ = self.lin_attn(
             hidden_states=hidden_states,
             cache_params=cache_params,
         ) # (B, L, E*D)
@@ -1032,7 +1390,7 @@ class DragonPreTrainedModel(PreTrainedModel):
         "attentions": DragonBlock,
     }
 
-    def _init_weights(self, module):
+    def _init_weights(self, module): # TODO: ??
         if isinstance(module, (DragonLinear, nn.Conv1d)):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -1092,7 +1450,7 @@ class DragonModel(DragonPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
+        self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
 
         self.rotary_emb = DragonRotaryEmbedding(config, head_dim=(config.expand_factor*config.hidden_size)//config.num_attention_heads) # only for SWA
         self.final_norm = DragonRMSNorm(config.hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
@@ -1184,6 +1542,7 @@ DragonModel.register_for_auto_class("AutoModel")
 class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
     def __init__(self, config: DragonConfig):
         super().__init__(config)
+        self.config = config
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=1/math.sqrt(config.hidden_size))
@@ -1220,17 +1579,31 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
 
+        logits = None
         loss = None
         if labels is not None:
             # move labels to correct device
-            labels = labels.to(logits.device)
+            labels = labels.to(hidden_states.device)
+
+            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
             # shift
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # compute loss
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=self.model.padding_idx)
+
+            """loss = linear_cross_entropy(
+                hidden_states[:, slice_indices, :].view(-1, hidden_states.size(-1)),
+                self.lm_head.weight,
+                labels.view(-1),
+                alpha_fwd=1/self.config.hidden_size if self.config.use_uscaling else 1.,
+                alpha_bwd=1/math.sqrt(self.config.hidden_size) if self.config.use_uscaling else 1.,
+                impl="cce_exact",
+                shift=1,
+            )"""
+        else:
+            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
 
         return DragonCausalLMOutput(
             loss=loss,

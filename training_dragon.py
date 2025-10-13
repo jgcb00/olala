@@ -14,14 +14,18 @@ import time
 import wandb
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .configuration_dragon import DragonConfig
 from .modeling_dragon import DragonForCausalLM
 
+# TODO: save code files!!!!
+
 @dataclass
 class NanoConfig:
+    resume_from: Optional[str] = None
     run_name : str = ""
     
     # arch - general
@@ -45,6 +49,11 @@ class NanoConfig:
     slw_increment: int = 64 # window size increment at each step
     softcap_local_attn: float = 0.0 # logit soft-capping for local attn logits, as per Gemma2 (0.0 = no soft-capping)
     softcap_global_attn: float = 0.0
+    qk_norm: bool = True
+    num_attention_heads_indexer: int = 8
+    head_dim_indexer: int = 32
+    dsa_q_lora_rank: int = 128
+    dsa_topk: int = 512
 
     # GatedDeltaNet related
     p_state_passing: float = 0.0 # probability of state passing (0.0 = no state passing)
@@ -88,8 +97,6 @@ class NanoConfig:
 
     # used during training
     slw_window: int = 0
-    # for logging
-    num_params: int = 0
 
 def _peek_data_shard(filename):
     with open(filename, "rb") as f:
@@ -165,10 +172,10 @@ class DistributedDataLoader:
     def next_batch(self):
         B = self.B
         T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = self.tokens[self.current_position : self.current_position+B*T]
         buf = np.asarray(buf, dtype=np.int64)
-        x = torch.from_numpy(buf[:-1].reshape(B, T)) # inputs
-        y = torch.from_numpy(buf[1: ].reshape(B, T)) # targets
+        x = torch.from_numpy(buf.reshape(B, T)) # inputs
+        y = torch.from_numpy(buf.reshape(B, T)) # targets
 
         # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
@@ -176,6 +183,45 @@ class DistributedDataLoader:
             self.advance()
 
         return x.cuda(), y.cuda()
+
+def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, wd):
+    groups, seen = [], set()
+    id2name = {id(p): n for n, p in model.named_parameters()}
+
+    for mod in model.modules():
+        if isinstance(mod, nn.Linear):
+            pname = id2name.get(id(mod.weight), "")
+            fan_in = mod.weight.shape[1]
+            scale = 1 / math.sqrt(fan_in)
+            if "lm_head" in pname:
+                lr_scaled = base_lr_head
+                wd_scaled = 0.0
+            else:
+                lr_scaled = base_lr_hidden * scale
+                wd_scaled = wd / lr_scaled
+
+            groups.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled})
+            seen.add(mod.weight)
+
+            if mod.bias is not None:
+                groups.append({"params": [mod.bias], "lr": lr_scaled, "weight_decay": 0.0})
+                seen.add(mod.bias)
+
+    for p in model.parameters():
+        if p in seen:
+            continue
+        pname = id2name.get(id(p), "<unnamed>")
+
+        if "embedding" in pname:
+            fan_out = p.shape[1] # nn.Embedding is transposed
+            #lr_scaled = base_lr / math.sqrt(fan_out) # u-muP
+            lr_scaled = base_lr_embed
+        else:
+            lr_scaled = base_lr_scalar
+
+        groups.append({"params": [p], "lr": lr_scaled, "weight_decay": 0.})
+
+    return groups
 
 config = tyro.cli(NanoConfig)
 
@@ -198,18 +244,34 @@ torch._dynamo.config.optimize_ddp=False
 
 # setup logging.
 ckpt = None
-resume_from = None
-if resume_from is not None and master_process:
+resume_from = config.resume_from
+if resume_from is not None:
+    if os.path.isdir(resume_from):
+        checkpoint_files = glob.glob(os.path.join(resume_from, "state_step*.pt"))
+        if not checkpoint_files:
+            raise ValueError(f"No checkpoint files found in directory: {resume_from}")
+        checkpoint_files.sort(key=lambda x: int(x.split("state_step")[1].split(".pt")[0]))
+        resume_from = checkpoint_files[-1]
+        if master_process:
+            print(f"Auto-selected latest checkpoint: {resume_from}")
     ckpt = torch.load(resume_from, map_location="cpu")
+    checkpoint_dir = os.path.dirname(resume_from)
+    saved_config_path = os.path.join(checkpoint_dir, 'config.pkl')
+    if os.path.exists(saved_config_path):
+        with open(saved_config_path, 'rb') as f:
+            config = pickle.load(f)
+        config.resume_from = resume_from
+        if master_process:
+            print(f"Loaded saved config from {saved_config_path}")
+    else:
+        if master_process:
+            print(f"WARNING: Could not find saved config at {saved_config_path}, using CLI config")
+if master_process:
+    print(f"running with config:\n{config}")
 if master_process:
     run_id = config.run_name + '_' + str(uuid.uuid4().hex[:8]) if ckpt is None else ckpt['run_id']
     logdir = os.path.join(config.log_dir, run_id)
     os.makedirs(logdir, exist_ok=True)
-    if ckpt is None:
-        with open(f'{logdir}/config.json', 'w') as f:
-            json.dump(vars(config), f)
-        with open(f'{logdir}/config.pkl', 'wb') as f:
-            pickle.dump(config, f)
     logfile = os.path.join(config.log_dir, f"{run_id}.txt")
     print(f"Logging to {logfile}")
 def print0(s, console=True):
@@ -219,7 +281,17 @@ def print0(s, console=True):
                 print(s)
             print(s, file=f)
 if master_process:
-    wandb.init(project=config.wandb_project, name=config.run_name, config={**vars(config)}, mode=None if config.log_wandb else 'disabled', id=run_id, resume="allow" if ckpt is not None else None)
+    #if ckpt is not None:
+    #    print0(f"Resuming wandb run {config.wandb_id}")
+    wandb.init(project=config.wandb_project, dir=logdir, name=config.run_name, config={**vars(config)}, mode=None if config.log_wandb else 'disabled')#, fork_from=None if ckpt is None else f"{config.wandb_id}?_step={ckpt['iteration']}")
+    config.wandb_id = wandb.run.id
+    print0(f"WandB run id: {wandb.run.id}")
+# so that we save the wandb id in the config.
+if master_process and not resume_from:
+    with open(f'{logdir}/config.json', 'w') as f:
+        json.dump(vars(config), f)
+    with open(f'{logdir}/config.pkl', 'wb') as f:
+        pickle.dump(config, f)
 
 # define convenience variables.
 B, T = config.device_batch_size, config.sequence_length
@@ -233,8 +305,12 @@ print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} 
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 # load model.
-assert not config.zero_centered_gamma
 config_hf = DragonConfig(
+    qk_norm=config.qk_norm,
+    num_attention_heads_indexer=config.num_attention_heads_indexer,
+    head_dim_indexer=config.head_dim_indexer,
+    dsa_q_lora_rank=config.dsa_q_lora_rank,
+    dsa_topk=config.dsa_topk,
     zero_centered_gamma=config.zero_centered_gamma,
     vocab_size=config.vocab_size,
     max_position_embeddings=config.sequence_length,
@@ -257,7 +333,7 @@ config_hf = DragonConfig(
 model = DragonForCausalLM(config_hf)
 model = model.cuda()
 
-# check here that the init std is as expected: # TODO TEMPORARY
+"""# check here that the init std is as expected: # TODO TEMPORARY
 with torch.no_grad():
     wstd = model.model.embedding.weight.std().item()
     print0(f"Model weight init std: {wstd:.6f} (expected {config.init_std})")
@@ -267,35 +343,48 @@ with torch.no_grad():
     lstd = model.model.layers[0].attn.linear_qkv.weight.std().item()
     print0(f"Model first layer attention QKV weight init std: {lstd:.6f} (expected {config.init_std})")
 
+    lstd = model.model.layers[0].lin_attn.qkv_conv1d.weight.std().item()
+    print0(f"Model first layer conv QKV weight init std: {lstd:.6f} (expected {config.init_std})")"""
+
 # count params. (total & active)
 num_params = sum(p.numel() for p in model.parameters())
-model.eval()
+"""model.eval()
 x, y = train_loader.next_batch()
-model(input_ids=x[[0], [0]].unsqueeze(0)).logits.sum().backward()
+with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+    model(input_ids=x[[0], [0]].unsqueeze(0)).logits.sum().backward()
 num_active = sum(p.grad.count_nonzero() for p in model.parameters() if p.grad is not None)
 model.zero_grad(set_to_none=True)
-model.train()
+model.train()"""
 print0(f"number of total parameters:  {num_params}")
-print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
+#print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
 
 # DDP & compile.
-model = torch.compile(model, dynamic=False)
+with torch.no_grad():
+    for module in model.modules():
+        if isinstance(module, nn.Embedding):
+            module.weight.data = module.weight.data.to(torch.bfloat16)
+        if isinstance(module, nn.Linear):
+            module.weight.data = module.weight.data.to(torch.bfloat16)
+model = torch.compile(model, dynamic=True)
 model.train()
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # load optimizers & schedulers.
-hidden_matrix_params = [p for n, p in raw_model.model.layers.named_parameters() if p.ndim >= 2 and "embedding" not in n and "conv" not in n]
-embed_params = [p for n, p in raw_model.named_parameters() if "embedding" in n]
-scalar_params = [p for n, p in raw_model.named_parameters() if p.ndim < 2 or "conv" in n]
-head_params = [raw_model.lm_head.weight]
-
-optimizer1 = torch.optim.Adam(hidden_matrix_params, lr=config.learning_rate, weight_decay=config.weight_decay/config.learning_rate, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
-optimizer2 = torch.optim.Adam(embed_params, lr=config.uscaling_mult_embed*config.learning_rate, weight_decay=0., betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
-optimizer3 = torch.optim.Adam(scalar_params, lr=config.uscaling_mult_scalar*config.learning_rate, weight_decay=0., betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
-optimizer4 = torch.optim.Adam(head_params, lr=config.uscaling_mult_head*config.learning_rate, weight_decay=0., betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+if config.use_uscaling:
+    param_list = param_groups_mup(
+        raw_model,
+        base_lr_hidden=config.learning_rate,
+        base_lr_scalar=config.uscaling_mult_scalar*config.learning_rate if config.uscaling_mult_scalar > 0 else config.learning_rate,
+        base_lr_embed=config.uscaling_mult_embed*config.learning_rate if config.uscaling_mult_embed > 0 else config.learning_rate,
+        base_lr_head=config.uscaling_mult_head*config.learning_rate if config.uscaling_mult_head > 0 else config.learning_rate,
+        wd=config.weight_decay,
+    )
+    optimizer = torch.optim.AdamW(param_list, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
+else:
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
+optimizers = [optimizer]
 
 def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
     assert it <= num_iterations, f"it : {it}, num_iterations : {num_iterations}"
@@ -341,15 +430,19 @@ for iter_ in range(start_iter, config.total_iterations+1):
     if iter_ == WARMUP_SKIP:
         training_time_ms = 0
         t0 = time.perf_counter()
+    to_log = {}
 
     # SLW WINDOW UPDATE
-    slw_warmup_iters = int(config.slw_warmup_iters * config.total_iterations)
+    if config.slw_warmup_iters > 0:
+        slw_warmup_iters = int(config.slw_warmup_iters * config.total_iterations)
 
-    progress_ratio = iter_ / slw_warmup_iters
-    window = config.slw_start + progress_ratio * (config.sequence_length - config.slw_start)
-    window = config.slw_increment * math.ceil(window / config.slw_increment) # quantize
-    window = int(min(window, config.sequence_length)) # cap
-    raw_model.config.slw_wsize = window
+        progress_ratio = iter_ / slw_warmup_iters
+        window = config.slw_start + progress_ratio * (config.sequence_length - config.slw_start)
+        window = config.slw_increment * math.ceil(window / config.slw_increment) # quantize
+        window = int(min(window, config.sequence_length)) # cap
+        raw_model.config.slw_wsize = window
+
+        to_log['slw_window'] = window
 
     # ----------- VALIDATION SECTION -----------
     if (last_iter or (config.val_loss_every > 0 and iter_ % config.val_loss_every == 0)):
@@ -360,13 +453,14 @@ for iter_ in range(start_iter, config.total_iterations+1):
         # run validation batches.
         model.eval()
         val_loader.reset()
-        val_loss = 0
+        val_loss = torch.zeros((), device=device, dtype=torch.float32)
         for _ in range(config.val_iterations):
-            inputs, targets = val_loader.next_batch()
-            with torch.no_grad():
-                with ctx:
-                    val_loss += model(input_ids=inputs, labels=targets).loss
-        val_loss /= config.val_iterations
+            for _ in range(accumulation_steps):
+                inputs, targets = val_loader.next_batch()
+                with torch.no_grad():
+                    with ctx:
+                        val_loss += model(input_ids=inputs, labels=targets).loss
+        val_loss /= config.val_iterations * accumulation_steps
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss = val_loss.item()
         model.train()
@@ -420,7 +514,7 @@ for iter_ in range(start_iter, config.total_iterations+1):
             (loss / accumulation_steps).backward() # just sync on the last step
     # clip those gradients.
     if config.grad_norm_clip is not None:
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_norm_clip, foreach=True)
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_norm_clip, foreach=True)
     else:
         grad_norm = torch.tensor(0.)
     # step the optimizers & schedulers.
@@ -433,9 +527,10 @@ for iter_ in range(start_iter, config.total_iterations+1):
     # ----------- LOGGING SECTION -----------
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= WARMUP_SKIP else 0
-    print0(f"iteration:{iter_+1:0{len(str(config.total_iterations))}d}/{config.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms")
+    extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
+    print0(f"iteration:{iter_+1:0{len(str(config.total_iterations))}d}/{config.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
-        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item()}, step=iter_)
+        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log}, step=iter_)
 
 print0(f"peak memory consumption during training: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 print0("Training complete.")

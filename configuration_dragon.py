@@ -89,8 +89,20 @@ class DragonConfig(PretrainedConfig):
     model_type = "dragon"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    """
+    config.num_attention_heads_indexer
+        self.indexer_head_dim = config.head_dim_indexer
+        self.q_lora_rank = config.dsa_q_lora_rank
+        self.topk = config.dsa_topk
+        """
+
     def __init__(
         self,
+        qk_norm=True,
+        num_attention_heads_indexer=8,
+        head_dim_indexer=32,
+        dsa_q_lora_rank=128,
+        dsa_topk=512,
         zero_centered_gamma=False,
         vocab_size=151936,
         tie_word_embeddings=False,
@@ -130,9 +142,13 @@ class DragonConfig(PretrainedConfig):
         old_lns=False,
         **kwargs,
     ):
+        self.num_attention_heads_indexer = num_attention_heads_indexer
+        self.head_dim_indexer = head_dim_indexer
+        self.dsa_q_lora_rank = dsa_q_lora_rank
+        self.dsa_topk = dsa_topk
         self.zero_centered_gamma = zero_centered_gamma
         self.rope_theta = rope_theta_local
-        self.qk_norm = True
+        self.qk_norm = qk_norm
         self.softcap_local_attn=softcap_local_attn
         self.softcap_global_attn=softcap_global_attn
         self.use_uscaling = use_uscaling
@@ -196,4 +212,4 @@ class DragonConfig(PretrainedConfig):
 
 DragonConfig.register_for_auto_class("AutoConfig")
 __all__ = ["DragonConfig"]
-# todo : update docstrings
+# todo : update docstrings, arg orders
