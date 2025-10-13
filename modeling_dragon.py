@@ -189,7 +189,9 @@ class HybridDragonDynamicCache(DynamicCache):
     def __init__(self, config: DragonConfig):
         super().__init__()
         self.config = config
-        self.conv_caches = []
+        self.q_conv_caches = []
+        self.k_conv_caches = []
+        self.v_conv_caches = []
         self.ssm_caches = []
         self._key_cache = {}
         self._value_cache = {}
@@ -199,7 +201,9 @@ class HybridDragonDynamicCache(DynamicCache):
                 self._key_cache[idx] = None
                 self._value_cache[idx] = None
 
-            self.conv_caches.append(None)
+            self.q_conv_caches.append(None)
+            self.k_conv_caches.append(None)
+            self.v_conv_caches.append(None)
             self.ssm_caches.append(None)
 
         self.window_size = config.sliding_window_size
@@ -1117,8 +1121,9 @@ class DragonGatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(A_log)
 
         self.conv_size = config.conv_kernel
-        self.conv_dim = 2*self.key_dim+self.value_dim
-        self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
+        self.q_conv1d = nn.Conv1d(in_channels=self.key_dim, out_channels=self.key_dim, bias=False, kernel_size=self.conv_size, groups=self.key_dim, padding=self.conv_size-1)
+        self.k_conv1d = nn.Conv1d(in_channels=self.key_dim, out_channels=self.key_dim, bias=False, kernel_size=self.conv_size, groups=self.key_dim, padding=self.conv_size-1)
+        self.v_conv1d = nn.Conv1d(in_channels=self.value_dim, out_channels=self.value_dim, bias=False, kernel_size=self.conv_size, groups=self.value_dim, padding=self.conv_size-1)
 
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
@@ -1145,50 +1150,97 @@ class DragonGatedDeltaNet(nn.Module):
         # [L,B,(H*P)] -> [B,L,H,P]
         qkvbag = rearrange(qkvbag, "b l (h p) -> b l h p", h=self.n_heads_local).contiguous()
         # split per head: [B,L,H,dk/dk/dv/1/1]
-        qkv_proj = qkvbag[..., 0:2*self.dk+self.dv]
+        q_proj = qkvbag[..., 0:self.dk]
+        k_proj = qkvbag[..., self.dk:2*self.dk]
+        v_proj = qkvbag[..., 2*self.dk:2*self.dk+self.dv]
         b_proj = qkvbag[..., 2*self.dk+self.dv:2*self.dk+self.dv+1]
         a_proj = qkvbag[..., 2*self.dk+self.dv+1:2*self.dk+self.dv+2]
         g_proj = qkvbag[..., 2*self.dk+self.dv+2:]
         # concat for conv
-        mixed_qkv = rearrange(qkv_proj, "b l h d -> b l (h d)")
+        q_proj = rearrange(q_proj, "b l h d -> b l (h d)") # d=1
+        k_proj = rearrange(k_proj, "b l h d -> b l (h d)") # d=1
+        v_proj = rearrange(v_proj, "b l h d -> b l (h d)")
         b_proj = rearrange(b_proj, "b l h d -> b l (h d)") # d=1
         a_proj = rearrange(a_proj, "b l h d -> b l (h d)")
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        # here, mixed_qkv (HF, imple B) is the same as torch.cat([q_proj, k_proj, v_proj], dim=-1) (MG, imple A)
+
+        q_proj = q_proj.transpose(1, 2)
+        k_proj = k_proj.transpose(1, 2)
+        v_proj = v_proj.transpose(1, 2)
+
+        mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=1)
 
         if cache_params is not None:
-            conv_cache = cache_params.conv_caches[self.layer_idx]
+            q_conv_cache = cache_params.q_conv_caches[self.layer_idx]
+            k_conv_cache = cache_params.k_conv_caches[self.layer_idx]
+            v_conv_cache = cache_params.v_conv_caches[self.layer_idx]
             ssm_cache = cache_params.ssm_caches[self.layer_idx]
 
         if use_precomputed_states:
-            mixed_qkv = self.causal_conv1d_update(
-                mixed_qkv,
-                conv_cache,
-                self.qkv_conv1d.weight.squeeze(1),
-                self.qkv_conv1d.bias,
+            q_proj = self.causal_conv1d_update(
+                q_proj,
+                q_conv_cache,
+                self.q_conv1d.weight.squeeze(1),
+                self.q_conv1d.bias,
                 'silu',
             ) # conv_cache is updated in-place here
+            k_proj = self.causal_conv1d_update(
+                k_proj,
+                k_conv_cache,
+                self.k_conv1d.weight.squeeze(1),
+                self.k_conv1d.bias,
+                'silu',
+            )
+            v_proj = self.causal_conv1d_update(
+                v_proj,
+                v_conv_cache,
+                self.v_conv1d.weight.squeeze(1),
+                self.v_conv1d.bias,
+                'silu',
+            )
         else:
             if cache_params is not None:
-                conv_cache = F.pad(mixed_qkv, (self.conv_size - mixed_qkv.shape[-1], 0))
-                cache_params.conv_caches[self.layer_idx] = conv_cache
+                q_conv_cache = F.pad(q_proj, (self.conv_size - q_proj.shape[-1], 0))
+                k_conv_cache = F.pad(k_proj, (self.conv_size - k_proj.shape[-1], 0))
+                v_conv_cache = F.pad(v_proj, (self.conv_size - v_proj.shape[-1], 0))
+                cache_params.q_conv_caches[self.layer_idx] = q_conv_cache
+                cache_params.k_conv_caches[self.layer_idx] = k_conv_cache
+                cache_params.v_conv_caches[self.layer_idx] = v_conv_cache
             if self.causal_conv1d_fn is not None:
-                mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=self.qkv_conv1d.weight.squeeze(1),
-                    bias=self.qkv_conv1d.bias,
+                q_proj = self.causal_conv1d_fn(
+                    x=q_proj,
+                    weight=self.q_conv1d.weight.squeeze(1),
+                    bias=self.q_conv1d.bias,
+                    activation='silu',
+                    seq_idx=None,
+                )
+                k_proj = self.causal_conv1d_fn(
+                    x=k_proj,
+                    weight=self.k_conv1d.weight.squeeze(1),
+                    bias=self.k_conv1d.bias,
+                    activation='silu',
+                    seq_idx=None,
+                )
+                v_proj = self.causal_conv1d_fn(
+                    x=v_proj,
+                    weight=self.v_conv1d.weight.squeeze(1),
+                    bias=self.v_conv1d.bias,
                     activation='silu',
                     seq_idx=None,
                 )
             else:
-                mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :q_len])
+                q_proj = F.silu(self.q_conv1d(q_proj)[:, :, :q_len])
+                k_proj = F.silu(self.k_conv1d(k_proj)[:, :, :q_len])
+                v_proj = F.silu(self.v_conv1d(v_proj)[:, :, :q_len])
 
         # split back
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        mixed_qkv = rearrange(mixed_qkv, "b l (h d) -> b l h d", h=self.n_heads_local).contiguous()
-        q = mixed_qkv[..., 0:self.dk]
-        k = mixed_qkv[..., self.dk:2*self.dk]
-        v = mixed_qkv[..., 2*self.dk:2*self.dk+self.dv]
+        q_proj = q_proj.transpose(1, 2)
+        k_proj = k_proj.transpose(1, 2)
+        v_proj = v_proj.transpose(1, 2)
+        q = rearrange(q_proj, "b l (h d) -> b l h d", d=self.dk)
+        k = rearrange(k_proj, "b l (h d) -> b l h d", d=self.dk)
+        v = rearrange(v_proj, "b l (h d) -> b l h d", d=self.dv)
 
         beta = b_proj.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a_proj.float() + self.dt_bias)
@@ -1364,12 +1416,14 @@ class DragonBlock(GradientCheckpointingLayer):
         y_attn = self.attn_group_norm(y_attn).view(y_attn.size(0), y_attn.size(1), -1)
         y_lin_attn = self.lin_attn_group_norm(y_lin_attn).view(y_lin_attn.size(0), y_lin_attn.size(1), -1)
         y_mixer = self.mixer_proj(self.sqrt_2_2 * (y_attn + y_lin_attn))
+        print("1234", self.sqrt_tau)
         hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mixer
 
         # MLP.
         residual = hidden_states
         hidden_states = self.lns * self.postmixer_norm(hidden_states)
         y_mlp = self.mlp(hidden_states) # (B, L, D)
+        print("12345678", self.sqrt_tau)
         hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mlp
 
         return hidden_states, last_key_states, last_value_states
