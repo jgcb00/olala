@@ -1,5 +1,4 @@
 import os
-import uuid
 import glob
 import json
 import pickle
@@ -7,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Union, Optional
 from contextlib import nullcontext
 from functools import partial
+import gc
 import math
 import numpy as np
 import tyro
@@ -18,13 +18,15 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import transformers
+
 from .configuration_dragon import DragonConfig
 from .modeling_dragon import DragonForCausalLM
 
 # TODO: save code files!!!!
 
 @dataclass
-class NanoConfig:
+class NanoArgs:
     resume_from: Optional[str] = None
     run_name : str = ""
     
@@ -93,6 +95,7 @@ class NanoConfig:
     save_every: int = 1000
     log_dir: str = "logs/"
     wandb_project: str = "dragon_v1.5"
+    wandb_name: Optional[str] = None
     log_wandb: bool = False
 
     # used during training
@@ -223,7 +226,7 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
 
     return groups
 
-config = tyro.cli(NanoConfig)
+args = tyro.cli(NanoArgs)
 
 # set up DDP (distributed data parallel).
 assert torch.cuda.is_available()
@@ -243,108 +246,115 @@ master_process = (ddp_rank == 0) # this process will do logging, checkpointing e
 torch._dynamo.config.optimize_ddp=False
 
 # setup logging.
-ckpt = None
-resume_from = config.resume_from
-if resume_from is not None:
-    if os.path.isdir(resume_from):
-        checkpoint_files = glob.glob(os.path.join(resume_from, "state_step*.pt"))
-        if not checkpoint_files:
-            raise ValueError(f"No checkpoint files found in directory: {resume_from}")
-        checkpoint_files.sort(key=lambda x: int(x.split("state_step")[1].split(".pt")[0]))
-        resume_from = checkpoint_files[-1]
+resume_dir = None
+if args.resume_from:
+    cand = args.resume_from # either a step dir or the run dir
+    if os.path.isdir(cand) and os.path.exists(os.path.join(cand, "train_state.pt")):
+        resume_dir = cand
+    elif os.path.isdir(cand):
+        # pick latest step*/train_state.pt inside run dir
+        step_dirs = sorted(
+            [d for d in glob.glob(os.path.join(cand, "step*")) if os.path.isdir(d)],
+            key=lambda p: int(os.path.basename(p).replace("step","")),
+        )
+        if not step_dirs:
+            raise ValueError(f"No step*/train_state.pt under {cand}")
+        resume_dir = step_dirs[-1]
         if master_process:
-            print(f"Auto-selected latest checkpoint: {resume_from}")
-    ckpt = torch.load(resume_from, map_location="cpu")
-    checkpoint_dir = os.path.dirname(resume_from)
-    saved_config_path = os.path.join(checkpoint_dir, 'config.pkl')
-    if os.path.exists(saved_config_path):
-        with open(saved_config_path, 'rb') as f:
-            config = pickle.load(f)
-        config.resume_from = resume_from
-        if master_process:
-            print(f"Loaded saved config from {saved_config_path}")
+            print(f"Auto-selected latest checkpoint dir: {resume_dir}")
     else:
-        if master_process:
-            print(f"WARNING: Could not find saved config at {saved_config_path}, using CLI config")
+        raise ValueError(f"resume_from must be a directory (got {cand})")
+
 if master_process:
-    print(f"running with config:\n{config}")
-if master_process:
-    run_id = config.run_name + '_' + str(uuid.uuid4().hex[:8]) if ckpt is None else ckpt['run_id']
-    logdir = os.path.join(config.log_dir, run_id)
+    if resume_dir is not None:
+        train_state = torch.load(os.path.join(resume_dir, "train_state.pt"), map_location="cpu")
+        run_name = train_state.get("run_name", args.run_name)
+        logdir = os.path.dirname(resume_dir)
+    else:
+        run_name = args.run_name
+        logdir = os.path.join(args.log_dir, args.run_name)
     os.makedirs(logdir, exist_ok=True)
-    logfile = os.path.join(config.log_dir, f"{run_id}.txt")
+    logfile = os.path.join(logdir, f"{run_name}.txt")
     print(f"Logging to {logfile}")
+    if resume_dir is None:
+        with open(f'{logdir}/args.json', 'w') as f: json.dump(vars(args), f)
+        with open(f'{logdir}/args.pkl', 'wb') as f: pickle.dump(args, f)
 def print0(s, console=True):
     if master_process:
         with open(logfile, "a") as f:
             if console:
                 print(s)
             print(s, file=f)
+if resume_dir is not None:
+    saved_args_path = os.path.join(os.path.dirname(resume_dir), "args.pkl")
+    if os.path.exists(saved_args_path):
+        with open(saved_args_path, "rb") as f:
+            saved_args = pickle.load(f)
+        cli_resume = args.resume_from
+        args = saved_args
+        args.resume_from = cli_resume or resume_dir
+print0(f"running with args:\n{args}")
 if master_process:
-    #if ckpt is not None:
-    #    print0(f"Resuming wandb run {config.wandb_id}")
-    wandb.init(project=config.wandb_project, dir=logdir, name=config.run_name, config={**vars(config)}, mode=None if config.log_wandb else 'disabled')#, fork_from=None if ckpt is None else f"{config.wandb_id}?_step={ckpt['iteration']}")
-    config.wandb_id = wandb.run.id
-    print0(f"WandB run id: {wandb.run.id}")
-# so that we save the wandb id in the config.
-if master_process and not resume_from:
-    with open(f'{logdir}/config.json', 'w') as f:
-        json.dump(vars(config), f)
-    with open(f'{logdir}/config.pkl', 'wb') as f:
-        pickle.dump(config, f)
+    wandb.init(project=args.wandb_project, dir=logdir, name=args.wandb_name if args.wandb_name else args.run_name, config={**vars(args)}, mode=None if args.log_wandb else 'disabled')
+    print0(f"wandb run id: {wandb.run.id}")
 
 # define convenience variables.
-B, T = config.device_batch_size, config.sequence_length
-assert config.batch_size % (B * ddp_world_size) == 0
-accumulation_steps = config.batch_size // (B * ddp_world_size)
+B, T = args.device_batch_size, args.sequence_length
+assert args.batch_size % (B * ddp_world_size) == 0
+accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load dataloaders.
-train_loader = DistributedDataLoader(config.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(config.input_val_bin, B, T, ddp_rank, ddp_world_size)
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 # load model.
 config_hf = DragonConfig(
-    qk_norm=config.qk_norm,
-    num_attention_heads_indexer=config.num_attention_heads_indexer,
-    head_dim_indexer=config.head_dim_indexer,
-    dsa_q_lora_rank=config.dsa_q_lora_rank,
-    dsa_topk=config.dsa_topk,
-    zero_centered_gamma=config.zero_centered_gamma,
-    vocab_size=config.vocab_size,
-    max_position_embeddings=config.sequence_length,
-    use_uscaling=config.use_uscaling,
-    hidden_size=config.d_model,
-    intermediate_size=config.d_model * config.mlp_expand,
-    expand_factor=config.expand_factor,
-    layers_config=config.layers_config,
-    num_attention_heads=config.n_heads,
-    num_key_value_heads=config.n_kv_heads if config.n_kv_heads > 0 else config.n_heads,
-    initializer_range=config.init_std,
-    softcap_local_attn=config.softcap_local_attn,
-    softcap_global_attn=config.softcap_global_attn,
-    norm_epsilon=config.eps_rmsnorm,
+    qk_norm=args.qk_norm,
+    num_attention_heads_indexer=args.num_attention_heads_indexer,
+    head_dim_indexer=args.head_dim_indexer,
+    dsa_q_lora_rank=args.dsa_q_lora_rank,
+    dsa_topk=args.dsa_topk,
+    zero_centered_gamma=args.zero_centered_gamma,
+    vocab_size=args.vocab_size,
+    max_position_embeddings=args.sequence_length,
+    use_uscaling=args.use_uscaling,
+    hidden_size=args.d_model,
+    intermediate_size=args.d_model * args.mlp_expand,
+    expand_factor=args.expand_factor,
+    layers_config=args.layers_config,
+    num_attention_heads=args.n_heads,
+    num_key_value_heads=args.n_kv_heads if args.n_kv_heads > 0 else args.n_heads,
+    initializer_range=args.init_std,
+    softcap_local_attn=args.softcap_local_attn,
+    softcap_global_attn=args.softcap_global_attn,
+    norm_epsilon=args.eps_rmsnorm,
     use_cache=False,
-    sliding_window_size=config.swa_window_size,
-    rope_theta_local=config.rope_theta_local,
-    uscaling_tau=config.uscaling_tau,
+    sliding_window_size=args.swa_window_size,
+    rope_theta_local=args.rope_theta_local,
+    uscaling_tau=args.uscaling_tau,
 )
-model = DragonForCausalLM(config_hf)
-model = model.cuda()
+
+if resume_dir is None:
+    model = DragonForCausalLM(config_hf)
+    model = model.cuda()
+else:
+    model = DragonForCausalLM.from_pretrained(resume_dir, torch_dtype=torch.bfloat16)
+    model = model.cuda()
 
 """# check here that the init std is as expected: # TODO TEMPORARY
 with torch.no_grad():
     wstd = model.model.embedding.weight.std().item()
-    print0(f"Model weight init std: {wstd:.6f} (expected {config.init_std})")
-    assert abs(wstd - config.init_std) / config.init_std < 0.1, f"weight init std {wstd} deviates from expected {config.init_std} by more than 10%"
+    print0(f"Model weight init std: {wstd:.6f} (expected {args.init_std})")
+    assert abs(wstd - args.init_std) / args.init_std < 0.1, f"weight init std {wstd} deviates from expected {args.init_std} by more than 10%"
 
     # check on another we
     lstd = model.model.layers[0].attn.linear_qkv.weight.std().item()
-    print0(f"Model first layer attention QKV weight init std: {lstd:.6f} (expected {config.init_std})")
+    print0(f"Model first layer attention QKV weight init std: {lstd:.6f} (expected {args.init_std})")
 
     lstd = model.model.layers[0].lin_attn.qkv_conv1d.weight.std().item()
-    print0(f"Model first layer conv QKV weight init std: {lstd:.6f} (expected {config.init_std})")"""
+    print0(f"Model first layer conv QKV weight init std: {lstd:.6f} (expected {args.init_std})")"""
 
 # count params. (total & active)
 num_params = sum(p.numel() for p in model.parameters())
@@ -359,12 +369,7 @@ print0(f"number of total parameters:  {num_params}")
 #print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
 
 # DDP & compile.
-with torch.no_grad():
-    for module in model.modules():
-        if isinstance(module, nn.Embedding):
-            module.weight.data = module.weight.data.to(torch.bfloat16)
-        if isinstance(module, nn.Linear):
-            module.weight.data = module.weight.data.to(torch.bfloat16)
+uncompiled_model = model
 model = torch.compile(model, dynamic=True)
 model.train()
 model = DDP(model, device_ids=[ddp_local_rank])
@@ -372,18 +377,18 @@ raw_model = model.module
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # load optimizers & schedulers.
-if config.use_uscaling:
+if args.use_uscaling:
     param_list = param_groups_mup(
         raw_model,
-        base_lr_hidden=config.learning_rate,
-        base_lr_scalar=config.uscaling_mult_scalar*config.learning_rate if config.uscaling_mult_scalar > 0 else config.learning_rate,
-        base_lr_embed=config.uscaling_mult_embed*config.learning_rate if config.uscaling_mult_embed > 0 else config.learning_rate,
-        base_lr_head=config.uscaling_mult_head*config.learning_rate if config.uscaling_mult_head > 0 else config.learning_rate,
-        wd=config.weight_decay,
+        base_lr_hidden=args.learning_rate,
+        base_lr_scalar=args.uscaling_mult_scalar*args.learning_rate if args.uscaling_mult_scalar > 0 else args.learning_rate,
+        base_lr_embed=args.uscaling_mult_embed*args.learning_rate if args.uscaling_mult_embed > 0 else args.learning_rate,
+        base_lr_head=args.uscaling_mult_head*args.learning_rate if args.uscaling_mult_head > 0 else args.learning_rate,
+        wd=args.weight_decay,
     )
-    optimizer = torch.optim.AdamW(param_list, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
+    optimizer = torch.optim.AdamW(param_list, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
 else:
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps)
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
 optimizers = [optimizer]
 
 def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
@@ -398,23 +403,22 @@ def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
     else:
         decay_ratio = (num_iterations - it) / warmdown_iters
         return decay_ratio
-sched_func = partial(get_lr_wsd, config.total_iterations, config.warmup_iters, config.warmdown_iters)
+sched_func = partial(get_lr_wsd, args.total_iterations, args.warmup_iters, args.warmdown_iters)
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, sched_func) for opt in optimizers]
 
 # resume if necessary.
 start_iter = 0
 training_time_ms = 0
-if ckpt is not None:
-    print0(f"Resuming from {resume_from}")
-    raw_model.load_state_dict(ckpt['model'])
-    for opt, s in zip(optimizers, ckpt.get("optimizers", [])):
+if resume_dir is not None:  
+    train_state = torch.load(os.path.join(resume_dir, "train_state.pt"), map_location="cpu")
+    for opt, s in zip(optimizers, train_state.get("optimizers", [])):
         opt.load_state_dict(s)
-    for sch, s in zip(schedulers, ckpt.get("schedulers", [])):
+    for sch, s in zip(schedulers, train_state.get("schedulers", [])):
         sch.load_state_dict(s)
-    torch.set_rng_state(ckpt["rng_cpu"])
-    torch.cuda.set_rng_state_all(ckpt["rng_cuda"])
-    training_time_ms = ckpt.get("training_time_ms", 0)
-    start_iter = ckpt.get("iteration", 0) + 1
+    torch.set_rng_state(train_state["rng_cpu"])
+    torch.cuda.set_rng_state_all(train_state["rng_cuda"])
+    training_time_ms = train_state.get("training_time_ms", 0)
+    start_iter = train_state.get("iteration", 0) + 1
 
 # start the clock.
 torch.cuda.synchronize()
@@ -423,29 +427,30 @@ WARMUP_SKIP = 10
 
 # begin training.
 train_loader.reset()
+tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True) # for saving
 x, y = train_loader.next_batch()
 
-for iter_ in range(start_iter, config.total_iterations+1):
-    last_iter = (iter_ == config.total_iterations)
+for iter_ in range(start_iter, args.total_iterations+1):
+    last_iter = (iter_ == args.total_iterations)
     if iter_ == WARMUP_SKIP:
         training_time_ms = 0
         t0 = time.perf_counter()
     to_log = {}
 
     # SLW WINDOW UPDATE
-    if config.slw_warmup_iters > 0:
-        slw_warmup_iters = int(config.slw_warmup_iters * config.total_iterations)
+    if args.slw_warmup_iters > 0:
+        slw_warmup_iters = int(args.slw_warmup_iters * args.total_iterations)
 
         progress_ratio = iter_ / slw_warmup_iters
-        window = config.slw_start + progress_ratio * (config.sequence_length - config.slw_start)
-        window = config.slw_increment * math.ceil(window / config.slw_increment) # quantize
-        window = int(min(window, config.sequence_length)) # cap
+        window = args.slw_start + progress_ratio * (args.sequence_length - args.slw_start)
+        window = args.slw_increment * math.ceil(window / args.slw_increment) # quantize
+        window = int(min(window, args.sequence_length)) # cap
         raw_model.config.slw_wsize = window
 
         to_log['slw_window'] = window
 
     # ----------- VALIDATION SECTION -----------
-    if (last_iter or (config.val_loss_every > 0 and iter_ % config.val_loss_every == 0)):
+    if (last_iter or (args.val_loss_every > 0 and iter_ % args.val_loss_every == 0)):
         # stop the clock.
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -454,19 +459,18 @@ for iter_ in range(start_iter, config.total_iterations+1):
         model.eval()
         val_loader.reset()
         val_loss = torch.zeros((), device=device, dtype=torch.float32)
-        for _ in range(config.val_iterations):
+        for _ in range(args.val_iterations):
             for _ in range(accumulation_steps):
                 inputs, targets = val_loader.next_batch()
-                with torch.no_grad():
-                    with ctx:
-                        val_loss += model(input_ids=inputs, labels=targets).loss
-        val_loss /= config.val_iterations * accumulation_steps
+                with ctx:
+                    val_loss += model(input_ids=inputs, labels=targets).loss.detach()
+        val_loss /= args.val_iterations * accumulation_steps
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss = val_loss.item()
         model.train()
 
         # log.
-        print0(f'iteration:{iter_}/{config.total_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms')
+        print0(f'iteration:{iter_:0{len(str(args.total_iterations))}d}/{args.total_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms')
         if master_process:
             wandb.log({"val_loss": val_loss}, step=iter_)
 
@@ -475,27 +479,35 @@ for iter_ in range(start_iter, config.total_iterations+1):
         t0 = time.perf_counter()
 
     # ----------- SAVING SECTION -----------
-    if master_process and iter_ > start_iter and (last_iter or (config.save_every > 0 and iter_ % config.save_every == 0)):
+    if master_process and iter_ > start_iter and (last_iter or (args.save_every > 0 and iter_ % args.save_every == 0)):
         # stop the clock.
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
-        # save the state of the training process.
-        log = dict(
+        save_dir = os.path.join(logdir, f"step{iter_:06d}")
+        os.makedirs(save_dir, exist_ok=True)
+        # save model & tokenizer to make evaluation easier.
+        tokenizer.save_pretrained(save_dir)
+        state_dict_bf16 = {k: v.detach().to(torch.bfloat16).cpu() for k, v in raw_model.state_dict().items()}
+        uncompiled_model.config.torch_dtype = torch.bfloat16
+        uncompiled_model.save_pretrained(save_dir, safe_serialization=True, state_dict=state_dict_bf16)
+        # save training state.
+        train_state = dict(
             iteration=iter_,
-            run_id=run_id,
-            model=raw_model.state_dict(),
+            run_name=run_name,
             optimizers=[opt.state_dict() for opt in optimizers],
             schedulers=[sched.state_dict() for sched in schedulers],
             training_time_ms=training_time_ms,
             rng_cpu=torch.get_rng_state(),
-            rng_cuda=torch.cuda.get_rng_state_all()
+            rng_cuda=torch.cuda.get_rng_state_all(),
         )
-        torch.save(log, os.path.join(logdir, f"state_step{iter_:06d}.pt"))
-        print0(f"saved model checkpoint to {logdir}/state_step{iter_:06d}.pt")
+        torch.save(train_state, os.path.join(save_dir, "train_state.pt"))
+        del state_dict_bf16
+        gc.collect()
         # start the clock again.
         torch.cuda.synchronize()
         t0 = time.perf_counter()
     if last_iter:
+        dist.barrier()
         break
 
     # ----------- TRAINING SECTION -----------
@@ -513,8 +525,8 @@ for iter_ in range(start_iter, config.total_iterations+1):
         else:
             (loss / accumulation_steps).backward() # just sync on the last step
     # clip those gradients.
-    if config.grad_norm_clip is not None:
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_norm_clip, foreach=True)
+    if args.grad_norm_clip is not None:
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
     else:
         grad_norm = torch.tensor(0.)
     # step the optimizers & schedulers.
@@ -528,7 +540,7 @@ for iter_ in range(start_iter, config.total_iterations+1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= WARMUP_SKIP else 0
     extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
-    print0(f"iteration:{iter_+1:0{len(str(config.total_iterations))}d}/{config.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
+    print0(f"iteration:{iter_+1:0{len(str(args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
         wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log}, step=iter_)
 
