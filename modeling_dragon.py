@@ -50,7 +50,6 @@ except ImportError:
                 "Neither Flash Attention nor Flex Attention is not installed, using eager attention implementation. "
                 "For better performance, consider installing flash-attention (https://github.com/Dao-AILab/flash-attention)."
             )
-print(f"Using attention implementation: {ATTN_IMPL}")
 
 # differential attention backend selection
 DIFF_ATTN_IMPL = None
@@ -59,7 +58,6 @@ try:
     DIFF_ATTN_IMPL = "flex_head"
 except ImportError:
     DIFF_ATTN_IMPL = ATTN_IMPL # if we don't have flex_head_fa, fallback to the best attention impl we have
-print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 
 # Gated DeltaNet backend selection
 try:
@@ -74,6 +72,14 @@ try:
 except ImportError:
     logger.warning_once("Falling back to Torch implementation for the short convolution as causal-conv1d module was not found.")
     causal_conv1d_fn, causal_conv1d_update = None, None
+
+print(f"Using attention implementation: {ATTN_IMPL}")
+print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
+
+logger.info(f"Using attention implementation: {ATTN_IMPL}")
+logger.info(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
+logger.info(f"Using Gated DeltaNet implementation: {'fla' if chunk_gated_delta_rule is not None else 'torch'}")
+logger.info(f"Using short convolution implementation: {'causal-conv1d' if causal_conv1d_fn is not None else 'torch'}")
 
 class DragonHeadWiseRMSNorm(nn.Module):
     def __init__(self, n_heads, d_head, eps=1e-6, zero_centered_gamma=False):
@@ -108,44 +114,6 @@ class DragonLayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return F.layer_norm(x.float(), (self.hidden_size,), self.weight, self.bias, self.eps).type_as(x)
-
-"""class _ScaledLinearFB(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias, alpha_fwd, alpha_bwd_x, alpha_bwd_w):
-        ctx.save_for_backward(x, weight, bias)
-        ctx.alpha_bwd_x = alpha_bwd_x
-        ctx.alpha_bwd_w = alpha_bwd_w
-        return F.linear(x, weight, bias) * alpha_fwd
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        x, weight, bias = ctx.saved_tensors
-        # -------- grads ----------
-        grad_x = torch.matmul(grad_out * ctx.alpha_bwd_x.to(grad_out.dtype), weight)
-
-        go_flat = (grad_out * ctx.alpha_bwd_w).reshape(-1, grad_out.shape[-1])
-        x_flat  = x.reshape(-1, x.shape[-1])
-        grad_weight = go_flat.t() @ x_flat
-        grad_bias   = go_flat.sum(0) if bias is not None else None
-
-        return grad_x, grad_weight, grad_bias, None, None, None
-
-class DragonLinear(nn.Linear):
-    Linear layer with different forward/backward scalings.
-    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, alpha_fwd=None, alpha_bwd=None):
-        super().__init__(in_features, out_features, bias)
-
-        if alpha_fwd is None:
-            alpha_fwd = 1.0 / math.sqrt(in_features)
-
-        if not config.use_uscaling:
-            alpha_fwd, alpha_bwd = 1, 1
-
-        self.register_buffer("alpha_fwd", torch.tensor(float(alpha_fwd)), persistent=False)
-        self.register_buffer("alpha_bwd", torch.tensor(float(alpha_bwd if alpha_bwd is not None else alpha_fwd)), persistent=False)
-
-    def forward(self, x):
-        return _ScaledLinearFB.apply(x, self.weight, self.bias, self.alpha_fwd.to(x.dtype), self.alpha_bwd, self.alpha_bwd)"""
 
 class ScaledGrad(torch.autograd.Function):
     @staticmethod
@@ -438,8 +406,7 @@ class DragonAttention(nn.Module):
                     return q_idx - kv_idx <= wsize
                 def causal_mask(b, h, q_idx, kv_idx):
                     return q_idx >= kv_idx
-                attn_mask = and_masks(causal_mask, sliding_window)
-                self.block_mask = create_block_mask(attn_mask, B=None, H=None, Q_LEN=self.config.max_position_embeddings, KV_LEN=self.config.max_position_embeddings)
+                self.attn_mask = and_masks(causal_mask, sliding_window)
                 return wsize
             self.build_mask = build_mask
             self.last_wsize = self.build_mask(min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size)
@@ -489,7 +456,7 @@ class DragonAttention(nn.Module):
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
-            attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
+            attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
             attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "fa3":
@@ -506,6 +473,8 @@ class DragonAttention(nn.Module):
             softcap=self.config.softcap_local_attn,
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
         )
+        if len(attn_output.shape) == 3:
+            attn_output = attn_output.view(query_states.size(0), query_states.size(1), attn_output.size(-2), attn_output.size(-1)) # keep (B, L, H, D)
 
         if cache_params is not None and not self.reuse_kv:
             cache_params.trim(self.layer_idx)
@@ -513,7 +482,6 @@ class DragonAttention(nn.Module):
         return attn_output, last_key_states, last_value_states
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size ** -0.5)
 
@@ -827,8 +795,7 @@ class DragonDifferentialAttention(nn.Module):
                     return q_idx - kv_idx <= wsize
                 def causal_mask(b, h, q_idx, kv_idx):
                     return q_idx >= kv_idx
-                attn_mask = and_masks(causal_mask, sliding_window)
-                self.block_mask = create_block_mask(attn_mask, B=None, H=None, Q_LEN=self.config.max_position_embeddings, KV_LEN=self.config.max_position_embeddings)
+                self.attn_mask = and_masks(causal_mask, sliding_window)
                 return wsize
             self.build_mask = build_mask
             self.last_wsize = self.build_mask(self.config.slw_wsize)
@@ -891,7 +858,7 @@ class DragonDifferentialAttention(nn.Module):
         elif DIFF_ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
-            diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=self.block_mask._adjust(q.size(1), k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
+            diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_heads > self.num_key_value_heads).transpose(1, 2)
         elif DIFF_ATTN_IMPL == "eager":
             diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
 
@@ -914,6 +881,9 @@ class DragonDifferentialAttention(nn.Module):
             softcap=self.softcap,
             softmax_scale=None if not self.config.use_uscaling else 1/self.head_dim,
         )
+        if len(y1.shape) == 3:
+            y1 = y1.view(query1_states.size(0), query1_states.size(1), y1.size(-2), y1.size(-1)) # keep (B, L, H/2, D)
+            y2 = y2.view(query1_states.size(0), query1_states.size(1), y2.size(-2), y2.size(-1))
         lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H/2)
         lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
         lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
@@ -953,15 +923,13 @@ def torch_chunk_gated_delta_rule(
     v,
     g,
     beta,
-    scale=None,
     chunk_size=64,
     initial_state=None,
     output_final_state=False,
+    scale=None,
     use_qk_l2norm_in_kernel=False,
 ):
     initial_dtype = q.dtype
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
     if use_qk_l2norm_in_kernel:
         q = l2norm(q, dim=-1, eps=1e-6)
         k = l2norm(k, dim=-1, eps=1e-6)
@@ -969,15 +937,16 @@ def torch_chunk_gated_delta_rule(
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
     ]
 
-    batch_size, sequence_length, num_heads, k_head_dim = k.shape
+    batch_size, num_heads, sequence_length, k_head_dim = k.shape
     v_head_dim = v.shape[-1]
-    pad_size = (chunk_size - num_heads % chunk_size) % chunk_size
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
     q = F.pad(q, (0, 0, 0, pad_size))
     k = F.pad(k, (0, 0, 0, pad_size))
     v = F.pad(v, (0, 0, 0, pad_size))
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
-    tot_heads = num_heads + pad_size
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (q.shape[-1] ** 0.5) if scale is None else scale
     q = q * scale
 
     v_beta = v * beta.unsqueeze(-1)
@@ -1001,7 +970,7 @@ def torch_chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
         if initial_state is None
         else initial_state.to(value)
     )
@@ -1009,8 +978,8 @@ def torch_chunk_gated_delta_rule(
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
 
     # for each chunk
-    for i in range(0, tot_heads // chunk_size):
-        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], value[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime
@@ -1024,16 +993,14 @@ def torch_chunk_gated_delta_rule(
     if not output_final_state:
         last_recurrent_state = None
     core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
-    core_attn_out = core_attn_out[:, :, :num_heads]
+    core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
 
 def torch_recurrent_gated_delta_rule(
-    q, k, v, g, beta, scale, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+    q, k, v, g, beta, initial_state, output_final_state, scale=None, use_qk_l2norm_in_kernel=False
 ):
     initial_dtype = q.dtype
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
     if use_qk_l2norm_in_kernel:
         q = l2norm(q, dim=-1, eps=1e-6)
         k = l2norm(k, dim=-1, eps=1e-6)
@@ -1041,18 +1008,19 @@ def torch_recurrent_gated_delta_rule(
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
     ]
 
-    batch_size, sequence_length, num_heads, k_head_dim = k.shape
+    batch_size, num_heads, sequence_length, k_head_dim = k.shape
     v_head_dim = v.shape[-1]
+    scale = 1 / (q.shape[-1] ** 0.5) if scale is None else scale
     q = q * scale
 
-    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(v)
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(v)
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(v)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(v)
         if initial_state is None
         else initial_state.to(v)
     )
 
-    for i in range(num_heads):
+    for i in range(sequence_length):
         q_t = q[:, :, i]
         k_t = k[:, :, i]
         v_t = v[:, :, i]
@@ -1069,6 +1037,24 @@ def torch_recurrent_gated_delta_rule(
         last_recurrent_state = None
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
+
+# works with tensors >2**31 elements
+def safe_conv1d(x, w, b=None, stride=1, padding=0, dilation=1, groups=1):
+    x = x.contiguous(); w = w.contiguous()
+    N, C, L = x.shape
+    k = w.shape[-1]; Cout = w.shape[0]
+    Lout = (L + 2*padding - dilation*(k-1) - 1)//stride + 1
+    per_sample_in  = C*L
+    per_sample_out = Cout*Lout
+    per_sample_max = max(per_sample_in, per_sample_out)
+    INT32_MAX = 2_147_483_647
+    bs = max(1, min(N, INT32_MAX // max(1, per_sample_max)))
+    if bs >= N:
+        return F.conv1d(x, w, b, stride, padding, dilation, groups)
+    outs = []
+    for i in range(0, N, bs):
+        outs.append(F.conv1d(x[i:i+bs], w, b, stride, padding, dilation, groups))
+    return torch.cat(outs, dim=0)
 
 class DragonGatedDeltaNet(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
@@ -1114,9 +1100,7 @@ class DragonGatedDeltaNet(nn.Module):
             self.dt_bias = nn.Parameter(inv_dt)
 
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(
-            self.n_heads_local, dtype=torch.float32, device=torch.cuda.current_device()
-        ).uniform_(*A_init_range)
+        A = torch.empty(self.n_heads_local, dtype=torch.float32).uniform_(*A_init_range)
         A_log = torch.log(A)  # Keep A_log in fp32
         self.A_log = nn.Parameter(A_log)
 
@@ -1614,6 +1598,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids=None,
         **kwargs,
     ) -> DragonCausalLMOutput:
         output_hidden_states = (output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states)
