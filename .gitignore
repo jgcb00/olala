@@ -2,4 +2,5 @@
 __pycache__/
 *.sh
 *.err
-*.out
+*.out__pycache__/
+*.pyc

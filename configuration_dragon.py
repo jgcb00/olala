@@ -98,6 +98,23 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        patch_level_training: bool = False,
+        patch_level_training_size: int = 4,
+        nsa_head_dim: int = 128,
+        nsa_topk: int = 16,
+        nsa_block_size: int = 64,
+        nsa_window_size: int = 512,
+        cca_head_dim: int = 128,
+        cca_seq_kernel_size: int = 4,
+        rope_gdn: str = None,
+        zero_centered_gate: bool = False,
+        zero_centered_gate_type: int = 1,
+        scalable_softmax: bool = True,
+        gate_attn: bool = False,
+        gate_gdn: bool = True,
+        num_attention_heads_gdn: int = 32,
+        num_key_value_heads_gdn: int = None,
+        fused_loss_computation=False,
         qk_norm=True,
         num_attention_heads_indexer=8,
         head_dim_indexer=32,
@@ -142,6 +159,24 @@ class DragonConfig(PretrainedConfig):
         old_lns=False,
         **kwargs,
     ):
+        self.patch_level_training = patch_level_training
+        self.patch_level_training_size = patch_level_training_size
+        self.nsa_head_dim = nsa_head_dim
+        self.nsa_topk = nsa_topk
+        self.nsa_block_size = nsa_block_size
+        self.nsa_window_size = nsa_window_size
+        self.cca_head_dim = cca_head_dim
+        self.cca_seq_kernel_size = cca_seq_kernel_size
+        self.rope_gdn = rope_gdn
+        self.zero_centered_gate = zero_centered_gate
+        self.zero_centered_gate_type = zero_centered_gate_type
+        self.gate_attn = gate_attn
+        self.gate_gdn = gate_gdn
+        self.num_attention_heads_gdn = num_attention_heads_gdn
+        if num_key_value_heads_gdn is None:
+            num_key_value_heads_gdn = num_attention_heads_gdn
+        self.num_key_value_heads_gdn = num_key_value_heads_gdn
+        self.fused_loss_computation = fused_loss_computation
         self.num_attention_heads_indexer = num_attention_heads_indexer
         self.head_dim_indexer = head_dim_indexer
         self.dsa_q_lora_rank = dsa_q_lora_rank
@@ -153,7 +188,7 @@ class DragonConfig(PretrainedConfig):
         self.softcap_global_attn=softcap_global_attn
         self.use_uscaling = use_uscaling
         self.uscaling_tau = uscaling_tau
-        self.scalable_softmax = True
+        self.scalable_softmax = scalable_softmax
 
         self.vocab_size = vocab_size
         self.tie_word_embeddings = tie_word_embeddings
@@ -194,8 +229,8 @@ class DragonConfig(PretrainedConfig):
 
         assert self.hidden_size % self.num_attention_heads == 0
         assert self.num_attention_heads % self.num_key_value_heads == 0
-        assert self.num_attention_heads % 2 == 0, "Number of attention heads must be even for differential attention."
-        assert self.num_key_value_heads % 2 == 0, "Number of kv heads must be even for differential attention."
+        #assert self.num_attention_heads % 2 == 0, "Number of attention heads must be even for differential attention."
+        #assert self.num_key_value_heads % 2 == 0, "Number of kv heads must be even for differential attention."
 
         super().__init__(
             pad_token_id=pad_token_id,

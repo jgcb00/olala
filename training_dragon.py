@@ -3,8 +3,7 @@ import glob
 import json
 import pickle
 from dataclasses import dataclass
-from typing import List, Union, Optional
-from contextlib import nullcontext
+from typing import Optional
 from functools import partial
 import gc
 import math
@@ -42,6 +41,10 @@ class NanoArgs:
     use_uscaling: bool = False
     uscaling_tau: float = 0.2
     zero_centered_gamma: bool = False
+    zero_centered_gate: bool = False
+    zero_centered_gate_type: int = 1 # 1, 2, 3
+    gate_attn: bool = False
+    gate_gdn: bool = True
 
     # attention related
     n_kv_heads : int = 0
@@ -52,14 +55,22 @@ class NanoArgs:
     softcap_local_attn: float = 0.0 # logit soft-capping for local attn logits, as per Gemma2 (0.0 = no soft-capping)
     softcap_global_attn: float = 0.0
     qk_norm: bool = True
+    scalable_softmax: bool = True
     num_attention_heads_indexer: int = 8
     head_dim_indexer: int = 32
     dsa_q_lora_rank: int = 128
     dsa_topk: int = 512
+    cca_head_dim: int = 128
+    cca_seq_kernel_size: int = 4
+    nsa_head_dim: int = 128
+    nsa_topk: int = 16
+    nsa_block_size: int = 64
+    nsa_window_size: int = 512
 
-    # GatedDeltaNet related
-    p_state_passing: float = 0.0 # probability of state passing (0.0 = no state passing)
-    step_state_passing: int = 0 # step at which to start using the given p_state_passing (0 = start at the beginning of training)
+    # GDN related
+    rope_gdn: Optional[str] = None # None, rope, (srope)
+    n_heads_gdn: int = 0
+    n_kv_heads_gdn: int = 0
 
     # optim
     optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus
@@ -78,6 +89,9 @@ class NanoArgs:
     uscaling_mult_scalar: float = 0
     uscaling_mult_head: float = 0
     init_std: float = 0.006
+    patch_level_training: bool = False
+    patch_level_training_size: int = 4
+    patch_level_training_mode: str = "reduced" # reduced = ask L tokens, treat L//K. full = ask K*L tokens, treat L.
 
     # data
     vocab_size: int = 50304
@@ -97,6 +111,11 @@ class NanoArgs:
     wandb_project: str = "dragon_v1.5"
     wandb_name: Optional[str] = None
     log_wandb: bool = False
+
+    load_arg_from_config: bool = True
+    load_optim: bool = True
+    load_sched: bool = True
+    compile: bool = True
 
     # used during training
     slw_window: int = 0
@@ -285,8 +304,9 @@ def print0(s, console=True):
             if console:
                 print(s)
             print(s, file=f)
-if resume_dir is not None:
+if resume_dir is not None and args.load_arg_from_config:
     saved_args_path = os.path.join(os.path.dirname(resume_dir), "args.pkl")
+    print0(f"Loading args from {saved_args_path}")
     if os.path.exists(saved_args_path):
         with open(saved_args_path, "rb") as f:
             saved_args = pickle.load(f)
@@ -298,12 +318,24 @@ if master_process:
     wandb.init(project=args.wandb_project, dir=logdir, name=args.wandb_name if args.wandb_name else args.run_name, config={**vars(args)}, mode=None if args.log_wandb else 'disabled')
     print0(f"wandb run id: {wandb.run.id}")
 
+# set seeds.
+seed = 123456789
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+np.random.seed(seed)
+
 # define convenience variables.
 B, T = args.device_batch_size, args.sequence_length
 assert args.batch_size % (B * ddp_world_size) == 0
 accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load dataloaders.
+if args.patch_level_training:
+    if args.patch_level_training_mode == "reduced":
+        assert T % args.patch_level_training_size == 0, "sequence length must be divisible by patch level training size in reduced mode"
+        T = T
+    elif args.patch_level_training_mode == "full":
+        T = T * args.patch_level_training_size
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
@@ -311,6 +343,22 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    patch_level_training=args.patch_level_training,
+    patch_level_training_size=args.patch_level_training_size,
+    nsa_head_dim=args.nsa_head_dim,
+    nsa_topk=args.nsa_topk,
+    nsa_block_size=args.nsa_block_size,
+    nsa_window_size=args.nsa_window_size,
+    cca_head_dim=args.cca_head_dim,
+    cca_seq_kernel_size=args.cca_seq_kernel_size,
+    num_attention_heads_gdn=args.n_heads_gdn,
+    num_key_value_heads_gdn=args.n_kv_heads_gdn,
+    zero_centered_gate=args.zero_centered_gate,
+    zero_centered_gate_type=args.zero_centered_gate_type,
+    scalable_softmax=args.scalable_softmax,
+    gate_attn=args.gate_attn,
+    gate_gdn=args.gate_gdn,
+    fused_loss_computation=args.fused_loss_computation,
     qk_norm=args.qk_norm,
     num_attention_heads_indexer=args.num_attention_heads_indexer,
     head_dim_indexer=args.head_dim_indexer,
@@ -342,6 +390,7 @@ if resume_dir is None:
 else:
     model = DragonForCausalLM.from_pretrained(resume_dir, torch_dtype=torch.bfloat16)
     model = model.cuda()
+print0(model)
 
 """# check here that the init std is as expected: # TODO TEMPORARY
 with torch.no_grad():
@@ -370,7 +419,7 @@ print0(f"number of total parameters:  {num_params}")
 
 # DDP & compile.
 uncompiled_model = model
-model = torch.compile(model, dynamic=True)
+model = torch.compile(model, dynamic=True) if args.compile else model
 model.train()
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module
@@ -411,10 +460,12 @@ start_iter = 0
 training_time_ms = 0
 if resume_dir is not None:  
     train_state = torch.load(os.path.join(resume_dir, "train_state.pt"), map_location="cpu")
-    for opt, s in zip(optimizers, train_state.get("optimizers", [])):
-        opt.load_state_dict(s)
-    for sch, s in zip(schedulers, train_state.get("schedulers", [])):
-        sch.load_state_dict(s)
+    if args.load_optim:
+        for opt, s in zip(optimizers, train_state.get("optimizers", [])):
+            opt.load_state_dict(s)
+    if args.load_sched:
+        for sch, s in zip(schedulers, train_state.get("schedulers", [])):
+            sch.load_state_dict(s)
     torch.set_rng_state(train_state["rng_cpu"])
     torch.cuda.set_rng_state_all(train_state["rng_cuda"])
     training_time_ms = train_state.get("training_time_ms", 0)
@@ -487,7 +538,7 @@ for iter_ in range(start_iter, args.total_iterations+1):
         os.makedirs(save_dir, exist_ok=True)
         # save model & tokenizer to make evaluation easier.
         tokenizer.save_pretrained(save_dir)
-        state_dict_bf16 = {k: v.detach().to(torch.bfloat16).cpu() for k, v in raw_model.state_dict().items()}
+        state_dict_bf16 = {k: v.detach().to(torch.bfloat16).cpu() for k, v in uncompiled_model.state_dict().items()}
         uncompiled_model.config.torch_dtype = torch.bfloat16
         uncompiled_model.save_pretrained(save_dir, safe_serialization=True, state_dict=state_dict_bf16)
         # save training state.
