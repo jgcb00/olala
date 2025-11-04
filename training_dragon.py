@@ -32,9 +32,13 @@ class NanoArgs:
     # arch - general
     d_model : int = 768
     n_heads : int = 6 # head dim 128 suggested by @Grad62304977
+    head_dim: Optional[int] = None
     layers_config : str = 4*"lrdlr"
-    expand_factor : int = 1 # expand factor for Mamba/Dragon
+    expand_factor : int = 2 # expand factor for Mamba/Dragon
+    rope_type_local: str = "rope" #p-rope
+    rope_type_global: str = "rope" #p-rope
     rope_theta_local: float = 10000.0
+    rope_theta_global: float = 0.0
     eps_rmsnorm: float = 1e-6
     mlp_expand: int = 4 # expand factor for MLP
     fused_loss_computation : bool = True # whether to use fused linear + cross entropy loss
@@ -42,9 +46,16 @@ class NanoArgs:
     uscaling_tau: float = 0.2
     zero_centered_gamma: bool = False
     zero_centered_gate: bool = False
-    zero_centered_gate_type: int = 1 # 1, 2, 3
+    zero_centered_gate_type: int = 1 # 1, 2, 3, 4
     gate_attn: bool = False
     gate_gdn: bool = True
+    gate_type: str = "elementwise" # elementwise (one per dim), headwise (one per head), kimi (lora)
+    gate_act: str = "silu" # silu, sigmoid
+    scalar_proj_as_hidden_matrix: bool = True
+    normalization_type: str = "rmsnorm" # rmsnorm, seednorm
+    seednorm_wd: bool = True
+    mixer_gn: bool = True
+    mlp_linking : bool = False
 
     # attention related
     n_kv_heads : int = 0
@@ -56,24 +67,36 @@ class NanoArgs:
     softcap_global_attn: float = 0.0
     qk_norm: bool = True
     scalable_softmax: bool = True
+    resformer : bool = False # Works only on f layers (DiffAttention)
+    token_shift_attn: bool = False
+    token_shift_gdn: bool = False
+    token_conv1d_attn: bool = False
+    token_conv1d_gdn: bool = True
     num_attention_heads_indexer: int = 8
     head_dim_indexer: int = 32
     dsa_q_lora_rank: int = 128
     dsa_topk: int = 512
-    cca_head_dim: int = 128
     cca_seq_kernel_size: int = 4
-    nsa_head_dim: int = 128
     nsa_topk: int = 16
     nsa_block_size: int = 64
     nsa_window_size: int = 512
+    num_signal_heads_diff: Optional[int] = None
+    tpa_rank: int = 2
+    shrink_qk_da: int = 2
+    mla_kv_rank: int = 128
 
     # GDN related
     rope_gdn: Optional[str] = None # None, rope, (srope)
+    head_dim_gdn: Optional[int] = None
     n_heads_gdn: int = 0
     n_kv_heads_gdn: int = 0
+    shrink_qk_gdn: int = 2
+    kda_allow_neg_eigval: bool = False
+    kda_num_v_heads: Optional[int] = None
 
     # optim
     optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus
+    second_order_optim : Optional[str] = None # snoo
     batch_size: int = 8*64 # batch size, in sequences, across all devices
     device_batch_size: int = 64 # batch size, in sequences, per device
     total_iterations: int = 1000 # number of iterations to run
@@ -91,14 +114,13 @@ class NanoArgs:
     init_std: float = 0.006
     patch_level_training: bool = False
     patch_level_training_size: int = 4
-    patch_level_training_mode: str = "reduced" # reduced = ask L tokens, treat L//K. full = ask K*L tokens, treat L.
+    second_order_lr: float = 0.68
+    second_order_momentum: float = 0.37
+    second_order_interval: int = 25
 
     # data
     vocab_size: int = 50304
     sequence_length: int = 1024
-    use_patch_level_training: bool = False
-    patch_size: int = 4
-    patch_training_fraction: float = 0.67
     input_bin: Optional[str] = None
     input_val_bin: Optional[str] = None
 
@@ -213,10 +235,14 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
     for mod in model.modules():
         if isinstance(mod, nn.Linear):
             pname = id2name.get(id(mod.weight), "")
+            is_scalar = getattr(mod, "is_scalar_weight", False)
             fan_in = mod.weight.shape[1]
             scale = 1 / math.sqrt(fan_in)
             if "lm_head" in pname:
                 lr_scaled = base_lr_head
+                wd_scaled = 0.0
+            elif is_scalar:
+                lr_scaled = base_lr_scalar
                 wd_scaled = 0.0
             else:
                 lr_scaled = base_lr_hidden * scale
@@ -226,7 +252,7 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
             seen.add(mod.weight)
 
             if mod.bias is not None:
-                groups.append({"params": [mod.bias], "lr": lr_scaled, "weight_decay": 0.0})
+                groups.append({"params": [mod.bias], "lr": base_lr_scalar, "weight_decay": 0.0})
                 seen.add(mod.bias)
 
     for p in model.parameters():
@@ -235,13 +261,17 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
         pname = id2name.get(id(p), "<unnamed>")
 
         if "embedding" in pname:
-            fan_out = p.shape[1] # nn.Embedding is transposed
+            #fan_out = p.shape[1] # nn.Embedding is transposed
             #lr_scaled = base_lr / math.sqrt(fan_out) # u-muP
             lr_scaled = base_lr_embed
         else:
             lr_scaled = base_lr_scalar
 
-        groups.append({"params": [p], "lr": lr_scaled, "weight_decay": 0.})
+        wd_scaled = 0.
+        if getattr(p, "requires_weight_decay", False):
+            wd_scaled = wd / lr_scaled
+
+        groups.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled})
 
     return groups
 
@@ -299,11 +329,13 @@ if master_process:
         with open(f'{logdir}/args.json', 'w') as f: json.dump(vars(args), f)
         with open(f'{logdir}/args.pkl', 'wb') as f: pickle.dump(args, f)
 def print0(s, console=True):
-    if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+    if not master_process: return
+    if console:
+        print(s)
+    try:
+        d=os.path.dirname(logfile); d and os.makedirs(d, exist_ok=True)
+        with open(logfile, "a", encoding="utf-8") as f: print(s, file=f)
+    except: pass
 if resume_dir is not None and args.load_arg_from_config:
     saved_args_path = os.path.join(os.path.dirname(resume_dir), "args.pkl")
     print0(f"Loading args from {saved_args_path}")
@@ -326,16 +358,14 @@ np.random.seed(seed)
 
 # define convenience variables.
 B, T = args.device_batch_size, args.sequence_length
+if args.patch_level_training:
+    T = args.patch_level_training_size * T
 assert args.batch_size % (B * ddp_world_size) == 0
 accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load dataloaders.
-if args.patch_level_training:
-    if args.patch_level_training_mode == "reduced":
-        assert T % args.patch_level_training_size == 0, "sequence length must be divisible by patch level training size in reduced mode"
-        T = T
-    elif args.patch_level_training_mode == "full":
-        T = T * args.patch_level_training_size
+#if args.patch_level_training:
+#    assert T % args.patch_level_training_size == 0, "sequence length must be divisible by patch level training size in reduced mode"
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
@@ -343,19 +373,38 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    mla_kv_rank=args.mla_kv_rank,
+    rope_gdn=args.rope_gdn,
+    shrink_qk_da=args.shrink_qk_da,
+    shrink_qk_gdn=args.shrink_qk_gdn,
+    mixer_gn=args.mixer_gn,
+    kda_allow_neg_eigval=args.kda_allow_neg_eigval,
+    kda_num_v_heads=args.kda_num_v_heads,
+    seednorm_wd=args.seednorm_wd,
+    normalization_type=args.normalization_type,
+    tpa_rank=args.tpa_rank,
+    num_signal_heads_diff=args.num_signal_heads_diff,
+    scalar_proj_as_hidden_matrix=args.scalar_proj_as_hidden_matrix,
+    token_shift_attn=args.token_shift_attn,
+    token_shift_gdn=args.token_shift_gdn,
+    token_conv1d_attn=args.token_conv1d_attn,
+    token_conv1d_gdn=args.token_conv1d_gdn,
     patch_level_training=args.patch_level_training,
     patch_level_training_size=args.patch_level_training_size,
-    nsa_head_dim=args.nsa_head_dim,
     nsa_topk=args.nsa_topk,
     nsa_block_size=args.nsa_block_size,
     nsa_window_size=args.nsa_window_size,
-    cca_head_dim=args.cca_head_dim,
     cca_seq_kernel_size=args.cca_seq_kernel_size,
+    head_dim=args.head_dim,
+    head_dim_gdn=args.head_dim_gdn,
     num_attention_heads_gdn=args.n_heads_gdn,
     num_key_value_heads_gdn=args.n_kv_heads_gdn,
     zero_centered_gate=args.zero_centered_gate,
     zero_centered_gate_type=args.zero_centered_gate_type,
     scalable_softmax=args.scalable_softmax,
+    resformer=args.resformer,
+    gate_type=args.gate_type,
+    gate_act=args.gate_act,
     gate_attn=args.gate_attn,
     gate_gdn=args.gate_gdn,
     fused_loss_computation=args.fused_loss_computation,
@@ -380,15 +429,19 @@ config_hf = DragonConfig(
     norm_epsilon=args.eps_rmsnorm,
     use_cache=False,
     sliding_window_size=args.swa_window_size,
+    rope_type_global=args.rope_type_global,
+    rope_type_local=args.rope_type_local,
+    rope_theta_global=args.rope_theta_global,
     rope_theta_local=args.rope_theta_local,
     uscaling_tau=args.uscaling_tau,
+    mlp_linking=args.mlp_linking
 )
 
 if resume_dir is None:
     model = DragonForCausalLM(config_hf)
     model = model.cuda()
 else:
-    model = DragonForCausalLM.from_pretrained(resume_dir, torch_dtype=torch.bfloat16)
+    model = DragonForCausalLM.from_pretrained(resume_dir, config=config_hf, torch_dtype=torch.bfloat16)
     model = model.cuda()
 print0(model)
 
@@ -421,12 +474,13 @@ print0(f"number of total parameters:  {num_params}")
 uncompiled_model = model
 model = torch.compile(model, dynamic=True) if args.compile else model
 model.train()
-model = DDP(model, device_ids=[ddp_local_rank])
+model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.resformer)
 raw_model = model.module
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # load optimizers & schedulers.
 if args.use_uscaling:
+    #assert args.optim == "adamw", "uscaling is only supported with AdamW optimizer currently"
     param_list = param_groups_mup(
         raw_model,
         base_lr_hidden=args.learning_rate,
@@ -435,9 +489,30 @@ if args.use_uscaling:
         base_lr_head=args.uscaling_mult_head*args.learning_rate if args.uscaling_mult_head > 0 else args.learning_rate,
         wd=args.weight_decay,
     )
-    optimizer = torch.optim.AdamW(param_list, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    if args.optim == "adamw":
+        optimizer = torch.optim.AdamW(param_list, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    elif args.optim == "ademamix":
+        from .optimizers.Ademamix import AdEMAMix
+        beta3_warmup = alpha_warmup = args.total_iterations
+        optimizer = AdEMAMix(param_list, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer for unit scaling: {args.optim}")
 else:
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    if args.optim == "adamw":
+        optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    elif args.optim == "ademamix":
+        from .optimizers.Ademamix import AdEMAMix
+
+        beta3_warmup = alpha_warmup = args.total_iterations
+        optimizer = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"Unknown Optimizer: {args.optim}")
+if args.second_order_optim == "snoo":
+    from .optimizers.Snoo import Snoo
+    second_order_optim = Snoo(raw_model, lr=args.second_order_lr, momentum=args.second_order_momentum, k=args.second_order_interval)
+else:
+    second_order_optim = None
+
 optimizers = [optimizer]
 
 def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
@@ -478,12 +553,13 @@ WARMUP_SKIP = 10
 
 # begin training.
 train_loader.reset()
-tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True) # for saving
+#tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True) # for saving
+tokenizer = transformers.AutoTokenizer.from_pretrained("/leonardo_work/BOOST_LCustodi/script/training/temp/hf_models/gpt2", use_fast=True)
 x, y = train_loader.next_batch()
 
-for iter_ in range(start_iter, args.total_iterations+1):
-    last_iter = (iter_ == args.total_iterations)
-    if iter_ == WARMUP_SKIP:
+for iter_ in range(start_iter, start_iter+args.total_iterations+1):
+    last_iter = (iter_ == start_iter+args.total_iterations)
+    if iter_ == start_iter+WARMUP_SKIP:
         training_time_ms = 0
         t0 = time.perf_counter()
     to_log = {}
@@ -521,7 +597,7 @@ for iter_ in range(start_iter, args.total_iterations+1):
         model.train()
 
         # log.
-        print0(f'iteration:{iter_:0{len(str(args.total_iterations))}d}/{args.total_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms')
+        print0(f'iteration:{iter_:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms')
         if master_process:
             wandb.log({"val_loss": val_loss}, step=iter_)
 
@@ -530,7 +606,7 @@ for iter_ in range(start_iter, args.total_iterations+1):
         t0 = time.perf_counter()
 
     # ----------- SAVING SECTION -----------
-    if master_process and iter_ > start_iter and (last_iter or (args.save_every > 0 and iter_ % args.save_every == 0)):
+    if master_process and (last_iter or (args.save_every > 0 and iter_ % args.save_every == 0)):
         # stop the clock.
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -584,14 +660,16 @@ for iter_ in range(start_iter, args.total_iterations+1):
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
+    if second_order_optim:
+        second_order_optim.step()
     # null those gradients.
     model.zero_grad(set_to_none=True)
 
     # ----------- LOGGING SECTION -----------
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= WARMUP_SKIP else 0
+    avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= start_iter+WARMUP_SKIP else 0
     extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
-    print0(f"iteration:{iter_+1:0{len(str(args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
+    print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
         wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log}, step=iter_)
 

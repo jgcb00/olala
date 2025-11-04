@@ -3,6 +3,7 @@
 # TODO : TP (cf qwen)
 # TODO : init
 
+from typing import Optional
 import re
 
 from transformers.configuration_utils import PretrainedConfig
@@ -89,29 +90,40 @@ class DragonConfig(PretrainedConfig):
     model_type = "dragon"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    """
-    config.num_attention_heads_indexer
-        self.indexer_head_dim = config.head_dim_indexer
-        self.q_lora_rank = config.dsa_q_lora_rank
-        self.topk = config.dsa_topk
-        """
-
     def __init__(
         self,
+        mla_kv_rank: int = 128,
+        shrink_qk_da: int = 2,
+        shrink_qk_gdn: int = 2,
+        mixer_gn: bool = True,
+        kda_allow_neg_eigval: bool = False,
+        kda_num_v_heads: Optional[int] = None,
+        seednorm_wd: bool = True,
+        normalization_type: str = "rmsnorm",
+        tpa_rank: int = 2,
+        num_signal_heads_diff: Optional[int] = None,
+        scalar_proj_as_hidden_matrix: bool = True,
+        token_shift_attn: bool = False,
+        token_shift_gdn: bool = False,
+        token_conv1d_attn: bool = False,
+        token_conv1d_gdn: bool = True,
         patch_level_training: bool = False,
         patch_level_training_size: int = 4,
-        nsa_head_dim: int = 128,
         nsa_topk: int = 16,
         nsa_block_size: int = 64,
         nsa_window_size: int = 512,
-        cca_head_dim: int = 128,
         cca_seq_kernel_size: int = 4,
         rope_gdn: str = None,
         zero_centered_gate: bool = False,
         zero_centered_gate_type: int = 1,
         scalable_softmax: bool = True,
+        resformer: bool = False,
+        mamba_mimo_dim : int = 4,
+        gate_type: str = "elementwise",
+        gate_act: str = "silu",
         gate_attn: bool = False,
         gate_gdn: bool = True,
+        head_dim_gdn: Optional[int] = None,
         num_attention_heads_gdn: int = 32,
         num_key_value_heads_gdn: int = None,
         fused_loss_computation=False,
@@ -129,6 +141,7 @@ class DragonConfig(PretrainedConfig):
         intermediate_size=8192,
         expand_factor=2,
         layers_config=4*"lrdlr",
+        head_dim=128,
         num_attention_heads=32,
         num_key_value_heads=8,
         mlp_hidden_act="relu2",
@@ -147,7 +160,10 @@ class DragonConfig(PretrainedConfig):
         eos_token_id=2,
         sliding_window_size=1024,
         slw_wsize=-1,
+        rope_type_local="rope",
+        rope_type_global="",
         rope_theta_local=163.,
+        rope_theta_global=10000.,
         uscaling_tau=0.2,
         attention_dropout=0.,
         hidden_dropout=0.,
@@ -157,21 +173,39 @@ class DragonConfig(PretrainedConfig):
         gdn_dt_init_floor=1e-4,
         gdn_A_init_range=(1, 16),
         old_lns=False,
+        mlp_linking=False,
         **kwargs,
     ):
+        self.mla_kv_rank = mla_kv_rank
+        self.shrink_qk_da = shrink_qk_da
+        self.shrink_qk_gdn = shrink_qk_gdn
+        self.mixer_gn = mixer_gn
+        self.kda_allow_neg_eigval = kda_allow_neg_eigval
+        self.kda_num_v_heads = kda_num_v_heads
+        self.seednorm_wd = seednorm_wd
+        self.normalization_type = normalization_type
+        self.tpa_rank = tpa_rank
+        self.num_signal_heads_diff = num_signal_heads_diff
+        self.scalar_proj_as_hidden_matrix = scalar_proj_as_hidden_matrix
+        self.token_shift_attn = token_shift_attn
+        self.token_shift_gdn = token_shift_gdn
+        self.token_conv1d_attn = token_conv1d_attn
+        self.token_conv1d_gdn = token_conv1d_gdn
         self.patch_level_training = patch_level_training
         self.patch_level_training_size = patch_level_training_size
-        self.nsa_head_dim = nsa_head_dim
         self.nsa_topk = nsa_topk
         self.nsa_block_size = nsa_block_size
         self.nsa_window_size = nsa_window_size
-        self.cca_head_dim = cca_head_dim
         self.cca_seq_kernel_size = cca_seq_kernel_size
         self.rope_gdn = rope_gdn
         self.zero_centered_gate = zero_centered_gate
         self.zero_centered_gate_type = zero_centered_gate_type
+        self.gate_type = gate_type
+        self.gate_act = gate_act
         self.gate_attn = gate_attn
         self.gate_gdn = gate_gdn
+        self.head_dim = head_dim
+        self.head_dim_gdn = head_dim_gdn
         self.num_attention_heads_gdn = num_attention_heads_gdn
         if num_key_value_heads_gdn is None:
             num_key_value_heads_gdn = num_attention_heads_gdn
@@ -182,13 +216,18 @@ class DragonConfig(PretrainedConfig):
         self.dsa_q_lora_rank = dsa_q_lora_rank
         self.dsa_topk = dsa_topk
         self.zero_centered_gamma = zero_centered_gamma
-        self.rope_theta = rope_theta_local
+        self.rope_type_local = rope_type_local
+        self.rope_type_global = rope_type_global
+        self.rope_theta_local = rope_theta_local
+        self.rope_theta_global = rope_theta_global
         self.qk_norm = qk_norm
         self.softcap_local_attn=softcap_local_attn
         self.softcap_global_attn=softcap_global_attn
         self.use_uscaling = use_uscaling
         self.uscaling_tau = uscaling_tau
         self.scalable_softmax = scalable_softmax
+        self.resformer = resformer
+        self.mamba_mimo_dim = mamba_mimo_dim
 
         self.vocab_size = vocab_size
         self.tie_word_embeddings = tie_word_embeddings
@@ -226,9 +265,11 @@ class DragonConfig(PretrainedConfig):
         self.A_init_range = gdn_A_init_range
 
         self.old_lns = old_lns
+        
+        self.mlp_linking = mlp_linking
 
-        assert self.hidden_size % self.num_attention_heads == 0
-        assert self.num_attention_heads % self.num_key_value_heads == 0
+        #assert self.hidden_size % self.num_attention_heads == 0
+        #assert self.num_attention_heads % self.num_key_value_heads == 0
         #assert self.num_attention_heads % 2 == 0, "Number of attention heads must be even for differential attention."
         #assert self.num_key_value_heads % 2 == 0, "Number of kv heads must be even for differential attention."
 
