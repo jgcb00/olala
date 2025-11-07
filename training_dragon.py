@@ -35,8 +35,8 @@ class NanoArgs:
     head_dim: Optional[int] = None
     layers_config : str = 4*"lrdlr"
     expand_factor : int = 2 # expand factor for Mamba/Dragon
-    rope_type_local: str = "rope" #p-rope
-    rope_type_global: str = "rope" #p-rope
+    rope_type_local: str = "" #p-rope
+    rope_type_global: str = "" #p-rope
     rope_theta_local: float = 10000.0
     rope_theta_global: float = 0.0
     eps_rmsnorm: float = 1e-6
@@ -54,8 +54,18 @@ class NanoArgs:
     scalar_proj_as_hidden_matrix: bool = True
     normalization_type: str = "rmsnorm" # rmsnorm, seednorm
     seednorm_wd: bool = True
+    seednorm_type: int = 1
+    seednorm_rank: int = 1
     mixer_gn: bool = True
     mlp_linking : bool = False
+    final_norm: bool = True
+
+    # MoE
+    moe: bool = False
+    moe_num_routed_experts: int = 2
+    moe_routed_scaling_factor: float = 2.5
+    moe_routed_intermediate_size: int = 768
+    moe_shared_intermediate_size: int = 768
 
     # attention related
     n_kv_heads : int = 0
@@ -93,6 +103,14 @@ class NanoArgs:
     shrink_qk_gdn: int = 2
     kda_allow_neg_eigval: bool = False
     kda_num_v_heads: Optional[int] = None
+    mamba_mimo_dim: Optional[int] = 2
+    mamba_ngroups: Optional[int] = 1
+    mamba3_rope: bool = True
+    mamba3_remove_BC_bias: bool = False
+    mamba3_is_id_rms: bool = True
+    mamba3_remove_conv: bool = True
+    mamba3_is_A_dd: bool = True
+    mamba3_add_trapezoid: bool = True
 
     # optim
     optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus
@@ -120,7 +138,9 @@ class NanoArgs:
 
     # data
     vocab_size: int = 50304
+    bos_id: int = 50256
     sequence_length: int = 1024
+    intra_doc_masking: bool = False
     input_bin: Optional[str] = None
     input_val_bin: Optional[str] = None
 
@@ -138,6 +158,7 @@ class NanoArgs:
     load_optim: bool = True
     load_sched: bool = True
     compile: bool = True
+    compile_dynamic: bool = False
 
     # used during training
     slw_window: int = 0
@@ -166,9 +187,11 @@ def _load_data_shard(filename):
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, intra_doc_masking,B, T, process_rank, num_processes, bos_id):
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.intra_doc_masking = intra_doc_masking
+        self.bos_id = bos_id
         self.B = B # micro batch size
         self.T = T
 
@@ -221,12 +244,32 @@ class DistributedDataLoader:
         x = torch.from_numpy(buf.reshape(B, T)) # inputs
         y = torch.from_numpy(buf.reshape(B, T)) # targets
 
+        # compute cumulative document positions for intra-document masking
+        cu = None
+        maxlen = None
+        position_ids = None
+        if self.intra_doc_masking:
+            assert self.B == 1
+            starts = (x == self.bos_id).nonzero(as_tuple=True)[1].to(torch.long)
+            if starts.numel() == 0 or starts[0] != 0:
+                starts = torch.cat([torch.zeros(1, dtype=torch.long), starts])
+            ends = torch.cat([starts[1:], torch.tensor([x.numel()])])
+            seqlens = (ends - starts).to(torch.int32)
+            # cu_seqlens, max_seqlen.
+            cu = torch.cat([torch.zeros(1, dtype=torch.int32), seqlens.cumsum(0)]).cuda().to(torch.int32)
+            maxlen = int(seqlens.max())
+            # position_ids.
+            lengths = seqlens.to(torch.long)
+            starts_per_token = torch.repeat_interleave(starts.to(torch.long), lengths)
+            idx = torch.arange(T, device=x.device, dtype=torch.long)
+            position_ids = (idx - starts_per_token).unsqueeze(0)
+
         # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
 
-        return x.cuda(), y.cuda()
+        return x.cuda(), y.cuda(), cu, maxlen, position_ids
 
 def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, wd):
     groups, seen = [], set()
@@ -277,6 +320,11 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
 
 args = tyro.cli(NanoArgs)
 
+if args.intra_doc_masking:
+    if args.device_batch_size != 1:
+        args.device_batch_size = 1
+        print("!!! Forcing device_batch_size to 1 for intra-document masking !!!")
+
 # set up DDP (distributed data parallel).
 assert torch.cuda.is_available()
 dist.init_process_group(
@@ -293,6 +341,8 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 torch._dynamo.config.optimize_ddp=False
+if args.compile_dynamic:
+    torch._dynamo.config.allow_unspec_int_on_nn_module=True
 
 # setup logging.
 resume_dir = None
@@ -363,16 +413,33 @@ if args.patch_level_training:
 assert args.batch_size % (B * ddp_world_size) == 0
 accumulation_steps = args.batch_size // (B * ddp_world_size)
 
+tokenizer = transformers.AutoTokenizer.from_pretrained("/leonardo_work/BOOST_LCustodi/script/training/temp/hf_models/gpt2", use_fast=True)
+
 # load dataloaders.
 #if args.patch_level_training:
 #    assert T % args.patch_level_training_size == 0, "sequence length must be divisible by patch level training size in reduced mode"
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+train_loader = DistributedDataLoader(args.input_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id)
+val_loader = DistributedDataLoader(args.input_val_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 # load model.
 config_hf = DragonConfig(
+    mamba3_rope=args.mamba3_rope,
+    mamba3_remove_BC_bias=args.mamba3_remove_BC_bias,
+    mamba3_is_id_rms=args.mamba3_is_id_rms,
+    mamba3_remove_conv=args.mamba3_remove_conv,
+    mamba3_is_A_dd=args.mamba3_is_A_dd,
+    mamba3_add_trapezoid=args.mamba3_add_trapezoid,
+    moe=args.moe,
+    moe_num_routed_experts=args.moe_num_routed_experts,
+    moe_routed_scaling_factor=args.moe_routed_scaling_factor,
+    moe_routed_intermediate_size=args.moe_routed_intermediate_size,
+    moe_shared_intermediate_size=args.moe_shared_intermediate_size,
+    intra_doc_masking=args.intra_doc_masking,
+    seednorm_rank=args.seednorm_rank,
+    seednorm_type=args.seednorm_type,
+    final_norm=args.final_norm,
     mla_kv_rank=args.mla_kv_rank,
     rope_gdn=args.rope_gdn,
     shrink_qk_da=args.shrink_qk_da,
@@ -402,6 +469,8 @@ config_hf = DragonConfig(
     zero_centered_gate=args.zero_centered_gate,
     zero_centered_gate_type=args.zero_centered_gate_type,
     scalable_softmax=args.scalable_softmax,
+    mamba_mimo_dim=args.mamba_mimo_dim,
+    mamba_ngroups=args.mamba_ngroups,
     resformer=args.resformer,
     gate_type=args.gate_type,
     gate_act=args.gate_act,
@@ -461,7 +530,7 @@ with torch.no_grad():
 # count params. (total & active)
 num_params = sum(p.numel() for p in model.parameters())
 """model.eval()
-x, y = train_loader.next_batch()
+x, y, _, _, _ = train_loader.next_batch()
 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
     model(input_ids=x[[0], [0]].unsqueeze(0)).logits.sum().backward()
 num_active = sum(p.grad.count_nonzero() for p in model.parameters() if p.grad is not None)
@@ -472,11 +541,15 @@ print0(f"number of total parameters:  {num_params}")
 
 # DDP & compile.
 uncompiled_model = model
-model = torch.compile(model, dynamic=True) if args.compile else model
+model = torch.compile(model, dynamic=args.compile_dynamic) if args.compile else model
 model.train()
 model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.resformer)
 raw_model = model.module
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+
+if args.intra_doc_masking:
+    print0("!!! Using intra-document masking !!!")
+    print0("It is only compatible with GDN (conv+chunk), DA and GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
 
 # load optimizers & schedulers.
 if args.use_uscaling:
@@ -553,9 +626,7 @@ WARMUP_SKIP = 10
 
 # begin training.
 train_loader.reset()
-#tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True) # for saving
-tokenizer = transformers.AutoTokenizer.from_pretrained("/leonardo_work/BOOST_LCustodi/script/training/temp/hf_models/gpt2", use_fast=True)
-x, y = train_loader.next_batch()
+x, y, cu, maxlen, position_ids = train_loader.next_batch()
 
 for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     last_iter = (iter_ == start_iter+args.total_iterations)
@@ -588,9 +659,9 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         val_loss = torch.zeros((), device=device, dtype=torch.float32)
         for _ in range(args.val_iterations):
             for _ in range(accumulation_steps):
-                inputs, targets = val_loader.next_batch()
+                inputs, targets, cu, maxlen, position_ids = val_loader.next_batch()
                 with ctx:
-                    val_loss += model(input_ids=inputs, labels=targets).loss.detach()
+                    val_loss += model(input_ids=inputs, labels=targets, just_loss=True, cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids).loss.detach()
         val_loss /= args.val_iterations * accumulation_steps
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss = val_loss.item()
@@ -641,10 +712,10 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     for i in range(1, accumulation_steps+1):
         # forward pass.
         with ctx:
-            loss = model(input_ids=x, labels=y).loss
+            loss = model(input_ids=x, labels=y, just_loss=True, cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids).loss
             train_loss = loss.detach()
         # prepare next batch.
-        x, y = train_loader.next_batch()
+        x, y, cu, maxlen, position_ids = train_loader.next_batch()
         # backward pass.
         if i < accumulation_steps:
             with model.no_sync():

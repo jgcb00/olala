@@ -92,6 +92,21 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        mamba3_rope: bool = True,
+        mamba3_remove_BC_bias: bool = False,
+        mamba3_is_id_rms: bool = True,
+        mamba3_remove_conv: bool = True,
+        mamba3_is_A_dd: bool = True,
+        mamba3_add_trapezoid: bool = True,
+        moe: bool = False,
+        moe_num_routed_experts: int = 2,
+        moe_routed_scaling_factor: float = 2.5,
+        moe_routed_intermediate_size: int = 768,
+        moe_shared_intermediate_size: int = 768,
+        intra_doc_masking: bool = False,
+        seednorm_rank: int = 1,
+        seednorm_type: int = 1,
+        final_norm: bool = True,
         mla_kv_rank: int = 128,
         shrink_qk_da: int = 2,
         shrink_qk_gdn: int = 2,
@@ -119,6 +134,7 @@ class DragonConfig(PretrainedConfig):
         scalable_softmax: bool = True,
         resformer: bool = False,
         mamba_mimo_dim : int = 4,
+        mamba_ngroups : int = 1,
         gate_type: str = "elementwise",
         gate_act: str = "silu",
         gate_attn: bool = False,
@@ -163,7 +179,7 @@ class DragonConfig(PretrainedConfig):
         rope_type_local="rope",
         rope_type_global="",
         rope_theta_local=163.,
-        rope_theta_global=10000.,
+        rope_theta_global=0.,
         uscaling_tau=0.2,
         attention_dropout=0.,
         hidden_dropout=0.,
@@ -176,6 +192,21 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.mamba3_rope = mamba3_rope
+        self.mamba3_remove_BC_bias = mamba3_remove_BC_bias
+        self.mamba3_is_id_rms = mamba3_is_id_rms
+        self.mamba3_remove_conv = mamba3_remove_conv
+        self.mamba3_is_A_dd = mamba3_is_A_dd
+        self.mamba3_add_trapezoid = mamba3_add_trapezoid
+        self.moe = moe
+        self.moe_num_routed_experts = moe_num_routed_experts
+        self.moe_routed_scaling_factor = moe_routed_scaling_factor
+        self.moe_routed_intermediate_size = moe_routed_intermediate_size
+        self.moe_shared_intermediate_size = moe_shared_intermediate_size
+        self.intra_doc_masking = intra_doc_masking
+        self.seednorm_rank = seednorm_rank
+        self.seednorm_type = seednorm_type
+        self.final_norm = final_norm
         self.mla_kv_rank = mla_kv_rank
         self.shrink_qk_da = shrink_qk_da
         self.shrink_qk_gdn = shrink_qk_gdn
@@ -228,6 +259,7 @@ class DragonConfig(PretrainedConfig):
         self.scalable_softmax = scalable_softmax
         self.resformer = resformer
         self.mamba_mimo_dim = mamba_mimo_dim
+        self.mamba_ngroups = mamba_ngroups
 
         self.vocab_size = vocab_size
         self.tie_word_embeddings = tie_word_embeddings
