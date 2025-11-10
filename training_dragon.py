@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import transformers
+from transformers import get_wsd_schedule
 
 from .configuration_dragon import DragonConfig
 from .modeling_dragon import DragonForCausalLM
@@ -59,6 +60,9 @@ class NanoArgs:
     mixer_gn: bool = True
     mlp_linking : bool = False
     final_norm: bool = True
+    layer_norm_scaling: bool = False # not read when using muP
+    mlp_type: str = "simple" # simple, gated
+    tie_lm_head: bool = False
 
     # MoE
     moe: bool = False
@@ -105,6 +109,8 @@ class NanoArgs:
     kda_num_v_heads: Optional[int] = None
     mamba_mimo_dim: Optional[int] = 2
     mamba_ngroups: Optional[int] = 1
+    mamba_d_state: int = 128
+    mamba_headdim: int = 64
     mamba3_rope: bool = True
     mamba3_remove_BC_bias: bool = False
     mamba3_is_id_rms: bool = True
@@ -125,6 +131,7 @@ class NanoArgs:
     adam_eps: float = 1e-8
     warmup_iters: int = 200
     warmdown_iters: int = 3000
+    warmdown_type: str = "linear" # linear, cosine
     grad_norm_clip: float = 1.0
     uscaling_mult_embed: float = 0
     uscaling_mult_scalar: float = 0
@@ -325,6 +332,15 @@ if args.intra_doc_masking:
         args.device_batch_size = 1
         print("!!! Forcing device_batch_size to 1 for intra-document masking !!!")
 
+if args.mlp_type == "gated":
+    if args.use_uscaling:
+        print("problem: gated MLP with muP is not supported, because we use FA backend")
+        exit(0)
+
+    if args.moe:
+        print("problem: gated MLP with MoE is not supported, because we use FA backend")
+        exit(0)
+
 # set up DDP (distributed data parallel).
 assert torch.cuda.is_available()
 dist.init_process_group(
@@ -425,6 +441,11 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    tie_lm_head=args.tie_lm_head,
+    mlp_type=args.mlp_type,
+    layer_norm_scaling=args.layer_norm_scaling,
+    mamba_d_state=args.mamba_d_state,
+    mamba_headdim=args.mamba_headdim,
     mamba3_rope=args.mamba3_rope,
     mamba3_remove_BC_bias=args.mamba3_remove_BC_bias,
     mamba3_is_id_rms=args.mamba3_is_id_rms,
@@ -600,8 +621,22 @@ def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
     else:
         decay_ratio = (num_iterations - it) / warmdown_iters
         return decay_ratio
-sched_func = partial(get_lr_wsd, args.total_iterations, args.warmup_iters, args.warmdown_iters)
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, sched_func) for opt in optimizers]
+if args.warmdown_type == "linear":
+    sched_func = partial(get_lr_wsd, args.total_iterations, args.warmup_iters, args.warmdown_iters)
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, sched_func) for opt in optimizers]
+elif args.warmdown_type == "cosine":
+    sched = get_wsd_schedule(
+        optimizers[0],
+        num_warmup_steps=args.warmup_iters,
+        num_decay_steps=args.warmdown_iters,
+        num_training_steps=args.total_iterations,
+        min_lr_ratio=0.,
+        warmup_type='linear',
+        decay_type='cosine',
+    )
+    schedulers = [sched]
+else:
+    raise ValueError(f"Unknown warmdown type: {args.warmdown_type}")
 
 # resume if necessary.
 start_iter = 0

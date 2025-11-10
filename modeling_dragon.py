@@ -19,6 +19,8 @@ from transformers.utils import ModelOutput, logging
 
 from fla.ops.nsa.parallel import parallel_nsa
 
+from flash_attn.modules.mlp import GatedMlp
+
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 except ImportError:
@@ -559,7 +561,7 @@ class DragonAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.hidden_size = config.hidden_size
-        self.head_dim = config.head_dim if config.head_dim else config.hidden_size * config.expand_factor // self.num_attention_heads
+        self.head_dim = config.head_dim # if config.head_dim else config.hidden_size * config.expand_factor // self.num_attention_heads
         self.qk_norm = config.qk_norm
         self.window_size = config.sliding_window_size
         self.reuse_kv = reuse_kv
@@ -706,7 +708,7 @@ class DragonAttention(nn.Module):
                 if not self.reuse_kv:
                     key_states = apply_rotary_emb(key_states, cos, sin)
             elif self.config.rope_type_local == "p-rope":
-                query_states = apply_p_rotary_emb(query_states, cos, sin)
+                query_states = apply_p_rotary_emb(query_states, cos, sin, p=0.5)
                 if not self.reuse_kv:
                     key_states = apply_p_rotary_emb(key_states, cos, sin)
             else:
@@ -3519,10 +3521,10 @@ class DragonMamba3(nn.Module):
             )
 
         self.d_model = config.hidden_size
-        self.d_state = 128
+        self.d_state = config.mamba_d_state
         self.conv_init = None
         self.expand = 2
-        self.headdim = 64
+        self.headdim = config.mamba_headdim
         self.ngroups = config.mamba_ngroups
         self.activation = "swish"
         self.bias = False
@@ -3547,8 +3549,8 @@ class DragonMamba3(nn.Module):
         if config.mamba3_rope:
             self.rope_proj = DragonLinear(config, self.d_model, self.num_rope_angles, bias=False)
 
-        # Order: [x, B, C, dt]
-        d_in_proj = self.d_inner + 2 * self.d_state * self.ngroups + self.nheads
+        # Order: [z, x, B, C, dt]
+        d_in_proj = 2 * self.d_inner + 2 * self.d_state * self.ngroups + self.nheads
 
         if self.config.mamba3_is_A_dd:
             self.A_proj = DragonLinear(config, self.d_model, self.nheads, bias=False, dtype=torch.float32)
@@ -3609,10 +3611,11 @@ class DragonMamba3(nn.Module):
         **kwargs
     ):
         # Apply in_proj
-        xBCdt = self.in_proj(hidden_states)
-        xBC, dd_dt = torch.split(
-            xBCdt,
+        zxBCdt = self.in_proj(hidden_states)
+        z, xBC, dd_dt = torch.split(
+            zxBCdt,
             [
+                self.d_inner,
                 self.d_inner + 2 * self.d_state * self.ngroups,
                 self.nheads,
             ],
@@ -3721,16 +3724,21 @@ class DragonMamba3(nn.Module):
         else:
             y = out
 
+        y = rearrange(y, "b l h p -> b l (h p)")
+        y = y*self.act(z)
+        y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads).to(x.dtype)
+
         return y, None, None
 
 class DragonMamba2(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: Optional[int]):
         super().__init__()
+        self.config = config
         self.d_model = config.hidden_size
-        self.d_state = 128
+        self.d_state = config.mamba_d_state
         self.expand = 2
         self.d_inner = self.expand * self.d_model
-        self.headdim = 64
+        self.headdim = config.mamba_headdim
         self.ngroups = config.mamba_ngroups
         assert self.d_inner % self.headdim == 0
         self.nheads = self.d_inner // self.headdim
@@ -3740,16 +3748,17 @@ class DragonMamba2(nn.Module):
         d_in_proj = self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         self.in_proj = DragonLinear(config, self.d_model, d_in_proj, bias=False)
 
-        conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
-        self.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            bias=False,
-            kernel_size=4,
-            groups=conv_dim,
-            padding=4-1,
-        )
-        self.act = nn.SiLU()
+        if not self.config.mamba3_remove_conv:
+            conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
+            self.conv1d = nn.Conv1d(
+                in_channels=conv_dim,
+                out_channels=conv_dim,
+                bias=False,
+                kernel_size=4,
+                groups=conv_dim,
+                padding=4-1,
+            )
+            self.act = nn.SiLU()
 
         # Initialize log dt bias
         dt_min=0.001
@@ -3791,18 +3800,19 @@ class DragonMamba2(nn.Module):
         dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
 
         # 1D Convolution
-        if causal_conv1d_fn is None:
-            xBC = self.act(
-                self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
-            )  # (B, L, self.d_inner + 2 * ngroups * d_state)
-            xBC = xBC[:, :seqlen, :]
-        else:
-            xBC = causal_conv1d_fn(
-                x=xBC.transpose(1, 2),
-                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                bias=self.conv1d.bias,
-                activation="swish",
-            ).transpose(1, 2)
+        if not self.config.mamba3_remove_conv:
+            if causal_conv1d_fn is None:
+                xBC = self.act(
+                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
+                )  # (B, L, self.d_inner + 2 * ngroups * d_state)
+                xBC = xBC[:, :seqlen, :]
+            else:
+                xBC = causal_conv1d_fn(
+                    x=xBC.transpose(1, 2),
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation="swish",
+                ).transpose(1, 2)
 
         # Split into 3 main branches: X, B, C
         # These correspond to V, K, Q respectively in the SSM/attention duality
@@ -4193,7 +4203,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.mixer = DragonMamba3(config, layer_idx=layer_idx)
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
-            use_gate = config.gate_gdn
+            use_gate = False
         elif layer_type == '2':
             self.mixer = DragonMamba2(config, layer_idx=layer_idx)
             head_dim = self.mixer.headdim
@@ -4249,13 +4259,19 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         self.input_norm = DragonNorm(config, config.hidden_size)
         self.postmixer_norm = DragonNorm(config, config.hidden_size)
         if not config.moe:
-            self.mlp = DragonMLP(config)
+            if config.mlp_type == "simple":
+                self.mlp = DragonMLP(config)
+            elif config.mlp_type == "gated":
+                self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
         else:
             self.mlp = DragonMoE(config)
         global PREVIOUS_MLP
         PREVIOUS_MLP = self.mlp
 
-        self.register_buffer("lns", torch.tensor(1.0 if config.use_uscaling else 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))), persistent=False)
+        if config.use_uscaling or not config.layer_norm_scaling:
+            self.register_buffer("lns", torch.tensor(1.0), persistent=False)
+        else:
+            self.register_buffer("lns", torch.tensor(1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))), persistent=False)
         self.register_buffer("sqrt_tau", torch.sqrt(torch.tensor(self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
         self.register_buffer("sqrt_one_minus_tau", torch.sqrt(torch.tensor(1.0 - self.config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
 
@@ -4575,6 +4591,8 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=1/math.sqrt(config.hidden_size))
         self.post_init()
+        if config.tie_lm_head:
+            self.lm_head.weight = self.model.embedding.weight
 
     def forward(
         self,
@@ -4654,6 +4672,13 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values if not just_loss else None,
             hidden_states=outputs.hidden_states if not just_loss else None,
         )
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
 DragonForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
 __all__ = ["DragonModel", "DragonForCausalLM", "DragonPreTrainedModel"]

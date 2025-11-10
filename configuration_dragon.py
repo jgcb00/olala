@@ -92,6 +92,11 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        tie_lm_head: bool = False,
+        mlp_type: str = "simple",
+        layer_norm_scaling: bool = False,
+        mamba_d_state: int = 128,
+        mamba_headdim: int = 64,
         mamba3_rope: bool = True,
         mamba3_remove_BC_bias: bool = False,
         mamba3_is_id_rms: bool = True,
@@ -192,6 +197,11 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.tie_lm_head = tie_lm_head
+        self.mlp_type = mlp_type
+        self.layer_norm_scaling = layer_norm_scaling
+        self.mamba_d_state = mamba_d_state
+        self.mamba_headdim = mamba_headdim
         self.mamba3_rope = mamba3_rope
         self.mamba3_remove_BC_bias = mamba3_remove_BC_bias
         self.mamba3_is_id_rms = mamba3_is_id_rms
@@ -309,7 +319,7 @@ class DragonConfig(PretrainedConfig):
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
+            tie_word_embeddings=tie_lm_head,
             **kwargs,
         )
         # TODO: better way to handle those?
