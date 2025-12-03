@@ -41,7 +41,8 @@ class NanoArgs:
     rope_theta_local: float = 10000.0
     rope_theta_global: float = 0.0
     eps_rmsnorm: float = 1e-6
-    mlp_expand: int = 4 # expand factor for MLP
+    mlp_expand: float = 4. # expand factor for MLP
+    intermediate_size: Optional[int] = None
     fused_loss_computation : bool = True # whether to use fused linear + cross entropy loss
     use_uscaling: bool = False
     uscaling_tau: float = 0.2
@@ -58,11 +59,19 @@ class NanoArgs:
     seednorm_type: int = 1
     seednorm_rank: int = 1
     mixer_gn: bool = True
+    gate_before_norm: bool = True
     mlp_linking : bool = False
     final_norm: bool = True
     layer_norm_scaling: bool = False # not read when using muP
     mlp_type: str = "simple" # simple, gated
     tie_lm_head: bool = False
+    legacy_gate: bool = False
+    vwn: bool = False
+    vwn_m: int = 2
+    vwn_n: int = 3
+    vwn_wd_alpha_beta: bool = False
+    vwn_dynamic: bool = True
+    reduce_lm_head: int = 0
 
     # MoE
     moe: bool = False
@@ -117,6 +126,7 @@ class NanoArgs:
     mamba3_remove_conv: bool = True
     mamba3_is_A_dd: bool = True
     mamba3_add_trapezoid: bool = True
+    mamba3_postgate_norm: bool = False # only works if legacy_gate is True!!
 
     # optim
     optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus
@@ -129,6 +139,8 @@ class NanoArgs:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
+    alpha_normalize: bool = False # whether to normalize update by (1+alpha) in AdEMAMix
+    alpha_ademamix: float = 8.0
     warmup_iters: int = 200
     warmdown_iters: int = 3000
     warmdown_type: str = "linear" # linear, cosine
@@ -142,6 +154,8 @@ class NanoArgs:
     second_order_lr: float = 0.68
     second_order_momentum: float = 0.37
     second_order_interval: int = 25
+    init_gpt2: bool = False
+    wnorm: bool = False # as in nemotron-flash (2511.18890)
 
     # data
     vocab_size: int = 50304
@@ -150,6 +164,7 @@ class NanoArgs:
     intra_doc_masking: bool = False
     input_bin: Optional[str] = None
     input_val_bin: Optional[str] = None
+    dataset_type: str = "hf" # hf, mg
 
     # evaluation and logging
     val_loss_every: int = 125
@@ -170,7 +185,34 @@ class NanoArgs:
     # used during training
     slw_window: int = 0
 
-def _peek_data_shard(filename):
+def _peek_data_shard(filename, dataset_type='hf'):
+    if dataset_type == 'hf':
+        return _peek_hf_shard(filename)
+    elif dataset_type == 'mg':
+        return _peek_mg_shard(filename)
+    else:
+        raise ValueError(f"unknown dataset type: {dataset_type}")
+
+def _load_data_shard(filename, dataset_type='hf'):
+    if dataset_type == 'hf':
+        return _load_hf_shard(filename)
+    elif dataset_type == 'mg':
+        return _load_mg_shard(filename)
+    else:
+        raise ValueError(f"unknown dataset type: {dataset_type}")
+
+def _load_hf_shard(filename):
+    with open(filename, "rb") as f:
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = int(header[2])
+    # memmap the token payload directly (uint16) after the 256*4B header
+    tokens = np.memmap(filename, dtype=np.uint16, mode="r", offset=256 * 4, shape=(ntok,))
+    assert tokens.size == ntok, "number of tokens read does not match header?"
+    return tokens
+
+def _peek_hf_shard(filename):
     with open(filename, "rb") as f:
         header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
     if header[0] != 20240520:
@@ -182,25 +224,22 @@ def _peek_data_shard(filename):
     ntok = int(header[2])
     return ntok
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = int(header[2])
-    # memmap the token payload directly (uint16) after the 256*4B header
-    tokens = np.memmap(filename, dtype=np.uint16, mode="r", offset=256 * 4, shape=(ntok,))
-    assert tokens.size == ntok, "number of tokens read does not match header?"
-    return tokens
+def _peek_mg_shard(filename):
+    tokens = np.memmap(filename, dtype=np.uint16, mode="r")
+    return int(tokens.size)
+
+def _load_mg_shard(filename):
+    return np.memmap(filename, dtype=np.uint16, mode="r")
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, intra_doc_masking,B, T, process_rank, num_processes, bos_id):
+    def __init__(self, filename_pattern, intra_doc_masking,B, T, process_rank, num_processes, bos_id, dataset_type='hf'):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.intra_doc_masking = intra_doc_masking
         self.bos_id = bos_id
         self.B = B # micro batch size
         self.T = T
+        self.dataset_type = dataset_type
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
@@ -210,7 +249,7 @@ class DistributedDataLoader:
         ntok_total = 0
         self.shard_ntoks = []
         for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
+            shard_ntok = _peek_data_shard(fname, dataset_type=self.dataset_type)
             #print(f"shard {fname} has {shard_ntok} tokens")
             assert shard_ntok >= num_processes * B * T + 1
             self.shard_ntoks.append(shard_ntok)
@@ -223,12 +262,12 @@ class DistributedDataLoader:
     def reset(self, shard=0):
         self.current_shard = shard
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.tokens = _load_data_shard(self.files[self.current_shard], dataset_type=self.dataset_type)
 
     def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.tokens = _load_data_shard(self.files[self.current_shard], dataset_type=self.dataset_type)
         
         if self.process_rank == 0:
             shard_tokens = self.shard_ntoks[self.current_shard]
@@ -282,30 +321,38 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
     groups, seen = [], set()
     id2name = {id(p): n for n, p in model.named_parameters()}
 
-    for mod in model.modules():
+    for name, mod in model.named_modules():
         if isinstance(mod, nn.Linear):
             pname = id2name.get(id(mod.weight), "")
             is_scalar = getattr(mod, "is_scalar_weight", False)
             fan_in = mod.weight.shape[1]
-            scale = 1 / math.sqrt(fan_in)
             if "lm_head" in pname:
+                scale = 1
                 lr_scaled = base_lr_head
                 wd_scaled = 0.0
+                wd_mult = 0.0
             elif is_scalar:
+                scale = 1
                 lr_scaled = base_lr_scalar
                 wd_scaled = 0.0
+                wd_mult = 0.0
             else:
+                scale = 1 / math.sqrt(fan_in)
                 lr_scaled = base_lr_hidden * scale
                 wd_scaled = wd / lr_scaled
+                wd_mult = 1/lr_scaled
 
             groups.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled})
             seen.add(mod.weight)
 
+            print(f"param {name}.weight | shape {mod.weight.shape} | scale {scale} | wd_mult={wd_mult:.3e}")
+
             if mod.bias is not None:
+                assert False
                 groups.append({"params": [mod.bias], "lr": base_lr_scalar, "weight_decay": 0.0})
                 seen.add(mod.bias)
 
-    for p in model.parameters():
+    for name, p in model.named_parameters():
         if p in seen:
             continue
         pname = id2name.get(id(p), "<unnamed>")
@@ -318,10 +365,14 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
             lr_scaled = base_lr_scalar
 
         wd_scaled = 0.
+        wd_mult = 0.
         if getattr(p, "requires_weight_decay", False):
             wd_scaled = wd / lr_scaled
+            wd_mult = 1/lr_scaled
 
         groups.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled})
+
+        print(f"param {name} | shape {p.shape} | scale {1.} | wd_mult={wd_mult:.3e}")
 
     return groups
 
@@ -340,6 +391,9 @@ if args.mlp_type == "gated":
     if args.moe:
         print("problem: gated MLP with MoE is not supported, because we use FA backend")
         exit(0)
+
+if args.legacy_gate:
+    assert not args.gate_gdn, "legacy_gate is not compatible with gate_gdn."
 
 # set up DDP (distributed data parallel).
 assert torch.cuda.is_available()
@@ -434,13 +488,22 @@ tokenizer = transformers.AutoTokenizer.from_pretrained("/leonardo_work/BOOST_LCu
 # load dataloaders.
 #if args.patch_level_training:
 #    assert T % args.patch_level_training_size == 0, "sequence length must be divisible by patch level training size in reduced mode"
-train_loader = DistributedDataLoader(args.input_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id)
-val_loader = DistributedDataLoader(args.input_val_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id)
+train_loader = DistributedDataLoader(args.input_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id, args.dataset_type)
+val_loader = DistributedDataLoader(args.input_val_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id, args.dataset_type)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 # load model.
 config_hf = DragonConfig(
+    reduce_lm_head=args.reduce_lm_head,
+    dataset_type=args.dataset_type,
+    vwn=args.vwn,
+    vwn_m=args.vwn_m,
+    vwn_n=args.vwn_n,
+    vwn_wd_alpha_beta=args.vwn_wd_alpha_beta,
+    vwn_dynamic=args.vwn_dynamic,
+    legacy_gate=args.legacy_gate,
+    init_gpt2=args.init_gpt2,
     tie_lm_head=args.tie_lm_head,
     mlp_type=args.mlp_type,
     layer_norm_scaling=args.layer_norm_scaling,
@@ -452,6 +515,7 @@ config_hf = DragonConfig(
     mamba3_remove_conv=args.mamba3_remove_conv,
     mamba3_is_A_dd=args.mamba3_is_A_dd,
     mamba3_add_trapezoid=args.mamba3_add_trapezoid,
+    mamba3_postgate_norm=args.mamba3_postgate_norm,
     moe=args.moe,
     moe_num_routed_experts=args.moe_num_routed_experts,
     moe_routed_scaling_factor=args.moe_routed_scaling_factor,
@@ -466,6 +530,7 @@ config_hf = DragonConfig(
     shrink_qk_da=args.shrink_qk_da,
     shrink_qk_gdn=args.shrink_qk_gdn,
     mixer_gn=args.mixer_gn,
+    gate_before_norm=args.gate_before_norm,
     kda_allow_neg_eigval=args.kda_allow_neg_eigval,
     kda_num_v_heads=args.kda_num_v_heads,
     seednorm_wd=args.seednorm_wd,
@@ -508,7 +573,7 @@ config_hf = DragonConfig(
     max_position_embeddings=args.sequence_length,
     use_uscaling=args.use_uscaling,
     hidden_size=args.d_model,
-    intermediate_size=args.d_model * args.mlp_expand,
+    intermediate_size=int(args.d_model * args.mlp_expand) if args.intermediate_size is None else args.intermediate_size,
     expand_factor=args.expand_factor,
     layers_config=args.layers_config,
     num_attention_heads=args.n_heads,
@@ -535,18 +600,14 @@ else:
     model = model.cuda()
 print0(model)
 
-"""# check here that the init std is as expected: # TODO TEMPORARY
 with torch.no_grad():
-    wstd = model.model.embedding.weight.std().item()
-    print0(f"Model weight init std: {wstd:.6f} (expected {args.init_std})")
-    assert abs(wstd - args.init_std) / args.init_std < 0.1, f"weight init std {wstd} deviates from expected {args.init_std} by more than 10%"
-
-    # check on another we
-    lstd = model.model.layers[0].attn.linear_qkv.weight.std().item()
-    print0(f"Model first layer attention QKV weight init std: {lstd:.6f} (expected {args.init_std})")
-
-    lstd = model.model.layers[0].lin_attn.qkv_conv1d.weight.std().item()
-    print0(f"Model first layer conv QKV weight init std: {lstd:.6f} (expected {args.init_std})")"""
+    for name, p in model.named_parameters():
+        if p is None or p.numel() == 0:
+            continue
+        t = p.detach().float()
+        mean = t.mean().item()
+        std  = t.std(unbiased=False).item()
+        print0(f"{name:60s} shape={tuple(p.shape)} mean={mean:+.4e} std={std:.4e}")
 
 # count params. (total & active)
 num_params = sum(p.numel() for p in model.parameters())
@@ -570,7 +631,7 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 if args.intra_doc_masking:
     print0("!!! Using intra-document masking !!!")
-    print0("It is only compatible with GDN (conv+chunk), DA and GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
+    print0("It is only compatible with GDN (conv+chunk), KDA (conv+chunk), DA and GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
 
 # load optimizers & schedulers.
 if args.use_uscaling:
@@ -587,18 +648,38 @@ if args.use_uscaling:
         optimizer = torch.optim.AdamW(param_list, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
     elif args.optim == "ademamix":
         from .optimizers.Ademamix import AdEMAMix
-        beta3_warmup = alpha_warmup = args.total_iterations
-        optimizer = AdEMAMix(param_list, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, weight_decay=args.weight_decay)
+        beta3_warmup = args.total_iterations
+        alpha_warmup = args.total_iterations
+        optimizer = AdEMAMix(param_list, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
     else:
         raise ValueError(f"Unknown optimizer for unit scaling: {args.optim}")
 else:
     if args.optim == "adamw":
-        optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+        #optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+        decay_params = []
+        no_decay_params = []
+        for name, p in raw_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if getattr(p, "_no_weight_decay", False):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": args.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+        )
     elif args.optim == "ademamix":
         from .optimizers.Ademamix import AdEMAMix
 
-        beta3_warmup = alpha_warmup = args.total_iterations
-        optimizer = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, weight_decay=args.weight_decay)
+        beta3_warmup = args.total_iterations
+        alpha_warmup = args.total_iterations
+        optimizer = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
     else:
         raise ValueError(f"Unknown Optimizer: {args.optim}")
 if args.second_order_optim == "snoo":
@@ -624,7 +705,7 @@ def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
 if args.warmdown_type == "linear":
     sched_func = partial(get_lr_wsd, args.total_iterations, args.warmup_iters, args.warmdown_iters)
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, sched_func) for opt in optimizers]
-elif args.warmdown_type == "cosine":
+elif args.warmdown_type == "cosine" or args.warmdown_type == "1-sqrt":
     sched = get_wsd_schedule(
         optimizers[0],
         num_warmup_steps=args.warmup_iters,
@@ -632,7 +713,7 @@ elif args.warmdown_type == "cosine":
         num_training_steps=args.total_iterations,
         min_lr_ratio=0.,
         warmup_type='linear',
-        decay_type='cosine',
+        decay_type=args.warmdown_type,
     )
     schedulers = [sched]
 else:
@@ -721,8 +802,11 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         # save model & tokenizer to make evaluation easier.
         tokenizer.save_pretrained(save_dir)
         state_dict_bf16 = {k: v.detach().to(torch.bfloat16).cpu() for k, v in uncompiled_model.state_dict().items()}
+        idm_og = uncompiled_model.config.intra_doc_masking
+        uncompiled_model.config.intra_doc_masking = False
         uncompiled_model.config.torch_dtype = torch.bfloat16
         uncompiled_model.save_pretrained(save_dir, safe_serialization=True, state_dict=state_dict_bf16)
+        uncompiled_model.config.intra_doc_masking = idm_og
         # save training state.
         train_state = dict(
             iteration=iter_,
@@ -757,6 +841,18 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
                 (loss / accumulation_steps).backward()
         else:
             (loss / accumulation_steps).backward() # just sync on the last step
+    individual_grad_norms = {}
+    """# Calculate individual param norms
+    # We use 'raw_model' to avoid 'module.' or '_orig_mod.' prefixes in wandb
+    individual_grad_norms = {}
+    # Only calculate on master process to save time, and maybe throttle frequency (e.g., every 10 steps)
+    # If you want it every step, remove the (iter_ % 10 == 0) check.
+    if master_process and (iter_ % 50 == 0): 
+        for name, p in raw_model.named_parameters():
+            if p.grad is not None:
+                # Calculate L2 norm of the gradient
+                param_norm = p.grad.detach().data.norm(2).item()
+                individual_grad_norms[f"grad_norm/{name}"] = param_norm"""
     # clip those gradients.
     if args.grad_norm_clip is not None:
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
@@ -771,13 +867,26 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     # null those gradients.
     model.zero_grad(set_to_none=True)
 
+    # Wnorm
+    if args.wnorm:
+        with torch.no_grad():
+            for m in model.modules():
+                if getattr(m, "norm_case_1", False):
+                    W = getattr(m, "weight", None)
+                    denom = W.float().norm(p=2, dim=1, keepdim=True).clamp_min(1e-8).to(W.dtype)
+                    W.div_(denom)
+                elif getattr(m, "norm_case_2", False):
+                    W = getattr(m, "weight", None)
+                    denom = W.float().norm(p=2, dim=0, keepdim=True).clamp_min(1e-8).to(W.dtype)
+                    W.div_(denom)
+
     # ----------- LOGGING SECTION -----------
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= start_iter+WARMUP_SKIP else 0
     extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
     print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
-        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log}, step=iter_)
+        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms}, step=iter_)
 
 print0(f"peak memory consumption during training: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 print0("Training complete.")

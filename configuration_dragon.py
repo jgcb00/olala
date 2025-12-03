@@ -92,6 +92,15 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        reduce_lm_head: int = 0,
+        dataset_type: str = "hf",
+        vwn: bool = False,
+        vwn_m: int = 2,
+        vwn_n: int = 3,
+        vwn_wd_alpha_beta: bool = False,
+        vwn_dynamic: bool = True,
+        legacy_gate: bool = False,
+        init_gpt2: bool = False,
         tie_lm_head: bool = False,
         mlp_type: str = "simple",
         layer_norm_scaling: bool = False,
@@ -103,6 +112,7 @@ class DragonConfig(PretrainedConfig):
         mamba3_remove_conv: bool = True,
         mamba3_is_A_dd: bool = True,
         mamba3_add_trapezoid: bool = True,
+        mamba3_postgate_norm: bool = False,
         moe: bool = False,
         moe_num_routed_experts: int = 2,
         moe_routed_scaling_factor: float = 2.5,
@@ -116,6 +126,7 @@ class DragonConfig(PretrainedConfig):
         shrink_qk_da: int = 2,
         shrink_qk_gdn: int = 2,
         mixer_gn: bool = True,
+        gate_before_norm: bool = True,
         kda_allow_neg_eigval: bool = False,
         kda_num_v_heads: Optional[int] = None,
         seednorm_wd: bool = True,
@@ -197,6 +208,15 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.reduce_lm_head = reduce_lm_head
+        self.dataset_type = dataset_type
+        self.vwn = vwn
+        self.vwn_m = vwn_m
+        self.vwn_n = vwn_n
+        self.vwn_wd_alpha_beta = vwn_wd_alpha_beta
+        self.vwn_dynamic = vwn_dynamic
+        self.legacy_gate = legacy_gate
+        self.init_gpt2 = init_gpt2
         self.tie_lm_head = tie_lm_head
         self.mlp_type = mlp_type
         self.layer_norm_scaling = layer_norm_scaling
@@ -208,6 +228,7 @@ class DragonConfig(PretrainedConfig):
         self.mamba3_remove_conv = mamba3_remove_conv
         self.mamba3_is_A_dd = mamba3_is_A_dd
         self.mamba3_add_trapezoid = mamba3_add_trapezoid
+        self.mamba3_postgate_norm = mamba3_postgate_norm
         self.moe = moe
         self.moe_num_routed_experts = moe_num_routed_experts
         self.moe_routed_scaling_factor = moe_routed_scaling_factor
@@ -221,6 +242,7 @@ class DragonConfig(PretrainedConfig):
         self.shrink_qk_da = shrink_qk_da
         self.shrink_qk_gdn = shrink_qk_gdn
         self.mixer_gn = mixer_gn
+        self.gate_before_norm = gate_before_norm
         self.kda_allow_neg_eigval = kda_allow_neg_eigval
         self.kda_num_v_heads = kda_num_v_heads
         self.seednorm_wd = seednorm_wd

@@ -46,7 +46,7 @@ class AdEMAMix(Optimizer):
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999, 0.999), alpha=8.0, 
-                 beta3_warmup=None, alpha_warmup=None,  eps=1e-8,
+                 beta3_warmup=None, alpha_warmup=None, eps=1e-8, normalize_alpha=False,
                  weight_decay=0):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -62,6 +62,7 @@ class AdEMAMix(Optimizer):
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
         if not 0.0 <= alpha:
             raise ValueError("Invalid alpha value: {}".format(alpha))
+        self.normalize_alpha = normalize_alpha
         defaults = dict(lr=lr, betas=betas, eps=eps, alpha=alpha, beta3_warmup=beta3_warmup,
                         alpha_warmup=alpha_warmup, weight_decay=weight_decay)
         super(AdEMAMix, self).__init__(params, defaults)
@@ -139,6 +140,8 @@ class AdEMAMix(Optimizer):
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                if self.normalize_alpha:
+                    denom = denom * (1.0 + alpha)
 
                 update = (exp_avg_fast.div(bias_correction1) + alpha * exp_avg_slow) / denom
 
