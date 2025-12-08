@@ -92,6 +92,8 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        layers_ve_config: str = "",
+        use_value_embedding: bool = False,
         reduce_lm_head: int = 0,
         dataset_type: str = "hf",
         vwn: bool = False,
@@ -114,7 +116,9 @@ class DragonConfig(PretrainedConfig):
         mamba3_add_trapezoid: bool = True,
         mamba3_postgate_norm: bool = False,
         moe: bool = False,
+        moe_router_type: str = "classic",
         moe_num_routed_experts: int = 2,
+        moe_num_active_experts: int = 1,
         moe_routed_scaling_factor: float = 2.5,
         moe_routed_intermediate_size: int = 768,
         moe_shared_intermediate_size: int = 768,
@@ -208,6 +212,8 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.layers_ve_config = layers_ve_config
+        self.use_value_embedding = use_value_embedding
         self.reduce_lm_head = reduce_lm_head
         self.dataset_type = dataset_type
         self.vwn = vwn
@@ -230,6 +236,8 @@ class DragonConfig(PretrainedConfig):
         self.mamba3_add_trapezoid = mamba3_add_trapezoid
         self.mamba3_postgate_norm = mamba3_postgate_norm
         self.moe = moe
+        self.moe_router_type = moe_router_type
+        self.moe_num_active_experts = moe_num_active_experts
         self.moe_num_routed_experts = moe_num_routed_experts
         self.moe_routed_scaling_factor = moe_routed_scaling_factor
         self.moe_routed_intermediate_size = moe_routed_intermediate_size

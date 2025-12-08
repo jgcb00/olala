@@ -2799,7 +2799,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
     Multi-headed differential attention (https://arxiv.org/abs/2410.05258)
     """
 
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
+    def __init__(self, config: DragonConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -2829,6 +2829,9 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         self.W_B_v = DragonLinear(config, self.hidden_size, self.rank * self.head_v_dim, bias=False)
         self.c_q.norm_case_1 = True
         # todo: norm others?
+
+        if use_ve:
+            self.ve_scalars = nn.Parameter(torch.zeros(self.num_noise_heads, self.head_v_dim, dtype=torch.float32))
 
         if self.config.token_shift_attn:
             if self.config.scalar_proj_as_hidden_matrix:
@@ -2901,6 +2904,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         cache_params: Optional[HybridDragonDynamicCache] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        ve=None,
         **kwargs,
     ):
         b, q_len, _ = hidden_states.shape
@@ -2919,6 +2923,10 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         B_v = B_v.view(b * q_len, self.rank, self.head_v_dim)
         key_states = torch.bmm(A_k, B_k).div_(self.rank).view(b, q_len, self.num_attention_heads, self.head_qk_dim)
         value_states = torch.bmm(A_v, B_v).div_(self.rank).view(b, q_len, self.num_noise_heads, self.head_v_dim)
+
+        # value embeddings
+        if ve is not None:
+            value_states = value_states + self.ve_scalars * ve.view_as(value_states)
 
         # token-shift.
         if self.config.token_shift_attn:
@@ -3586,7 +3594,7 @@ def get_qkv_tensors_gdn(module: nn.Module, hidden_states: torch.Tensor):
     return q, k, v
 
 class DragonGatedDeltaNet(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
+    def __init__(self, config: DragonConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -3623,6 +3631,9 @@ class DragonGatedDeltaNet(nn.Module):
             self.num_attention_heads + self.num_attention_heads, #+ self.num_attention_heads*self.dv, # b(H), a(H), g(H*dv)
             bias=False
         )
+
+        if use_ve:
+            self.ve_scalars = nn.Parameter(torch.zeros(self.num_attention_heads, self.dv, dtype=torch.float32))
 
         if config.legacy_gate:
             if config.gate_type == 'kimi':
@@ -3690,6 +3701,7 @@ class DragonGatedDeltaNet(nn.Module):
                 position_embeddings: tuple[torch.Tensor, torch.Tensor],
                 cache_params: Optional[HybridDragonDynamicCache] = None,
                 cu_seqlens: Optional[torch.Tensor] = None,
+                ve=None,
                 **kwargs,
     ):
         _, q_len, _ = hidden_states.shape
@@ -3710,6 +3722,10 @@ class DragonGatedDeltaNet(nn.Module):
 
         if cache_params is not None:
             ssm_cache = cache_params.ssm_caches[self.layer_idx]
+
+        # value embeddings
+        if ve is not None:
+            v = v + self.ve_scalars * ve.view_as(v)
 
         # token-shift.
         if self.config.token_shift_gdn:
@@ -4631,7 +4647,7 @@ class DragonMLP(nn.Module):
         self.fc_2.norm_case_2 = True
         self.register_buffer("_2_sqrt_5", torch.tensor(2/math.sqrt(5)) if config.use_uscaling else torch.tensor(1.), persistent=False)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, router_prev=None):
         if self.mlp_linking:
             #hidden_states = torch.concat([hidden_states, self.previous_mlp.get_mlp_link()], dim=-1)
             #link = hidden_states[...,:self.link_size] + self.previous_mlp.get_mlp_link()
@@ -4643,67 +4659,278 @@ class DragonMLP(nn.Module):
         if self.config.mlp_linking:
             self.mlp_link = hidden_states[...,:self.link_size]
         hidden_states = self.fc_2(hidden_states)
-        return hidden_states
+        return hidden_states, None
     
     def get_mlp_link(self):
         mlp_link = self.mlp_link
         self.mlp_link = None
         return mlp_link
 
-class DragonGatedMLP(nn.Module):
-    def __init__(self, config: DragonConfig, intermediate_size: Optional[int] = None, num_active_experts: int = 1):
-        super().__init__()
-        self.config = config
-        self.intermediate_size = intermediate_size
+def group_limited_topk(
+    scores: torch.Tensor,
+    topk: int,
+    num_tokens: int,
+    num_experts: int,
+    num_groups: int,
+    group_topk: int,
+):
+    """Perform top-k routing on a subset of expert groups.
 
-        self.fc_1 = DragonLinear(config, config.hidden_size, num_active_experts*self.intermediate_size, bias=False)
-        self.fc_1.norm_case_1 = True
-        self.fc_2 = DragonLinear(config, num_active_experts*self.intermediate_size, config.hidden_size, bias=False)
-        self.fc_2.norm_case_2 = True
-        self.register_buffer("_2_sqrt_5", torch.tensor(2/math.sqrt(5)) if config.use_uscaling else torch.tensor(1.), persistent=False)
+    When using group-limited routing:
+    1. Experts are divided into 'moe_router_num_groups' equal-sized groups
+    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
+       (specifically, the sum of top-2 expert scores within each group)
+    3. From these selected groups, 'moe_router_topk' individual experts are chosen
 
-    def forward(self, hidden_states, gates):
-        B, L, D = hidden_states.size()
-        hidden_states = self.fc_1(hidden_states) # (B, L, E*D)
-        hidden_states = self._2_sqrt_5 * F.relu(hidden_states).square().view(B, L, -1, self.intermediate_size)  # (B, L, E, D)
-        hidden_states = hidden_states * gates.unsqueeze(-1)  # (B, L, E, D)
-        hidden_states = self.fc_2(hidden_states.view(B, L, -1))  # (B, L, D)
-        return hidden_states
+    Two common use cases:
+    - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
+      to limit each token to experts on a subset of devices
+      (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
+
+    - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
+      to limit each token to experts on a subset of nodes
+      (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
+
+    Args:
+        scores (torch.Tensor): Softmax scores generated by the router.
+        topk (int): The number of experts to select for each token.
+        num_tokens (int): The number of tokens.
+        num_experts (int): The number of experts.
+        num_groups (int): Number of groups for routed experts.
+        group_topk (int): Number of groups selected for each token.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
+    """
+    # Organize the experts into groups
+    # Select groups based on sum of top-(topk/group_topk) routing scores within each group
+    group_scores = (scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1))
+    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+
+    # Mask the experts based on selection groups
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_groups, num_experts // num_groups)
+        .reshape(num_tokens, -1)
+    )
+
+    masked_scores = scores.masked_fill(~score_mask.bool(), float('-inf'))
+    probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
+
+    return probs, top_indices
+
+def compute_topk(scores, num_tokens, num_total_experts, topk, num_groups=None, group_topk=None):
+    if group_topk:
+        return group_limited_topk(
+            scores=scores,
+            topk=topk,
+            num_tokens=num_tokens,
+            num_experts=num_total_experts,
+            num_groups=num_groups,
+            group_topk=group_topk,
+        )
+    else:
+        return torch.topk(scores, k=topk, dim=1)
+
+def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_capacity=None):
+    """
+    Calculate the capacity of each expert.
+
+    Args:
+        num_tokens (int): num of the input tokens.
+        num_experts (int): num of the experts.
+        capacity_factor (float): Capacity factor.
+        min_capacity (int, optional): Minimum capacity. Defaults to None.
+
+    Returns:
+        Tensor: Capacity of each expert.
+    """
+    capacity = math.ceil((num_tokens / num_experts) * capacity_factor)
+    if min_capacity is not None and capacity < min_capacity:
+        capacity = min_capacity
+    return capacity
+
+def apply_router_token_dropping(
+    routing_probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    router_topk: int,
+    capacity_factor: float,
+    drop_policy: str = "probs",
+    pad_to_capacity: bool = False,
+):
+    """Apply token dropping to top-k expert selection.
+
+    This function enforces expert capacity limits by dropping tokens that exceed
+    the capacity and optionally padding to capacity.
+
+    Args:
+        routing_probs (torch.Tensor): Tensor of shape [num_tokens, num_experts]
+            containing the routing probabilities for selected experts.
+        routing_map (torch.Tensor): Boolean tensor of shape [num_tokens, num_experts]
+            indicating which experts were selected for each token.
+        router_topk (int): Number of experts selected per token.
+        capacity_factor (float): The capacity factor of each expert.
+        drop_policy (str): Policy to drop tokens - "probs" or "position".
+        pad_to_capacity (bool): Whether to pad to capacity.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - final_probs: Routing probabilities after applying capacity constraints
+            - final_map: Boolean mask after applying capacity constraints
+    """
+    assert routing_probs.ndim == 2 and routing_map.ndim == 2
+    num_tokens, num_experts = routing_probs.shape
+    # Calculate expert capacity
+    expert_capacity = get_capacity(
+        num_tokens=num_tokens * router_topk,
+        num_experts=num_experts,
+        capacity_factor=capacity_factor,
+    )
+
+    # Create capacity mask based on drop policy
+    if drop_policy == "probs":
+        _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+    elif drop_policy == "position":
+        _, capacity_indices = torch.topk(routing_map.int(), k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+    else:
+        raise ValueError(f"Invalid drop_policy: {drop_policy}")
+
+    # Apply capacity constraints
+    if pad_to_capacity:
+        final_map = capacity_mask
+        final_probs = routing_probs * final_map
+    else:
+        # Get exceed mask and maskout exceeded probs and indices
+        final_map = torch.logical_and(routing_map, capacity_mask)
+        final_probs = routing_probs * final_map
+
+    return final_probs, final_map
 
 class DragonMoE(nn.Module):
-    def __init__(self, config: DragonConfig):
+    def __init__(self, config: DragonConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.num_experts = config.moe_num_routed_experts
+        self.num_active_experts = config.moe_num_active_experts
+        self.num_groups = 1
+        self.num_active_groups = 1
         self.routed_scaling_factor = config.moe_routed_scaling_factor
+        # token dropping
+        self.moe_expert_capacity_factor = None
+        self.moe_token_drop_policy = 0
+        self.moe_pad_expert_input_to_capacity = 0
 
-        self.router = DragonLinear(config, config.hidden_size, self.num_experts, bias=False, dtype=torch.float32)
-        self.experts = DragonGatedMLP(config, config.moe_routed_intermediate_size, self.num_experts)
-        if config.moe_shared_intermediate_size > 0:
+        # router and experts
+        if self.config.moe_router_type == 'classic':
+            self.router = DragonLinear(config, config.hidden_size, self.num_experts, bias=False, dtype=torch.float32, alpha_fwd=1., alpha_bwd=1.)
+        else:
+            intermediate_size = config.hidden_size//8
+            self.linear_down = DragonLinear(config, config.hidden_size, intermediate_size, bias=True)
+            if layer_idx > 0:
+                self.eda_scalers = torch.nn.Parameter(torch.zeros(intermediate_size))
+            self.eda_norm = DragonNorm(config, intermediate_size)
+            self.router_fc1 = DragonLinear(config, intermediate_size, intermediate_size, bias=True)
+            self.router_fc2 = DragonLinear(config, intermediate_size, intermediate_size, bias=True)
+            self.router_fc3 = DragonLinear(config, intermediate_size, self.num_experts, bias=False)
+
+        self.experts = nn.ModuleList([
+            DragonMLP(config, config.moe_routed_intermediate_size) for _ in range(self.num_experts)
+        ])
+        self.register_buffer('expert_bias', torch.zeros(self.num_experts, dtype=torch.float32, device=torch.cuda.current_device()))
+        if config.moe_shared_intermediate_size:
             self.shared_expert = DragonMLP(config, config.moe_shared_intermediate_size)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, router_prev=None):
+        B, L, D = hidden_states.size()
+        num_tokens = B * L
+        hidden_states = hidden_states.view(num_tokens, -1)
+
         # compute gating score.
-        weights = F.sigmoid(self.router(hidden_states.to(torch.float32))) # (B, L, experts)
-        weights = weights / weights.sum(dim=-1, keepdim=True) # (B, L, experts)
-        weights = (weights * self.routed_scaling_factor).to(hidden_states.dtype)
-        # forward through (routed) experts.
-        y = self.experts(hidden_states, weights) # (B, L, E, D)
+        if self.config.moe_router_type == 'classic':
+            logits = self.router(hidden_states.float()) # (num_tokens, experts)
+            scores = F.sigmoid(logits.float()).type_as(logits)
+        else:
+            x = self.linear_down(hidden_states)
+            if router_prev is not None:
+                x = x + self.eda_scalers * router_prev
+            router_prev = x.clone()
+            x = self.eda_norm(x)
+            x = F.gelu(self.router_fc1(x))
+            x = F.gelu(self.router_fc2(x))
+            logits = self.router_fc3(x)
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+
+        scores_for_routing = scores + self.expert_bias
+        _, top_indices = compute_topk(scores_for_routing, num_tokens, self.num_experts, self.num_active_experts, self.num_groups, self.num_active_groups)
+        scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.num_active_experts > 1 else scores
+        probs = probs * self.routed_scaling_factor
+
+        if torch.are_deterministic_algorithms_enabled():
+            # build [num_tokens, num_experts] from [num_tokens, topk]
+            routing_probs = torch.zeros_like(logits)
+            rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+            routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+            routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+            routing_map.index_put_((rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False)
+            routing_map = routing_map.bool()
+        else:
+            # TODO try using element-wise operations instead of scatter?
+            routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+            routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+        if self.moe_expert_capacity_factor is not None:
+            routing_probs, routing_map = apply_router_token_dropping(
+                routing_probs,
+                routing_map,
+                router_topk=self.num_active_experts,
+                capacity_factor=self.moe_expert_capacity_factor,
+                drop_policy=self.moe_token_drop_policy,
+                pad_to_capacity=self.moe_pad_expert_input_to_capacity,
+            )
+
+        # forward through routed experts.
+        if self.num_experts == 1 and self.num_active_experts == 1:
+            # routing_probs is [num_tokens, 1]; dropped tokens have prob 0, so this is safe.
+            expert_out = self.experts[0](hidden_states)[0].float()           # [T, D]
+            y = expert_out * routing_probs[:, 0:1].float()                   # [T, D]
+        else:
+            y = hidden_states.new_zeros(num_tokens, D, dtype=torch.float32)
+
+            for e in range(self.num_experts):
+                token_idx = torch.nonzero(routing_map[:, e], as_tuple=False).flatten()
+                if token_idx.numel() == 0:
+                    continue
+                expert_out = self.experts[e](hidden_states[token_idx])[0].float()
+                probs_e = routing_probs[token_idx, e].unsqueeze(-1).float()
+                y.index_add_(0, token_idx, expert_out * probs_e)
+
         # forward through shared expert.
-        if self.config.moe_shared_intermediate_size > 0:
-            y = y + self.shared_expert(hidden_states)
-        return y
+        if self.config.moe_shared_intermediate_size:
+            y = y + self.shared_expert(hidden_states)[0]
+        
+        y = y.to(hidden_states.dtype)
+        y = y.view(B, L, -1)
+        return y, router_prev
 
 PREVIOUS_MLP = None
 class DragonMonoBlock(GradientCheckpointingLayer):
-    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str):
+    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.expand_factor = config.expand_factor
 
+        if use_ve:
+            assert layer_type in ['g', 'T'], "VE is only supported for 'g' and 'T' layer types."
+
         if layer_type == 'g':
-            self.mixer = DragonGatedDeltaNet(config, layer_idx=layer_idx)
+            self.mixer = DragonGatedDeltaNet(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
             use_gate = config.gate_gdn
@@ -4753,7 +4980,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             num_attention_heads = self.mixer.num_attention_heads
             use_gate = config.gate_attn
         elif layer_type == 'T':
-            self.mixer = DragonDifferentialTensorProductAttention(config, layer_idx=layer_idx)
+            self.mixer = DragonDifferentialTensorProductAttention(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_signal_heads
             use_gate = config.gate_attn
@@ -4839,7 +5066,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             elif config.mlp_type == "gated":
                 self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
         else:
-            self.mlp = DragonMoE(config)
+            self.mlp = DragonMoE(config, layer_idx=layer_idx)
         global PREVIOUS_MLP
         PREVIOUS_MLP = self.mlp
 
@@ -4860,6 +5087,8 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        router_prev=None,
+        ve=None,
         **kwargs,
     ):
         # MIXER.
@@ -4873,6 +5102,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             key_value_last_layer=key_value_last_layer,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            ve=ve,
         ) # (B, L, E*D)
         if self.config.mixer_gn and not self.config.gate_before_norm:
             y_mixer = self.mixer_group_norm(y_mixer)
@@ -4899,10 +5129,10 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         # MLP.
         residual = hidden_states
         hidden_states = self.lns * self.postmixer_norm(hidden_states)
-        y_mlp = self.mlp(hidden_states) # (B, L, D)
+        y_mlp, router_prev = self.mlp(hidden_states, router_prev) # (B, L, D)
         hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mlp
 
-        return hidden_states, last_key_states, last_value_states
+        return hidden_states, last_key_states, last_value_states, router_prev
 
 class DragonGHyperConnection(nn.Module):
     def __init__(self, config: DragonConfig, m, n_in=3):
@@ -5330,10 +5560,34 @@ class DragonModel(DragonPreTrainedModel):
             self.hidden_size_expanded = int(config.vwn_n/config.vwn_m * config.hidden_size)
             self.expand_embedding = DragonLinear(config, config.hidden_size, self.hidden_size_expanded, bias=False)
 
+        if config.use_value_embedding:
+            layers_ve_flags = [c == "1" for c in config.layers_ve_config]
+            assert len(layers_ve_flags) == len(config.layers_config)
+            self.value_embedding = nn.ModuleList()
+            self.value_embedding_map = []
+            for use_ve, layer_type in zip(layers_ve_flags, config.layers_config):
+                if not use_ve:
+                    self.value_embedding_map.append(-1)
+                    continue
+                if layer_type == 'T':
+                    out_dim = (config.num_attention_heads - config.num_signal_heads_diff) * config.head_dim
+                elif layer_type == 'g':
+                    out_dim = config.num_attention_heads_gdn * config.head_dim_gdn
+                else:
+                    raise ValueError(f"Value embedding is only supported for 'T' and 'g' layers, got {layer_type}")
+                self.value_embedding_map.append(len(self.value_embedding))
+                self.value_embedding.append(nn.Embedding(config.vocab_size, out_dim, self.padding_idx))
+
         if not self.config.vwn:
-            self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
+            if not self.config.use_value_embedding:
+                self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
+            else:
+                self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve)) for i, (layer, ve) in enumerate(zip(config.layers_config, config.layers_ve_config))])
         else:
-            self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoVirtualBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
+            if not self.config.use_value_embedding:
+                self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoVirtualBlock(config, layer_idx=i, layer_type=layer) for i, layer in enumerate(config.layers_config)])
+            else:
+                self.layers = nn.ModuleList([DragonBlock(config, layer_idx=i, layer_type=layer) if layer in ['l', 'r', 'd'] else DragonMonoVirtualBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve)) for i, (layer, ve) in enumerate(zip(config.layers_config, config.layers_ve_config))])
 
         if self.config.rope_type_global != '' or self.config.rope_type_local != '':
             self.rotary_emb = DragonRotaryEmbedding(config, head_dim=config.head_dim if config.head_dim else (config.expand_factor*config.hidden_size)//config.num_attention_heads, theta=config.rope_theta_local) # only for SWA
@@ -5420,11 +5674,18 @@ class DragonModel(DragonPreTrainedModel):
             position_embeddings = None
 
         shared_kv = (None, None)
-        for block in self.layers:
+        router_prev = None
+        for i, block in enumerate(self.layers):
+            ve_i = None
+            if self.config.use_value_embedding:
+                j = self.value_embedding_map[i]
+                if j != -1:
+                    ve_i = self.value_embedding[j](input_ids)
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states, last_k, last_v = block(
+            hidden_states, last_k, last_v, router_prev = block(
                 hidden_states,
                 position_ids=position_ids,
                 cache_params=past_key_values,
@@ -5433,6 +5694,8 @@ class DragonModel(DragonPreTrainedModel):
                 key_value_last_layer=shared_kv,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                router_prev=router_prev,
+                ve=ve_i,
                 **kwargs,
             )
             shared_kv = (last_k, last_v)
@@ -5465,7 +5728,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         self.config = config
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
-        bwd = 1/math.sqrt(config.hidden_size) if config.dataset_type == "hf" else 1/config.hidden_size
+        bwd = 1/math.sqrt(config.hidden_size) # if config.dataset_type == "hf" else 1/config.hidden_size
         if config.reduce_lm_head == 0:
             self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=bwd)
         else:

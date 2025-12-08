@@ -72,10 +72,14 @@ class NanoArgs:
     vwn_wd_alpha_beta: bool = False
     vwn_dynamic: bool = True
     reduce_lm_head: int = 0
+    use_value_embedding: bool = False
+    layers_ve_config: str = ""
 
     # MoE
     moe: bool = False
+    moe_router_type: str = "classic" # "classic", "dragon"
     moe_num_routed_experts: int = 2
+    moe_num_active_experts: int = 1
     moe_routed_scaling_factor: float = 2.5
     moe_routed_intermediate_size: int = 768
     moe_shared_intermediate_size: int = 768
@@ -348,7 +352,6 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
             print(f"param {name}.weight | shape {mod.weight.shape} | scale {scale} | wd_mult={wd_mult:.3e}")
 
             if mod.bias is not None:
-                assert False
                 groups.append({"params": [mod.bias], "lr": base_lr_scalar, "weight_decay": 0.0})
                 seen.add(mod.bias)
 
@@ -495,6 +498,8 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    layers_ve_config=args.layers_ve_config,
+    use_value_embedding=args.use_value_embedding,
     reduce_lm_head=args.reduce_lm_head,
     dataset_type=args.dataset_type,
     vwn=args.vwn,
@@ -517,7 +522,9 @@ config_hf = DragonConfig(
     mamba3_add_trapezoid=args.mamba3_add_trapezoid,
     mamba3_postgate_norm=args.mamba3_postgate_norm,
     moe=args.moe,
+    moe_router_type=args.moe_router_type,
     moe_num_routed_experts=args.moe_num_routed_experts,
+    moe_num_active_experts=args.moe_num_active_experts,
     moe_routed_scaling_factor=args.moe_routed_scaling_factor,
     moe_routed_intermediate_size=args.moe_routed_intermediate_size,
     moe_shared_intermediate_size=args.moe_shared_intermediate_size,
@@ -612,12 +619,12 @@ with torch.no_grad():
 # count params. (total & active)
 num_params = sum(p.numel() for p in model.parameters())
 """model.eval()
-x, y, _, _, _ = train_loader.next_batch()
+x, y, cu, maxlen, position_ids = train_loader.next_batch()
 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-    model(input_ids=x[[0], [0]].unsqueeze(0)).logits.sum().backward()
+    model(input_ids=x[[0], [0]].unsqueeze(0), labels=y[[0], [0]].unsqueeze(0), cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids).logits.sum().backward()
 num_active = sum(p.grad.count_nonzero() for p in model.parameters() if p.grad is not None)
-model.zero_grad(set_to_none=True)
-model.train()"""
+model.zero_grad(set_to_none=True)"""
+model.train()
 print0(f"number of total parameters:  {num_params}")
 #print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
 
@@ -625,7 +632,7 @@ print0(f"number of total parameters:  {num_params}")
 uncompiled_model = model
 model = torch.compile(model, dynamic=args.compile_dynamic) if args.compile else model
 model.train()
-model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.resformer)
+model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.resformer or (args.moe and args.moe_num_routed_experts > 1))
 raw_model = model.module
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
@@ -884,7 +891,7 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= start_iter+WARMUP_SKIP else 0
     extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
-    print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
+    print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} grad_norm:{grad_norm.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
         wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms}, step=iter_)
 
