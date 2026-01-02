@@ -45,7 +45,7 @@ class AdEMAMix(Optimizer):
         weight_decay (float, optional): weight decay as in AdamW (default: 0)
     """
 
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999, 0.999), alpha=8.0, 
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95, 0.999), alpha=8.0,  #0.999
                  beta3_warmup=None, alpha_warmup=None, eps=1e-8, normalize_alpha=False,
                  weight_decay=0):
         if not 0.0 <= lr:

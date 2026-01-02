@@ -21,7 +21,7 @@ import transformers
 from transformers import get_wsd_schedule
 
 from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM
+from .modeling_dragon import DragonForCausalLM, DragonGroupedLinear, DragonMoE
 
 # TODO: save code files!!!!
 
@@ -83,6 +83,9 @@ class NanoArgs:
     moe_routed_scaling_factor: float = 2.5
     moe_routed_intermediate_size: int = 768
     moe_shared_intermediate_size: int = 768
+    moe_routed_input_dim: Optional[int] = None
+    moe_bias_update_rate: float = 1e-3
+    layers_mlp_config: str = ""
 
     # attention related
     n_kv_heads : int = 0
@@ -139,6 +142,7 @@ class NanoArgs:
     device_batch_size: int = 64 # batch size, in sequences, per device
     total_iterations: int = 1000 # number of iterations to run
     learning_rate: float = 1e-4
+    wd_emb: bool = False
     weight_decay: float = 0.
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -160,6 +164,17 @@ class NanoArgs:
     second_order_interval: int = 25
     init_gpt2: bool = False
     wnorm: bool = False # as in nemotron-flash (2511.18890)
+    use_completed_p: bool = False
+    completed_p_alpha: float = 0.5
+    completed_p_wd_other: bool = True
+    completed_p_beta_scaling: bool = False
+    learning_rate_scalar: float = 1e-4
+    learning_rate_embed: float = 1e-4
+    learning_rate_head: float = 1e-4
+    base_batch_size: int = 0
+    base_dataset_size: int = 0
+    base_width: int = 0
+    base_depth: int = 0
 
     # data
     vocab_size: int = 50304
@@ -321,38 +336,46 @@ class DistributedDataLoader:
 
         return x.cuda(), y.cuda(), cu, maxlen, position_ids
 
-def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, wd):
-    groups, seen = [], set()
+def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, wd, wd_emb=False):
+    hidden_groups, other_groups, seen = [], [], set()
     id2name = {id(p): n for n, p in model.named_parameters()}
 
     for name, mod in model.named_modules():
         if isinstance(mod, nn.Linear):
             pname = id2name.get(id(mod.weight), "")
             is_scalar = getattr(mod, "is_scalar_weight", False)
-            fan_in = mod.weight.shape[1]
+            target = None
             if "lm_head" in pname:
                 scale = 1
                 lr_scaled = base_lr_head
                 wd_scaled = 0.0
                 wd_mult = 0.0
+                target = other_groups
             elif is_scalar:
                 scale = 1
                 lr_scaled = base_lr_scalar
                 wd_scaled = 0.0
                 wd_mult = 0.0
+                target = other_groups
             else:
-                scale = 1 / math.sqrt(fan_in)
+                fan_in = mod.weight.shape[1]
+                if args.optim == "muon_modded":
+                    fan_out = mod.weight.shape[0]
+                    scale = math.sqrt(fan_in) / math.sqrt(max(fan_out, fan_in))
+                else:
+                    scale = 1 / math.sqrt(fan_in)
                 lr_scaled = base_lr_hidden * scale
                 wd_scaled = wd / lr_scaled
                 wd_mult = 1/lr_scaled
+                target = hidden_groups
 
-            groups.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled})
+            target.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled})
             seen.add(mod.weight)
 
-            print(f"param {name}.weight | shape {mod.weight.shape} | scale {scale} | wd_mult={wd_mult:.3e}")
+            print(f"param {name}.weight | hidden {target is hidden_groups} | shape {mod.weight.shape} | scale {scale} | lr={lr_scaled} | wd_mult={wd_mult:.3e}")
 
             if mod.bias is not None:
-                groups.append({"params": [mod.bias], "lr": base_lr_scalar, "weight_decay": 0.0})
+                other_groups.append({"params": [mod.bias], "lr": base_lr_scalar, "weight_decay": 0.0})
                 seen.add(mod.bias)
 
     for name, p in model.named_parameters():
@@ -360,22 +383,137 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
             continue
         pname = id2name.get(id(p), "<unnamed>")
 
+        target = other_groups
+        wd_scaled = 0.
+        wd_mult = 0.
+        scale = 1.
+
         if "embedding" in pname:
             #fan_out = p.shape[1] # nn.Embedding is transposed
             #lr_scaled = base_lr / math.sqrt(fan_out) # u-muP
             lr_scaled = base_lr_embed
+            if wd_emb:
+                wd_scaled = wd / lr_scaled
+                wd_mult = 1/lr_scaled
+        elif "experts.weight" in pname:
+            fan_in = p.shape[2]
+            scale = 1 / math.sqrt(fan_in)
+            lr_scaled = base_lr_hidden * scale
+            wd_scaled = wd / lr_scaled
+            wd_mult = 1/lr_scaled
+            target = hidden_groups
         else:
             lr_scaled = base_lr_scalar
-
-        wd_scaled = 0.
-        wd_mult = 0.
+        
         if getattr(p, "requires_weight_decay", False):
             wd_scaled = wd / lr_scaled
             wd_mult = 1/lr_scaled
 
-        groups.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled})
+        target.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled})
 
-        print(f"param {name} | shape {p.shape} | scale {1.} | wd_mult={wd_mult:.3e}")
+        print(f"param {name} | hidden {False} | shape {p.shape} | scale {scale} | lr={lr_scaled} | wd_mult={wd_mult:.3e}")
+
+    return hidden_groups, other_groups
+
+def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, dataset_size_base, width, width_base, depth, depth_base, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, base_wd, base_eps, wd_other, alpha_complete_p):
+    groups, seen = [], set()
+    id2name = {id(p): n for n, p in model.named_parameters()}
+
+    rho = math.sqrt(batch_size / dataset_size)
+    rho_base = math.sqrt(batch_size_base / dataset_size_base)
+
+    rho_adjusted = rho / rho_base
+    width_adjusted = width / width_base
+    depth_adjusted = depth / depth_base
+
+    print(f"rho scaling: rho={rho:.3e}, rho_adjusted={rho_adjusted:.3e}, depth_adjusted={depth_adjusted:.3e}")
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            pname = id2name.get(id(mod.weight), "")
+
+            if "lm_head" in pname:
+                base_lr = base_lr_head
+                scale_lr = (width_adjusted ** (-1)) * rho_adjusted
+                scale_wd = (width_adjusted) * rho_adjusted
+                scale_eps = 1/rho_adjusted
+            else:
+                base_lr = base_lr_hidden
+                scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
+                scale_wd = (width_adjusted) * rho_adjusted
+                scale_eps = ((width_adjusted) ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted
+
+            lr_scaled = base_lr * scale_lr
+            wd_scaled = base_wd * scale_wd
+            eps_scaled = base_eps * scale_eps
+
+            groups.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled, "eps": eps_scaled})
+            seen.add(mod.weight)
+
+            print(f"param {name}.weight | shape {mod.weight.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
+
+            if mod.bias is not None:
+                scale_lr = (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
+                lr_scaled = base_lr_scalar * scale_lr
+
+                scale_wd = rho_adjusted
+                if not wd_other:
+                    scale_wd = 0.
+                wd_scaled = base_wd * scale_wd
+
+                if "lm_head" in pname:
+                    scale_eps = 1/rho_adjusted
+                else:
+                    scale_eps = scale_eps # reuse from weight
+                eps_scaled = base_eps * scale_eps
+
+                groups.append({"params": [mod.bias], "lr": lr_scaled, "weight_decay": wd_scaled, "eps": eps_scaled})
+                seen.add(mod.bias)
+
+                print(f"param {name}.bias  | shape {mod.bias.shape} | lr={lr_scaled} | wd={wd_scaled:.3e}")
+
+    for name, p in model.named_parameters():
+        if p in seen:
+            continue
+        pname = id2name.get(id(p), "<unnamed>")
+
+        if "embedding" in pname:
+            base_lr = base_lr_embed
+            scale_lr = rho_adjusted
+            scale_wd = rho_adjusted
+            if not wd_other:
+                scale_wd = 0.0
+            scale_eps = ((width_adjusted) ** (-1)) * 1/rho_adjusted
+        elif "final_norm" in pname:
+            base_lr = base_lr_scalar
+            scale_lr = rho_adjusted
+            scale_wd = rho_adjusted
+            if not wd_other:
+                scale_wd = 0.0
+            scale_eps = 1/rho_adjusted
+        elif "experts.weight" in pname:
+            base_lr = base_lr_hidden
+            scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
+            scale_wd = (width_adjusted) * rho_adjusted
+            scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted
+        else:
+            base_lr = base_lr_scalar
+            scale_lr = (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
+            scale_wd = rho_adjusted
+            if not wd_other:
+                scale_wd = 0.0
+            if not("q_norm" in pname or "k_norm" in pname):
+                scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted
+            else:
+                scale_eps = (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted
+
+        lr_scaled = base_lr * scale_lr
+        wd_scaled = base_wd * scale_wd
+        eps_scaled = base_eps * scale_eps
+
+        groups.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled, "eps": eps_scaled})
+
+        print(f"param {name} | hidden {False} | shape {p.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
 
     return groups
 
@@ -397,6 +535,8 @@ if args.mlp_type == "gated":
 
 if args.legacy_gate:
     assert not args.gate_gdn, "legacy_gate is not compatible with gate_gdn."
+
+assert not (args.use_uscaling and args.use_completed_p), "use_uscaling and use_completed_p cannot be both True at the same time."
 
 # set up DDP (distributed data parallel).
 assert torch.cuda.is_available()
@@ -479,6 +619,36 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 np.random.seed(seed)
 
+def _fmt_gib(x_bytes: int) -> str:
+    return f"{x_bytes / (1024**3):.2f} GiB"
+def cuda_mem_report(dev=None):
+    dev = dev if dev is not None else torch.cuda.current_device()
+    free_b, total_b = torch.cuda.mem_get_info(dev)  # free/total on device
+    alloc_b   = torch.cuda.memory_allocated(dev)
+    reserv_b  = torch.cuda.memory_reserved(dev)
+    peak_a_b  = torch.cuda.max_memory_allocated(dev)
+    peak_r_b  = torch.cuda.max_memory_reserved(dev)
+
+    return {
+        "free_b": free_b, "total_b": total_b,
+        "alloc_b": alloc_b, "reserv_b": reserv_b,
+        "peak_alloc_b": peak_a_b, "peak_reserv_b": peak_r_b,
+        "util_peak_reserv": (peak_r_b / total_b) if total_b > 0 else float("nan"),
+        "headroom_b": max(total_b - peak_r_b, 0),
+    }
+def print_cuda_mem(prefix=""):
+    r = cuda_mem_report()
+    msg = (
+        f"{prefix}"
+        f"mem alloc={_fmt_gib(r['alloc_b'])} "
+        f"resv={_fmt_gib(r['reserv_b'])} "
+        f"peak_resv={_fmt_gib(r['peak_reserv_b'])} "
+        f"free={_fmt_gib(r['free_b'])}/{_fmt_gib(r['total_b'])} "
+        f"peak_util={100*r['util_peak_reserv']:.1f}% "
+        f"headroom~{_fmt_gib(r['headroom_b'])}"
+    )
+    print0(msg)
+
 # define convenience variables.
 B, T = args.device_batch_size, args.sequence_length
 if args.patch_level_training:
@@ -498,6 +668,10 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    base_depth=args.base_depth,
+    completed_p_alpha=args.completed_p_alpha,
+    use_completed_p=args.use_completed_p,
+    layers_mlp_config=args.layers_mlp_config,
     layers_ve_config=args.layers_ve_config,
     use_value_embedding=args.use_value_embedding,
     reduce_lm_head=args.reduce_lm_head,
@@ -528,6 +702,7 @@ config_hf = DragonConfig(
     moe_routed_scaling_factor=args.moe_routed_scaling_factor,
     moe_routed_intermediate_size=args.moe_routed_intermediate_size,
     moe_shared_intermediate_size=args.moe_shared_intermediate_size,
+    moe_routed_input_dim=args.moe_routed_input_dim,
     intra_doc_masking=args.intra_doc_masking,
     seednorm_rank=args.seednorm_rank,
     seednorm_type=args.seednorm_type,
@@ -629,10 +804,16 @@ print0(f"number of total parameters:  {num_params}")
 #print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
 
 # DDP & compile.
+"""torch._dynamo.config.cache_size_limit = 32
+torch._dynamo.config.accumulated_cache_size_limit = 256
+if hasattr(torch._dynamo.config, "recompile_limit"):
+    torch._dynamo.config.recompile_limit = 32
+if hasattr(torch._dynamo.config, "accumulated_recompile_limit"):
+    torch._dynamo.config.accumulated_recompile_limit = 256"""
 uncompiled_model = model
 model = torch.compile(model, dynamic=args.compile_dynamic) if args.compile else model
 model.train()
-model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.resformer or (args.moe and args.moe_num_routed_experts > 1))
+model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.resformer)
 raw_model = model.module
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
@@ -640,26 +821,93 @@ if args.intra_doc_masking:
     print0("!!! Using intra-document masking !!!")
     print0("It is only compatible with GDN (conv+chunk), KDA (conv+chunk), DA and GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
 
+# init model properly
+if args.use_completed_p:
+    with torch.no_grad():
+        groups, seen = [], set()
+        id2name = {id(p): n for n, p in model.named_parameters()}
+
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear):
+                pname = id2name.get(id(mod.weight), "")
+
+                if "lm_head" in pname:
+                    mod.weight.normal_(mean=0.0, std=args.init_std * ((args.d_model/args.base_width) ** -1))
+                else:
+                    mod.weight.normal_(mean=0.0, std=args.init_std * ((args.d_model/args.base_width) ** -0.5))
+                seen.add(mod.weight)
+                print(f"param {name}.weight | shape {mod.weight.shape} | std={mod.weight.std().item():.3e}")
+
+                if mod.bias is not None:
+                    mod.bias.zero_()
+                    seen.add(mod.bias)
+                    print(f"param {name}.bias  | shape {mod.bias.shape} | std={mod.bias.std().item():.3e}")
+
+        for name, p in model.named_parameters():
+            if p in seen:
+                continue
+            pname = id2name.get(id(p), "<unnamed>")
+            if "embedding" in pname:
+                p.normal_(mean=0.0, std=args.init_std)
+            print(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
+
 # load optimizers & schedulers.
 if args.use_uscaling:
-    #assert args.optim == "adamw", "uscaling is only supported with AdamW optimizer currently"
-    param_list = param_groups_mup(
+    hidden_groups, other_groups = param_groups_mup(
         raw_model,
         base_lr_hidden=args.learning_rate,
         base_lr_scalar=args.uscaling_mult_scalar*args.learning_rate if args.uscaling_mult_scalar > 0 else args.learning_rate,
         base_lr_embed=args.uscaling_mult_embed*args.learning_rate if args.uscaling_mult_embed > 0 else args.learning_rate,
         base_lr_head=args.uscaling_mult_head*args.learning_rate if args.uscaling_mult_head > 0 else args.learning_rate,
         wd=args.weight_decay,
+        wd_emb=args.wd_emb,
     )
     if args.optim == "adamw":
+        param_list = hidden_groups + other_groups
         optimizer = torch.optim.AdamW(param_list, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
     elif args.optim == "ademamix":
         from .optimizers.Ademamix import AdEMAMix
         beta3_warmup = args.total_iterations
         alpha_warmup = args.total_iterations
+        param_list = hidden_groups + other_groups
         optimizer = AdEMAMix(param_list, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
+    elif args.optim == "muon":
+        optim1 = torch.optim.Muon(hidden_groups, eps=1e-7, adjust_lr_fn='match_rms_adamw')
+        optim2 = torch.optim.AdamW(other_groups, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    elif args.optim == "muon_modded":
+        from .optimizers.muon_modded import Muon
+        optim1 = Muon(params=hidden_groups)
+        optim2 = torch.optim.AdamW(other_groups, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    elif args.optim == "normuon":
+        from .optimizers.normuon import NorMuon
+        optim1 = NorMuon(params=hidden_groups, distributed_mesh=dist.group.WORLD, cautious_wd=True, nesterov=True, adjust_lr="spectral_norm", )
+        optim2 = torch.optim.AdamW(other_groups, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
     else:
         raise ValueError(f"Unknown optimizer for unit scaling: {args.optim}")
+elif args.use_completed_p:
+    groups = param_groups_completed_p(
+        raw_model,
+        batch_size=args.batch_size * args.sequence_length,
+        batch_size_base=args.base_batch_size,
+        dataset_size=args.total_iterations * args.batch_size * args.sequence_length,
+        dataset_size_base=args.base_dataset_size,
+        width=args.d_model,
+        width_base=args.base_width,
+        depth=len(args.layers_config),
+        depth_base=args.base_depth,
+        base_lr_hidden=args.learning_rate,
+        base_lr_scalar=args.learning_rate_scalar,
+        base_lr_embed=args.learning_rate_embed,
+        base_lr_head=args.learning_rate_head,
+        base_wd=args.weight_decay,
+        base_eps=args.adam_eps,
+        wd_other=args.completed_p_wd_other,
+        alpha_complete_p=args.completed_p_alpha,
+    )
+    beta1 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta1 - 1)
+    beta2 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta2 - 1)
+
+    optimizer = torch.optim.AdamW(groups, betas=(beta1, beta2))
 else:
     if args.optim == "adamw":
         #optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
@@ -680,6 +928,7 @@ else:
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_eps,
+            foreach=False,
         )
     elif args.optim == "ademamix":
         from .optimizers.Ademamix import AdEMAMix
@@ -689,13 +938,58 @@ else:
         optimizer = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
     else:
         raise ValueError(f"Unknown Optimizer: {args.optim}")
+
+if args.optim != "muon" and args.optim != "muon_modded" and args.optim != "normuon":
+    optimizers = [optimizer]
+else:
+    optimizers = [optim1, optim2]
+
+# here, loop through all the params, print their lr,wd,eps AND std
+print0("=================================================================")
+@torch.no_grad()
+def _build_param_to_group_map(optimizer):
+    # param (by identity) -> (group_index, group_dict)
+    m = {}
+    for gi, g in enumerate(optimizer.param_groups):
+        for p in g["params"]:
+            m[id(p)] = (gi, g)
+    return m
+
+@torch.no_grad()
+def print_params_stats_and_hparams(model, optimizer, *, max_name=80, only_trainable=True):
+    p2g = _build_param_to_group_map(optimizer)
+
+    header = f"{'name':{max_name}}  {'shape':>16}  {'dtype':>10}  {'device':>10}  {'mean':>12}  {'std':>12}  {'lr':>10}  {'wd':>10}  {'eps':>10}  {'grp':>4}"
+    print0(header)
+    print0("-" * len(header))
+
+    for name, p in model.named_parameters():
+        if only_trainable and not p.requires_grad:
+            continue
+
+        # stats
+        x = p.detach()
+        mean = x.float().mean().item()
+        std = x.float().std(unbiased=False).item()
+
+        # optimizer hparams
+        gi, g = p2g.get(id(p), (-1, {}))
+        lr = g.get("lr", float("nan"))
+        wd = g.get("weight_decay", float("nan"))
+        eps = g.get("eps", optimizer.defaults.get("eps", float("nan")))  # per-group or global
+
+        nm = name if len(name) <= max_name else ("…" + name[-(max_name - 1):])
+        shp = str(tuple(p.shape))
+        print0(f"{nm:{max_name}}  {shp:>16}  {str(p.dtype):>10}  {str(p.device):>10}  "
+              f"{mean:12.5e}  {std:12.5e}  {lr:10.3e}  {wd:10.3e}  {eps:10.3e}  {gi:4d}")
+
+print_params_stats_and_hparams(raw_model, optimizer)
+
 if args.second_order_optim == "snoo":
     from .optimizers.Snoo import Snoo
     second_order_optim = Snoo(raw_model, lr=args.second_order_lr, momentum=args.second_order_momentum, k=args.second_order_interval)
 else:
     second_order_optim = None
-
-optimizers = [optimizer]
 
 def get_lr_wsd(num_iterations, warmup_iters, warmdown_iters, it):
     assert it <= num_iterations, f"it : {it}, num_iterations : {num_iterations}"
@@ -756,6 +1050,8 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     if iter_ == start_iter+WARMUP_SKIP:
         training_time_ms = 0
         t0 = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats()
+        print_cuda_mem(prefix=f"iter {iter_:06d} | ")
     to_log = {}
 
     # SLW WINDOW UPDATE
@@ -849,17 +1145,19 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         else:
             (loss / accumulation_steps).backward() # just sync on the last step
     individual_grad_norms = {}
-    """# Calculate individual param norms
-    # We use 'raw_model' to avoid 'module.' or '_orig_mod.' prefixes in wandb
-    individual_grad_norms = {}
-    # Only calculate on master process to save time, and maybe throttle frequency (e.g., every 10 steps)
-    # If you want it every step, remove the (iter_ % 10 == 0) check.
-    if master_process and (iter_ % 50 == 0): 
-        for name, p in raw_model.named_parameters():
-            if p.grad is not None:
-                # Calculate L2 norm of the gradient
-                param_norm = p.grad.detach().data.norm(2).item()
-                individual_grad_norms[f"grad_norm/{name}"] = param_norm"""
+    if master_process and (iter_ % 150 == 0):
+        with torch.no_grad():
+            names = []
+            norms_t = []
+            for name, p in raw_model.named_parameters():
+                if p.grad is None:
+                    continue
+                names.append(name)
+                norms_t.append(p.grad.detach().float().norm())  # norme L2 sur GPU
+
+            if norms_t:
+                norms = torch.stack(norms_t).cpu().tolist()      # 1 seul transfert
+                individual_grad_norms = {f"grad_norm/{n}": v for n, v in zip(names, norms)}
     # clip those gradients.
     if args.grad_norm_clip is not None:
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
@@ -871,6 +1169,23 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         sched.step()
     if second_order_optim:
         second_order_optim.step()
+    # update expert biases (and report balance).
+    with torch.no_grad():
+        for moe in model.module.modules():
+            if not isinstance(moe, DragonMoE):
+                continue
+            counts = moe.tokens_per_expert # (E,) float32 buffer on device
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            # compute and store expert entropies
+            if iter_ % 50 == 0:
+                p = counts / counts.sum().clamp_min(1.0)
+                ent = -(p * (p.clamp_min(1e-12)).log()).sum()
+                ent_norm = (ent / math.log(args.moe_num_routed_experts)).item()
+                to_log.update({f"moe/layer_{moe.layer_idx}_balance_entropy": ent_norm})
+            # update bias
+            moe.expert_bias.add_(args.moe_bias_update_rate * (counts.mean() - counts).sign())
+            counts.zero_() # reset for next training step
     # null those gradients.
     model.zero_grad(set_to_none=True)
 
@@ -887,13 +1202,26 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
                     denom = W.float().norm(p=2, dim=0, keepdim=True).clamp_min(1e-8).to(W.dtype)
                     W.div_(denom)
 
+    # param norm (logging)
+    param_norms = {}
+    if master_process and (iter_ % 150 == 0):
+        with torch.no_grad():
+            names = []
+            norm_tensors = []
+            for name, p in raw_model.named_parameters():
+                names.append(name)
+                norm_tensors.append(p.detach().float().norm())
+
+            norms = torch.stack(norm_tensors).cpu().tolist()
+            param_norms = {f"param_norm/{n}": v for n, v in zip(names, norms)}
+
     # ----------- LOGGING SECTION -----------
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= start_iter+WARMUP_SKIP else 0
     extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
     print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} grad_norm:{grad_norm.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
-        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms}, step=iter_)
+        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms, **param_norms}, step=iter_)
 
 print0(f"peak memory consumption during training: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 print0("Training complete.")
