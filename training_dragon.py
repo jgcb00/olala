@@ -48,7 +48,6 @@ class NanoArgs:
     uscaling_tau: float = 0.2
     zero_centered_gamma: bool = False
     zero_centered_gate: bool = False
-    zero_centered_gate_type: int = 1 # 1, 2, 3, 4
     gate_attn: bool = False
     gate_gdn: bool = True
     gate_type: str = "elementwise" # elementwise (one per dim), headwise (one per head), kimi (lora)
@@ -163,7 +162,6 @@ class NanoArgs:
     second_order_momentum: float = 0.37
     second_order_interval: int = 25
     init_gpt2: bool = False
-    wnorm: bool = False # as in nemotron-flash (2511.18890)
     use_completed_p: bool = False
     completed_p_alpha: float = 0.5
     completed_p_wd_other: bool = True
@@ -526,11 +524,11 @@ if args.intra_doc_masking:
 
 if args.mlp_type == "gated":
     if args.use_uscaling:
-        print("problem: gated MLP with muP is not supported, because we use FA backend")
+        print("problem: Gated MLP with muP is not supported, because we use FA backend")
         exit(0)
 
     if args.moe:
-        print("problem: gated MLP with MoE is not supported, because we use FA backend")
+        print("problem: Gated MLP with MoE is not supported, because we use FA backend")
         exit(0)
 
 if args.legacy_gate:
@@ -659,8 +657,6 @@ accumulation_steps = args.batch_size // (B * ddp_world_size)
 tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True)
 
 # load dataloaders.
-#if args.patch_level_training:
-#    assert T % args.patch_level_training_size == 0, "sequence length must be divisible by patch level training size in reduced mode"
 train_loader = DistributedDataLoader(args.input_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id, args.dataset_type)
 val_loader = DistributedDataLoader(args.input_val_bin, args.intra_doc_masking, B, T, ddp_rank, ddp_world_size, args.bos_id, args.dataset_type)
 print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
@@ -682,7 +678,6 @@ config_hf = DragonConfig(
     vwn_wd_alpha_beta=args.vwn_wd_alpha_beta,
     vwn_dynamic=args.vwn_dynamic,
     legacy_gate=args.legacy_gate,
-    init_gpt2=args.init_gpt2,
     tie_lm_head=args.tie_lm_head,
     mlp_type=args.mlp_type,
     layer_norm_scaling=args.layer_norm_scaling,
@@ -735,7 +730,6 @@ config_hf = DragonConfig(
     num_attention_heads_gdn=args.n_heads_gdn,
     num_key_value_heads_gdn=args.n_kv_heads_gdn,
     zero_centered_gate=args.zero_centered_gate,
-    zero_centered_gate_type=args.zero_centered_gate_type,
     scalable_softmax=args.scalable_softmax,
     mamba_mimo_dim=args.mamba_mimo_dim,
     mamba_ngroups=args.mamba_ngroups,
@@ -804,12 +798,6 @@ print0(f"number of total parameters:  {num_params}")
 #print0(f"number of active parameters: {num_active} ({num_active/num_params*100:.2f}%)")
 
 # DDP & compile.
-"""torch._dynamo.config.cache_size_limit = 32
-torch._dynamo.config.accumulated_cache_size_limit = 256
-if hasattr(torch._dynamo.config, "recompile_limit"):
-    torch._dynamo.config.recompile_limit = 32
-if hasattr(torch._dynamo.config, "accumulated_recompile_limit"):
-    torch._dynamo.config.accumulated_recompile_limit = 256"""
 uncompiled_model = model
 model = torch.compile(model, dynamic=args.compile_dynamic) if args.compile else model
 model.train()
@@ -822,7 +810,7 @@ if args.intra_doc_masking:
     print0("It is only compatible with GDN (conv+chunk), KDA (conv+chunk), DA and GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
 
 # init model properly
-if args.use_completed_p:
+if resume_dir is None and args.use_completed_p:
     with torch.no_grad():
         groups, seen = [], set()
         id2name = {id(p): n for n, p in model.named_parameters()}
@@ -850,6 +838,35 @@ if args.use_completed_p:
             if "embedding" in pname:
                 p.normal_(mean=0.0, std=args.init_std)
             print(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
+elif resume_dir is None:
+    with torch.no_grad():
+        groups, seen = [], set()
+        id2name = {id(p): n for n, p in model.named_parameters()}
+
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear):
+                pname = id2name.get(id(mod.weight), "")
+                mod.weight.normal_(mean=0.0, std=args.init_std)
+                seen.add(mod.weight)
+                print(f"param {name}.weight | shape {mod.weight.shape} | std={mod.weight.std().item():.3e}")
+
+                if mod.bias is not None:
+                    mod.bias.zero_()
+                    seen.add(mod.bias)
+                    print(f"param {name}.bias  | shape {mod.bias.shape} | std={mod.bias.std().item():.3e}")
+
+        for name, p in model.named_parameters():
+            if p in seen:
+                continue
+            pname = id2name.get(id(p), "<unnamed>")
+            if "embedding" in pname:
+                p.normal_(mean=0.0, std=args.init_std)
+            print(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
+
+        if args.init_gpt2:
+            for pn, p in model.named_parameters():
+                if pn.endswith('fc2.weight') or pn.endswith('mixer_proj.weight'):
+                    torch.nn.init.normal_(p, mean=0.0, std=args.init_std/math.sqrt(2 * len(args.layers_config)))
 
 # load optimizers & schedulers.
 if args.use_uscaling:
@@ -1189,19 +1206,6 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
             counts.zero_() # reset for next training step
     # null those gradients.
     model.zero_grad(set_to_none=True)
-
-    # Wnorm
-    if args.wnorm:
-        with torch.no_grad():
-            for m in model.modules():
-                if getattr(m, "norm_case_1", False):
-                    W = getattr(m, "weight", None)
-                    denom = W.float().norm(p=2, dim=1, keepdim=True).clamp_min(1e-8).to(W.dtype)
-                    W.div_(denom)
-                elif getattr(m, "norm_case_2", False):
-                    W = getattr(m, "weight", None)
-                    denom = W.float().norm(p=2, dim=0, keepdim=True).clamp_min(1e-8).to(W.dtype)
-                    W.div_(denom)
 
     # param norm (logging)
     param_norms = {}

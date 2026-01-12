@@ -102,7 +102,6 @@ class DragonConfig(PretrainedConfig):
         vwn_wd_alpha_beta: bool = False,
         vwn_dynamic: bool = True,
         legacy_gate: bool = False,
-        init_gpt2: bool = False,
         tie_lm_head: bool = False,
         mlp_type: str = "simple",
         layer_norm_scaling: bool = False,
@@ -150,7 +149,6 @@ class DragonConfig(PretrainedConfig):
         cca_seq_kernel_size: int = 4,
         rope_gdn: str = None,
         zero_centered_gate: bool = False,
-        zero_centered_gate_type: int = 1,
         scalable_softmax: bool = True,
         resformer: bool = False,
         mamba_mimo_dim : int = 4,
@@ -222,7 +220,6 @@ class DragonConfig(PretrainedConfig):
         self.vwn_wd_alpha_beta = vwn_wd_alpha_beta
         self.vwn_dynamic = vwn_dynamic
         self.legacy_gate = legacy_gate
-        self.init_gpt2 = init_gpt2
         self.tie_lm_head = tie_lm_head
         self.mlp_type = mlp_type
         self.layer_norm_scaling = layer_norm_scaling
@@ -270,7 +267,6 @@ class DragonConfig(PretrainedConfig):
         self.cca_seq_kernel_size = cca_seq_kernel_size
         self.rope_gdn = rope_gdn
         self.zero_centered_gate = zero_centered_gate
-        self.zero_centered_gate_type = zero_centered_gate_type
         self.gate_type = gate_type
         self.gate_act = gate_act
         self.gate_attn = gate_attn
