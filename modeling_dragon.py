@@ -28,8 +28,11 @@ except ImportError:
 
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 except ImportError:
+    print("Warning: No mamba-ssm found !")
     mamba_chunk_scan_combined = None
+    RMSNormGated = None
 
 try:
     from dragon_mamba3_ops.siso_variant.ssd_combined_fused import mamba_chunk_scan_discretized_combined
@@ -39,7 +42,6 @@ try:
     from dragon_mamba3_ops.rotary_mamba_mimo import rotary_qk as mimo_rotary_qk
 except ImportError as exc:
     print("Warning: No Mamba-3 found !")
-    print(exc)
     mamba_chunk_scan_discretized_combined, angle_dt, rotary_qk = None, None, None
 
 try:
@@ -66,7 +68,6 @@ try:
 except ImportError:
     chunk_kda, fused_recurrent_kda, fused_kda_gate, prepare_sequence_ids = None, None, None, None
 
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 from torch.compiler import disable
 

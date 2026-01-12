@@ -21,7 +21,7 @@ import transformers
 from transformers import get_wsd_schedule
 
 from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM, DragonGroupedLinear, DragonMoE
+from .modeling_dragon import DragonForCausalLM, DragonMoE
 
 # TODO: save code files!!!!
 
@@ -656,7 +656,7 @@ if args.patch_level_training:
 assert args.batch_size % (B * ddp_world_size) == 0
 accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-tokenizer = transformers.AutoTokenizer.from_pretrained("/leonardo_work/BOOST_LCustodi/script/training/temp/hf_models/gpt2", use_fast=True)
+tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", use_fast=True)
 
 # load dataloaders.
 #if args.patch_level_training:
@@ -906,6 +906,7 @@ elif args.use_completed_p:
     )
     beta1 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta1 - 1)
     beta2 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta2 - 1)
+    print0(f"Completed-p AdamW betas adjusted to: beta1={beta1:.6f}, beta2={beta2:.6f}")
 
     optimizer = torch.optim.AdamW(groups, betas=(beta1, beta2))
 else:
