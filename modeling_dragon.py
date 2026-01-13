@@ -3175,6 +3175,58 @@ class DragonMoE(nn.Module):
 
         return (out + out_experts).reshape(bs, slen, dim), None
 
+class GHyperConnection(nn.Module):
+def __init__(self, dim, m,):
+    super().__init__()
+    self.m, self.n_in, self.n_out = m, n_in, n_out
+    self.factor = 1.0 / math.sqrt(dim // self.m)
+
+    # Initialize static beta: cyclic pattern
+    static_beta_tensor = torch.zeros(self.m, n_in)
+    for j in range(n_in):
+        static_beta_tensor[j % self.m, j] = 1.0
+    self.static_beta = nn.Parameter(static_beta_tensor.T.contiguous())
+
+    # Initialize static alpha: block matrix
+    init_alpha = torch.cat([torch.eye(self.m), torch.eye(self.m),
+    torch.zeros((self.m, self.n_in - self.m))], dim=1)
+    if self.n_in > self.m:
+        part2 = torch.cat([torch.zeros((self.n_in - self.m, self.m * 2)), torch.eye(self.n_in - self.m)], dim=1)
+        init_alpha = torch.cat([init_alpha, part2], dim=0)
+    self.static_alpha = nn.Parameter(init_alpha.contiguous())
+
+    # Dynamic parameters
+    self.dynamic_alpha_fn = nn.Parameter(torch.zeros((dim // self.m, self.m + self.n_in)))
+    self.dynamic_alpha_scale = nn.Parameter(torch.ones_like(self.static_alpha))
+    self.dynamic_beta_fn = nn.Parameter(torch.zeros((dim // self.m, self.m)))
+    self.dynamic_beta_scale = nn.Parameter(torch.ones_like(self.static_beta))
+    self.layer_norm = RMSNorm(hidden_size=dim // self.m)
+
+    def _base_width_connection(self, h, dynamic_fn, dynamic_scale, static_scale):
+        h_shape = h.shape
+        N, NMM = static_scale.shape
+        M = (NMM - N) // 2
+        h_reshape = h.reshape((h_shape[:-1].numel(),) + (N, h_shape[-1] // N))
+        norm_h = self.layer_norm(h_reshape)
+        alpha_beta = (safe_tanh(norm_h @ dynamic_fn.T.to(dtype=norm_h.dtype) * self.factor) * dynamic_scale[None, ...] + static_scale[None, ...])
+        alpha, beta = torch.split(alpha_beta, (M + N, M), dim=-1)
+        mix_h = (h_reshape.transpose(1, 2) @ alpha.to(dtype=h_reshape.dtype)).transpose(1, 2)
+        return mix_h.reshape(h_shape[:-1] + mix_h.shape[1:]), beta
+
+    def width_connection(self, h):
+        dynamic_fn = torch.concat([self.dynamic_alpha_fn.T, self.dynamic_beta_fn.T], dim=0)
+        dynamic_scale = torch.concat([self.dynamic_alpha_scale, self.dynamic_beta_scale], dim=-1).contiguous()
+        static_scale = torch.concat([self.static_alpha, self.static_beta], dim=-1)
+        return self._base_width_connection(h, dynamic_fn.to(dtype=h.dtype), dynamic_scale.to(dtype=h.dtype), static_scale.to(dtype=h.dtype))
+
+    def depth_connection(self, mix_h, h_o, beta):
+        h_o_shape = h_o.shape
+        h_o = h_o.reshape(h_o_shape[:-1] + (self.m, h_o_shape[-1] // self.m))
+        h_i = beta.view(h_o.shape[:2] + beta.shape[1:]).to(dtype=h_o.dtype) @ h_o
+        h = h_i + mix_h[..., self.m:, :]
+        h_shape = h.shape
+        return h.reshape(h_shape[:-2] + (h_shape[-2] * h_shape[-1],)).contiguous()
+
 PREVIOUS_MLP = None
 class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
