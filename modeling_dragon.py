@@ -590,23 +590,6 @@ class DragonAttention(nn.Module):
         projection_dim = self.head_dim * (self.num_attention_heads + 2 * (0 if reuse_kv else self.num_key_value_heads))
         self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
 
-        if self.config.token_shift_attn:
-            if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_k.is_scalar_weight = True
-                self.shift_proj_v.is_scalar_weight = True
-
-        if self.config.token_conv1d_attn:
-            self.conv_size = config.conv_kernel
-            self.conv_dim = self.num_attention_heads * self.head_dim + self.num_key_value_heads * self.head_dim + self.num_key_value_heads * self.head_dim
-            self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
-            self.causal_conv1d_fn = causal_conv1d_fn
-            self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-
         if self.qk_norm:
             self.q_norm = DragonNorm(config, self.head_dim)
             if not reuse_kv:
@@ -615,8 +598,8 @@ class DragonAttention(nn.Module):
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_local_attn > 0.:
-                    score = self.config.softcap_local_attn * torch.tanh(score / self.config.softcap_local_attn)
+                if self.config.softcap_attn > 0.:
+                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
                 return score
             self.score_mod = score_mod
             # block mask (for causal & sliding window)
@@ -639,6 +622,8 @@ class DragonAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         cache_params: Optional[HybridDragonDynamicCache] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
         **kwargs,
     ):
         _, q_len, _ = hidden_states.shape
@@ -653,67 +638,9 @@ class DragonAttention(nn.Module):
             last_key_states, last_value_states = None, None
 
         # token-shift.
-        if self.config.token_shift_attn and not self.reuse_kv:
-            alpha_k = torch.sigmoid(self.shift_proj_k(hidden_states).float()).float().to(key_states.dtype).unsqueeze(-1) # (B, L, Hkv, 1)
-            alpha_v = torch.sigmoid(self.shift_proj_v(hidden_states).float()).float().to(value_states.dtype).unsqueeze(-1) # (B, L, Hkv, 1)
-
-            if cache_params is not None:
-                k_prev, v_prev = cache_params.get_last_kv(self.layer_idx)
-                if k_prev is None:
-                    k_prev, v_prev = torch.zeros_like(key_states[:, :1]), torch.zeros_like(value_states[:, :1])
-                cache_params.set_last_kv(self.layer_idx, key_states[:, -1:], value_states[:, -1:])
-            else:
-                k_prev = F.pad(key_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-                v_prev = F.pad(value_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-
-            key_states = alpha_k * k_prev + (1 - alpha_k) * key_states
-            value_states = alpha_v * v_prev + (1 - alpha_v) * value_states
-
+        assert not self.config.token_shift_attn
         # conv.
-        if self.config.token_conv1d_attn:
-            assert not self.reuse_kv, "not supported"
-            # --- pack for conv ---
-            q_proj = rearrange(query_states, "b l h d -> b l (h d)")
-            k_proj = rearrange(key_states, "b l g d -> b l (g d)")
-            v_proj = rearrange(value_states, "b l g d -> b l (g d)")
-            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)
-
-            if cache_params is not None:
-                conv_cache = cache_params.conv_caches[self.layer_idx]
-
-            if use_precomputed_states:
-                mixed_qkv = self.causal_conv1d_update(
-                    mixed_qkv,
-                    conv_cache,
-                    self.qkv_conv1d.weight.squeeze(1),
-                    self.qkv_conv1d.bias,
-                    'silu',
-                ) # conv_cache is updated in-place here
-            else:
-                if cache_params is not None:
-                    conv_cache = F.pad(mixed_qkv, (self.conv_size - mixed_qkv.shape[-1], 0))
-                    cache_params.conv_caches[self.layer_idx] = conv_cache
-                if self.causal_conv1d_fn is not None:
-                    mixed_qkv = self.causal_conv1d_fn(
-                        x=mixed_qkv,
-                        weight=self.qkv_conv1d.weight.squeeze(1),
-                        bias=self.qkv_conv1d.bias,
-                        activation='silu',
-                        seq_idx=None,
-                    )
-                else:
-                    mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :q_len])
-
-            # split back
-            mixed_qkv = mixed_qkv.transpose(1, 2)
-            q_proj, k_proj, v_proj = torch.split(
-                mixed_qkv,
-                [self.num_attention_heads*self.head_dim, self.num_key_value_heads*self.head_dim, self.num_key_value_heads*self.head_dim],
-                dim=-1,
-            )
-            query_states = rearrange(q_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
-            key_states = rearrange(k_proj, "b l (g d) -> b l g d", g=self.num_key_value_heads)
-            value_states = rearrange(v_proj, "b l (g d) -> b l g d", g=self.num_key_value_heads)
+        assert not self.config.token_conv1d_attn
 
         # QK-norm.
         if self.qk_norm:
@@ -722,18 +649,18 @@ class DragonAttention(nn.Module):
                 key_states = self.k_norm(key_states)
 
         # RoPE.
-        if self.config.rope_theta_local > 0.0:
+        if self.config.rope_type != "" and self.config.rope_theta > 0.0:
             cos, sin = position_embeddings
-            if self.config.rope_type_local == "rope":
+            if self.config.rope_type == "rope":
                 query_states = apply_rotary_emb(query_states, cos, sin)
                 if not self.reuse_kv:
                     key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type_local == "p-rope":
+            elif self.config.rope_type == "p-rope":
                 query_states = apply_p_rotary_emb(query_states, cos, sin, p=0.5)
                 if not self.reuse_kv:
                     key_states = apply_p_rotary_emb(key_states, cos, sin)
             else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type_local}")
+                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
 
         # KV-cache.
         if not self.reuse_kv and cache_params is not None:
@@ -747,15 +674,22 @@ class DragonAttention(nn.Module):
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
 
         if ATTN_IMPL == "eager":
+            assert not self.config.intra_doc_masking
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
+            if not self.config.intra_doc_masking:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
+            else:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
+            if not self.config.intra_doc_masking:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
+            else:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
@@ -765,7 +699,7 @@ class DragonAttention(nn.Module):
             value_states.bfloat16(),
             causal=True,
             wsize=wsize,
-            softcap=self.config.softcap_local_attn,
+            softcap=self.config.softcap_attn,
             softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
         )
         if len(attn_output.shape) == 3:
@@ -832,8 +766,8 @@ class DragonTensorProductAttention(nn.Module):
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_local_attn > 0.:
-                    score = self.config.softcap_local_attn * torch.tanh(score / self.config.softcap_local_attn)
+                if self.config.softcap_attn > 0.:
+                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
                 return score
             self.score_mod = score_mod
             # block mask (for causal & sliding window)
@@ -945,18 +879,18 @@ class DragonTensorProductAttention(nn.Module):
                 key_states = self.k_norm(key_states)
 
         # RoPE.
-        if self.config.rope_theta_local > 0.0:
+        if self.config.rope_theta > 0.0:
             cos, sin = position_embeddings
-            if self.config.rope_type_local == "rope":
+            if self.config.rope_type == "rope":
                 query_states = apply_rotary_emb(query_states, cos, sin)
                 if not self.reuse_kv:
                     key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type_local == "p-rope":
+            elif self.config.rope_type == "p-rope":
                 query_states = apply_p_rotary_emb(query_states, cos, sin)
                 if not self.reuse_kv:
                     key_states = apply_p_rotary_emb(key_states, cos, sin)
             else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type_local}")
+                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
 
         # KV-cache.
         if not self.reuse_kv and cache_params is not None:
@@ -988,7 +922,7 @@ class DragonTensorProductAttention(nn.Module):
             value_states.bfloat16(),
             causal=True,
             wsize=wsize,
-            softcap=self.config.softcap_local_attn,
+            softcap=self.config.softcap_attn,
             softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
         )
         if len(attn_output.shape) == 3:
@@ -1025,7 +959,7 @@ class DragonDifferentialAttention(nn.Module):
         self.head_v_dim = self.head_dim # typically 256
         self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
         self.qk_norm = config.qk_norm
-        self.softcap = config.softcap_global_attn
+        self.softcap = config.softcap_attn
         self.scalable_softmax = config.scalable_softmax
 
         projection_dim = self.head_qk_dim * self.num_attention_heads + self.head_qk_dim * self.num_key_value_heads + (self.head_v_dim * self.num_noise_heads//2)
@@ -1073,8 +1007,8 @@ class DragonDifferentialAttention(nn.Module):
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_global_attn > 0.:
-                    score = self.config.softcap_global_attn * torch.tanh(score / self.config.softcap_global_attn)
+                if self.config.softcap_attn > 0.:
+                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
                 return score
             self.score_mod = score_mod
             # block mask (for causal & sliding window)
@@ -1090,8 +1024,8 @@ class DragonDifferentialAttention(nn.Module):
             self.build_mask = build_mask
             self.last_wsize = self.build_mask(self.config.slw_wsize)
 
-        if self.config.rope_theta_global > 0.0 and self.config.rope_type_global != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta_global)
+        if self.config.rope_theta > 0.0 and self.config.rope_type != "":
+            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
         else:
             self.rotary_emb = None
 
@@ -1222,15 +1156,14 @@ class DragonDifferentialAttention(nn.Module):
         #rope
         if self.rotary_emb is not None:
             cos, sin = self.rotary_emb(hidden_states, position_ids)
-            if self.config.rope_type_global == "rope":
+            if self.config.rope_type == "rope":
                 query_states = apply_rotary_emb(query_states, cos, sin)
                 key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type_global == "p-rope":
+            elif self.config.rope_type == "p-rope":
                 query_states = apply_p_rotary_emb(query_states, cos, sin)
                 key_states = apply_p_rotary_emb(key_states, cos, sin)
             else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type_global}")
-
+                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
@@ -1372,7 +1305,7 @@ class DragonDifferentialMultiLatentAttention(nn.Module):
         self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
         self.kv_rank = config.mla_kv_rank
         self.qk_norm = config.qk_norm
-        self.softcap = config.softcap_global_attn
+        self.softcap = config.softcap_attn
         self.scalable_softmax = config.scalable_softmax
 
         self.linear_q = DragonLinear(config, config.hidden_size, self.head_qk_dim * self.num_attention_heads, bias=False)
@@ -1422,8 +1355,8 @@ class DragonDifferentialMultiLatentAttention(nn.Module):
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_global_attn > 0.:
-                    score = self.config.softcap_global_attn * torch.tanh(score / self.config.softcap_global_attn)
+                if self.config.softcap_attn > 0.:
+                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
                 return score
             self.score_mod = score_mod
             # block mask (for causal & sliding window)
@@ -1439,8 +1372,8 @@ class DragonDifferentialMultiLatentAttention(nn.Module):
             self.build_mask = build_mask
             self.last_wsize = self.build_mask(self.config.slw_wsize)
 
-        if self.config.rope_theta_global > 0.0 and self.config.rope_type_global != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta_global)
+        if self.config.rope_theta > 0.0 and self.config.rope_type != "":
+            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
         else:
             self.rotary_emb = None
 
@@ -1559,15 +1492,14 @@ class DragonDifferentialMultiLatentAttention(nn.Module):
         #rope
         if self.rotary_emb is not None:
             cos, sin = self.rotary_emb(hidden_states, position_ids)
-            if self.config.rope_type_global == "rope":
+            if self.config.rope_type == "rope":
                 query_states = apply_rotary_emb(query_states, cos, sin)
                 key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type_global == "p-rope":
+            elif self.config.rope_type == "p-rope":
                 query_states = apply_p_rotary_emb(query_states, cos, sin)
                 key_states = apply_p_rotary_emb(key_states, cos, sin)
             else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type_global}")
-
+                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
@@ -1699,7 +1631,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
         self.rank = config.tpa_rank
         self.qk_norm = config.qk_norm
-        self.softcap = config.softcap_global_attn
+        self.softcap = config.softcap_attn
         self.scalable_softmax = config.scalable_softmax
 
         self.c_q = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.head_qk_dim, bias=False)
@@ -1753,8 +1685,8 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
             def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_global_attn > 0.:
-                    score = self.config.softcap_global_attn * torch.tanh(score / self.config.softcap_global_attn)
+                if self.config.softcap_attn > 0.:
+                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
                 return score
             self.score_mod = score_mod
             # block mask (for causal & sliding window)
@@ -1770,8 +1702,8 @@ class DragonDifferentialTensorProductAttention(nn.Module):
             self.build_mask = build_mask
             self.last_wsize = self.build_mask(self.config.slw_wsize)
 
-        if self.config.rope_theta_global > 0.0 and self.config.rope_type_global != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta_global)
+        if self.config.rope_theta > 0.0 and self.config.rope_type != "":
+            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
         else:
             self.rotary_emb = None
 
@@ -1904,15 +1836,14 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         #rope
         if self.rotary_emb is not None:
             cos, sin = self.rotary_emb(hidden_states, position_ids)
-            if self.config.rope_type_global == "rope":
+            if self.config.rope_type == "rope":
                 query_states = apply_rotary_emb(query_states, cos, sin)
                 key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type_global == "p-rope":
+            elif self.config.rope_type == "p-rope":
                 query_states = apply_p_rotary_emb(query_states, cos, sin)
                 key_states = apply_p_rotary_emb(key_states, cos, sin)
             else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type_global}")
-
+                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
@@ -3322,7 +3253,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
 
         self.input_norm = DragonNorm(config, config.hidden_size)
         self.postmixer_norm = DragonNorm(config, config.hidden_size)
-        if mlp_type == 'd':
+        if not config.moe or mlp_type == 'd':
             if config.mlp_type == "simple":
                 self.mlp = DragonMLP(config)
             elif config.mlp_type == "gated":
@@ -3522,10 +3453,9 @@ class DragonModel(DragonPreTrainedModel):
                 assert len(config.layers_ve_config) == len(config.layers_config)
                 self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoVirtualBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
 
-        if self.config.rope_type_global != '' or self.config.rope_type_local != '':
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=config.head_dim if config.head_dim else (config.expand_factor*config.hidden_size)//config.num_attention_heads, theta=config.rope_theta_local) # only for SWA
-        else:
-            self.rotary_emb = None
+        self.rotary_emb = None
+        if self.config.rope_type != '' and self.config.rope_theta > 0.:
+            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=config.head_dim, theta=config.rope_theta)
 
         if self.config.vwn:
             if int(self.config.vwn_n/self.config.vwn_m) == 8:

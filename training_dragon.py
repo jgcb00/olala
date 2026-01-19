@@ -3,7 +3,7 @@ import glob
 import json
 import pickle
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 from functools import partial
 import gc
 import math
@@ -11,6 +11,16 @@ import numpy as np
 import tyro
 import time
 import wandb
+from pathlib import Path
+
+try:
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    pd = None
+    plt = None
 
 import torch
 import torch.nn as nn
@@ -36,10 +46,8 @@ class NanoArgs:
     head_dim: Optional[int] = None
     layers_config : str = 4*"lrdlr"
     expand_factor : int = 2 # expand factor for Mamba/Dragon
-    rope_type_local: str = "" #p-rope
-    rope_type_global: str = "" #p-rope
-    rope_theta_local: float = 10000.0
-    rope_theta_global: float = 0.0
+    rope_type: str = "" #p-rope
+    rope_theta: float = 0.0
     eps_rmsnorm: float = 1e-6
     mlp_expand: float = 4. # expand factor for MLP
     intermediate_size: Optional[int] = None
@@ -92,8 +100,7 @@ class NanoArgs:
     slw_warmup_iters: float = 0
     slw_start: int = 8 # window size at the start of training
     slw_increment: int = 64 # window size increment at each step
-    softcap_local_attn: float = 0.0 # logit soft-capping for local attn logits, as per Gemma2 (0.0 = no soft-capping)
-    softcap_global_attn: float = 0.0
+    softcap_attn: float = 0.0 # logit soft-capping for attn logits, as per Gemma2 (0.0 = no soft-capping)
     qk_norm: bool = True
     scalable_softmax: bool = True
     resformer : bool = False # Works only on f layers (DiffAttention)
@@ -135,6 +142,7 @@ class NanoArgs:
     mamba3_postgate_norm: bool = False # only works if legacy_gate is True!!
 
     # optim
+    seed: int = 123456789
     optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus
     second_order_optim : Optional[str] = None # snoo
     batch_size: int = 8*64 # batch size, in sequences, across all devices
@@ -193,6 +201,11 @@ class NanoArgs:
     wandb_name: Optional[str] = None
     log_wandb: bool = False
 
+    # debug
+    coord_check: bool = False
+    coord_check_sweep_dir: Optional[str] = None
+    coord_check_steps: str = "1,2,5,10"
+
     load_arg_from_config: bool = True
     load_optim: bool = True
     load_sched: bool = True
@@ -202,6 +215,198 @@ class NanoArgs:
     # used during training
     slw_window: int = 0
 
+##### ====================== COORD CHECK ======================= ####
+
+def _parse_int_list(s: str):
+    if not s.strip():
+        return set()
+    return {int(x) for x in s.split(",") if x.strip()}
+
+class DeltaWRecorder:
+    """
+    Records spectral norm of init weights as well as update (ΔW = W_after_step - W_before_step)
+    Only for 2D parameters (matrices).
+    Logs JSONL per run into a shared directory, then rebuilds plots from all JSONL files.
+    """
+    def __init__(self, logdir: str, record_steps: set[int], run_meta: dict):
+        self.logdir = Path(logdir)
+        self.logdir.mkdir(parents=True, exist_ok=True)
+
+        self.record_steps = set(record_steps)
+        self.run_meta = dict(run_meta)
+
+        run_id = self.run_meta.get("run_id") or time.strftime("%Y%m%d-%H%M%S")
+        self.run_meta["run_id"] = run_id
+
+        self.out_path = self.logdir / f"delta_w_{run_id}.jsonl"
+        self._snap = None
+        self._snap_step = None
+
+    def should_record(self, step: int) -> bool:
+        return step in self.record_steps
+
+    @torch.no_grad()
+    def record_init(self, model: torch.nn.Module, step: int = -1, *, skip_if_already_present: bool = True):
+        """Log ||W_0|| for all 2D trainable params as step=-1 (same schema as deltas)."""
+
+        if skip_if_already_present and self.out_path.exists():
+            # quick guard to avoid duplicating init lines when resuming/re-running
+            with open(self.out_path, "r", encoding="utf-8") as f:
+                for _ in range(200):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if '"step": -1' in line:
+                        return
+
+        rows = []
+        now = time.time()
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.ndim == 2:
+                w = p.detach().float().cpu()
+                w_spectral = torch.linalg.matrix_norm(w, ord=2).item()
+
+                rows.append({
+                    **self.run_meta,
+                    "ts": now,
+                    "step": int(step),
+                    "param": name,
+                    "shape": list(w.shape),
+                    "delta_fro": 0.0,
+                    "delta_spectral": float(w_spectral),  # == ||W0|| when step=-1
+                    "delta_rms": 0.0,
+                })
+
+        with open(self.out_path, "a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    @torch.no_grad()
+    def pre_step(self, model: torch.nn.Module, step: int):
+        """Call RIGHT BEFORE optimizer.step() (only on recorded steps)."""
+        if not self.should_record(step):
+            self._snap = None
+            self._snap_step = None
+            return
+
+        snap = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.ndim == 2:
+                snap[name] = p.detach().float().cpu().clone()
+        self._snap = snap
+        self._snap_step = step
+
+    @torch.no_grad()
+    def post_step(self, model: torch.nn.Module, step: int):
+        """Call RIGHT AFTER optimizer.step() (only on recorded steps)."""
+        if self._snap is None or self._snap_step != step:
+            return
+
+        rows = []
+        now = time.time()
+        for name, p in model.named_parameters():
+            if not (p.requires_grad and p.ndim == 2):
+                continue
+            before = self._snap.get(name)
+            if before is None:
+                continue
+
+            after = p.detach().float().cpu()
+            delta = after - before
+
+            # Frobenius norm (L2 over all entries)
+            delta_fro = 0 # torch.linalg.norm(delta).item()
+            # Spectral norm (L2 over all entries)
+            delta_spectral = torch.linalg.matrix_norm(delta, ord=2).item()
+            # RMS per coordinate (nice when comparing different sizes)
+            delta_rms = 0 # (delta.pow(2).mean().sqrt()).item()
+
+            row = {
+                **self.run_meta,
+                "ts": now,
+                "step": int(step),
+                "param": name,
+                "shape": list(after.shape),
+                "delta_fro": float(delta_fro),
+                "delta_spectral": float(delta_spectral),
+                "delta_rms": float(delta_rms),
+            }
+            rows.append(row)
+
+        # Append JSONL
+        with open(self.out_path, "a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+        self._snap = None
+        self._snap_step = None
+
+    @staticmethod
+    def rebuild_plots(logdir: str, outfile: str = "coord_check.png"):
+        """
+        Reads all delta_w_*.jsonl in logdir and generates coord-check style plots:
+          x: d_model
+          y: ||ΔW|| (log scale)
+          one subplot per recorded step
+          one line per param name
+        """
+
+        logdir = str(logdir)
+        paths = sorted(glob.glob(os.path.join(logdir, "delta_w_*.jsonl")))
+        if not paths:
+            return
+
+        dfs = []
+        for p in paths:
+            try:
+                dfs.append(pd.read_json(p, lines=True))
+            except ValueError:
+                # skip partially-written/bad file
+                continue
+        if not dfs:
+            return
+
+        df = pd.concat(dfs, ignore_index=True)
+        if df.empty or "d_model" not in df.columns:
+            return
+
+        # Ensure numeric
+        df["d_model"] = pd.to_numeric(df["d_model"], errors="coerce")
+        df["step"] = pd.to_numeric(df["step"], errors="coerce")
+        df = df.dropna(subset=["d_model", "step"])
+        df["d_model"] = df["d_model"].astype(int)
+        df["step"] = df["step"].astype(int)
+
+        steps = sorted(df["step"].unique().tolist())
+        n = len(steps)
+        if n == 0:
+            return
+
+        fig, axes = plt.subplots(1, n, figsize=(4*n, 3), squeeze=False)
+        axes = axes[0]
+
+        metric = "delta_spectral"  # or switch to "delta_rms" if you prefer
+        for ax, st in zip(axes, steps):
+            dfi = df[df["step"] == st].copy()
+            # average if multiple runs share same (d_model, param, step)
+            grp = dfi.groupby(["param", "d_model"], as_index=False)[metric].mean()
+
+            for pname, g in grp.groupby("param"):
+                g = g.sort_values("d_model")
+                if len(g) >= 2:
+                    ax.plot(g["d_model"], g[metric], linewidth=1)
+
+            ax.set_title("Init" if st == -1 else f"Step {st}")
+            ax.set_xlabel("d_model")
+            ax.set_yscale("log")
+            ax.grid(True, which="both", linewidth=0.5)
+
+        axes[0].set_ylabel("||ΔW|| (spectral norm)")
+        fig.tight_layout()
+        fig.savefig(os.path.join(logdir, outfile), dpi=200)
+        plt.close(fig)
+
+##### ========================== DATA ========================== #####
 def _peek_data_shard(filename, dataset_type='hf'):
     if dataset_type == 'hf':
         return _peek_hf_shard(filename)
@@ -612,7 +817,7 @@ if master_process:
     print0(f"wandb run id: {wandb.run.id}")
 
 # set seeds.
-seed = 123456789
+seed = args.seed
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 np.random.seed(seed)
@@ -755,15 +960,12 @@ config_hf = DragonConfig(
     num_attention_heads=args.n_heads,
     num_key_value_heads=args.n_kv_heads if args.n_kv_heads > 0 else args.n_heads,
     initializer_range=args.init_std,
-    softcap_local_attn=args.softcap_local_attn,
-    softcap_global_attn=args.softcap_global_attn,
+    softcap_attn=args.softcap_attn,
     norm_epsilon=args.eps_rmsnorm,
     use_cache=False,
     sliding_window_size=args.swa_window_size,
-    rope_type_global=args.rope_type_global,
-    rope_type_local=args.rope_type_local,
-    rope_theta_global=args.rope_theta_global,
-    rope_theta_local=args.rope_theta_local,
+    rope_type=args.rope_type,
+    rope_theta=args.rope_theta,
     uscaling_tau=args.uscaling_tau,
     mlp_linking=args.mlp_linking
 )
@@ -807,7 +1009,7 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 if args.intra_doc_masking:
     print0("!!! Using intra-document masking !!!")
-    print0("It is only compatible with GDN (conv+chunk), KDA (conv+chunk), DA and GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
+    print0("It is only compatible with GDN (conv+chunk), KDA (conv+chunk), standard attention, DA, GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
 
 # init model properly
 if resume_dir is None and args.use_completed_p:
@@ -820,7 +1022,7 @@ if resume_dir is None and args.use_completed_p:
                 pname = id2name.get(id(mod.weight), "")
 
                 if "lm_head" in pname:
-                    mod.weight.normal_(mean=0.0, std=args.init_std * ((args.d_model/args.base_width) ** -1))
+                    mod.weight.normal_(mean=0.0, std=args.init_std * ((args.d_model/args.base_width) ** -0.5)) # temp test
                 else:
                     mod.weight.normal_(mean=0.0, std=args.init_std * ((args.d_model/args.base_width) ** -0.5))
                 seen.add(mod.weight)
@@ -1054,6 +1256,26 @@ if resume_dir is not None:
     training_time_ms = train_state.get("training_time_ms", 0)
     start_iter = train_state.get("iteration", 0) + 1
 
+# setup recorder if necessary.
+record_steps = _parse_int_list(args.coord_check_steps) if args.coord_check_steps else None
+recorder = None
+if args.coord_check:
+    recorder = DeltaWRecorder(
+        logdir=args.coord_check_sweep_dir,
+        record_steps=record_steps,
+        run_meta={
+            "d_model": int(args.d_model),
+            "n_layers": int(len(args.layers_config)),
+            "batch_size": int(args.batch_size*args.sequence_length),
+            "iterations": int(args.total_iterations),
+            "lr": float(args.learning_rate),
+            "run_id": args.run_name,
+        },
+    )
+    print0(f"Will record coord check at steps: {record_steps}")
+    if master_process:
+        recorder.record_init(raw_model)
+
 # start the clock.
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -1147,6 +1369,9 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     if last_iter:
         dist.barrier()
         break
+    if args.coord_check and iter_ > max(record_steps):
+        print0(f"Reached max coord check step at iteration {iter_}, stopping training.")
+        break
 
     # ----------- TRAINING SECTION -----------
     for i in range(1, accumulation_steps+1):
@@ -1181,12 +1406,19 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_norm_clip, foreach=True)
     else:
         grad_norm = torch.tensor(0.)
+    # coord check, read
+    if recorder is not None and iter_ in record_steps and master_process:
+        print0(f"Recording coord check at step {iter_}")
+        recorder.pre_step(raw_model, iter_)
     # step the optimizers & schedulers.
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
     if second_order_optim:
         second_order_optim.step()
+    # coord check, read&record
+    if recorder is not None and iter_ in record_steps and master_process:
+        recorder.post_step(raw_model, iter_)
     # update expert biases (and report balance).
     with torch.no_grad():
         for moe in model.module.modules():
@@ -1227,6 +1459,9 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} grad_norm:{grad_norm.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
         wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms, **param_norms}, step=iter_)
+
+if recorder is not None and master_process:
+    DeltaWRecorder.rebuild_plots(args.coord_check_sweep_dir)
 
 print0(f"peak memory consumption during training: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 print0("Training complete.")
