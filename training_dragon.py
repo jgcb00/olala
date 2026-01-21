@@ -245,6 +245,27 @@ class DeltaWRecorder:
     def should_record(self, step: int) -> bool:
         return step in self.record_steps
 
+    def _is_tracked_weight(self, p: torch.Tensor) -> bool:
+        return p.requires_grad and (p.ndim == 2 or p.ndim == 3)
+
+    def _spectral(self, x: torch.Tensor) -> float:
+        # x: (m,n) or (E,m,n)
+        if x.ndim == 2:
+            return torch.linalg.matrix_norm(x, ord=2).item()
+        else:  # 3D: per-expert spectral, then aggregate
+            per = torch.linalg.matrix_norm(x, ord=2)  # (E,)
+            return per.mean().item()   # or per.mean().item()
+
+    def _fro(self, x: torch.Tensor) -> float:
+        if x.ndim == 2:
+            return torch.linalg.norm(x).item()
+        else:
+            per = torch.linalg.norm(x, dim=(1,2))     # (E,)
+            return per.mean().item()   # or per.mean().item()
+
+    def _rms(self, x: torch.Tensor) -> float:
+        return x.pow(2).mean().sqrt().item()          # works for 2D/3D
+
     @torch.no_grad()
     def record_init(self, model: torch.nn.Module, step: int = -1, *, skip_if_already_present: bool = True):
         """Log ||W_0|| for all 2D trainable params as step=-1 (same schema as deltas)."""
@@ -262,9 +283,9 @@ class DeltaWRecorder:
         rows = []
         now = time.time()
         for name, p in model.named_parameters():
-            if p.requires_grad and p.ndim == 2:
+            if self._is_tracked_weight(p):
                 w = p.detach().float().cpu()
-                w_spectral = torch.linalg.matrix_norm(w, ord=2).item()
+                w_spectral = self._spectral(w)
 
                 rows.append({
                     **self.run_meta,
@@ -291,7 +312,7 @@ class DeltaWRecorder:
 
         snap = {}
         for name, p in model.named_parameters():
-            if p.requires_grad and p.ndim == 2:
+            if self._is_tracked_weight(p):
                 snap[name] = p.detach().float().cpu().clone()
         self._snap = snap
         self._snap_step = step
@@ -305,7 +326,7 @@ class DeltaWRecorder:
         rows = []
         now = time.time()
         for name, p in model.named_parameters():
-            if not (p.requires_grad and p.ndim == 2):
+            if not self._is_tracked_weight(p):
                 continue
             before = self._snap.get(name)
             if before is None:
@@ -313,13 +334,9 @@ class DeltaWRecorder:
 
             after = p.detach().float().cpu()
             delta = after - before
-
-            # Frobenius norm (L2 over all entries)
-            delta_fro = 0 # torch.linalg.norm(delta).item()
-            # Spectral norm (L2 over all entries)
-            delta_spectral = torch.linalg.matrix_norm(delta, ord=2).item()
-            # RMS per coordinate (nice when comparing different sizes)
-            delta_rms = 0 # (delta.pow(2).mean().sqrt()).item()
+            delta_fro      = self._fro(delta)
+            delta_spectral = self._spectral(delta)
+            delta_rms      = self._rms(delta)
 
             row = {
                 **self.run_meta,
@@ -1018,7 +1035,7 @@ if resume_dir is None and args.use_completed_p:
         id2name = {id(p): n for n, p in model.named_parameters()}
 
         for name, mod in model.named_modules():
-            if isinstance(mod, nn.Linear):
+            if isinstance(mod, nn.Linear) or "experts.weight" in name:
                 pname = id2name.get(id(mod.weight), "")
 
                 if "lm_head" in pname:

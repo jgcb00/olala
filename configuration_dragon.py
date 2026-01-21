@@ -95,7 +95,6 @@ class DragonConfig(PretrainedConfig):
         layers_ve_config: str = "",
         use_value_embedding: bool = False,
         reduce_lm_head: int = 0,
-        dataset_type: str = "hf",
         vwn: bool = False,
         vwn_m: int = 2,
         vwn_n: int = 3,
@@ -210,7 +209,6 @@ class DragonConfig(PretrainedConfig):
         self.layers_ve_config = layers_ve_config
         self.use_value_embedding = use_value_embedding
         self.reduce_lm_head = reduce_lm_head
-        self.dataset_type = dataset_type
         self.vwn = vwn
         self.vwn_m = vwn_m
         self.vwn_n = vwn_n

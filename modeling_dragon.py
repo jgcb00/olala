@@ -1279,6 +1279,151 @@ class DragonDifferentialAttention(nn.Module):
 
         return attn_output, None, None
 
+class DragonDifferentialAttentionV2(nn.Module):
+    """
+    https://spiky-homegrown-4cb.notion.site/Differential-Transformer-V2-2e7baa052def80ecaa93d4d67d125417
+    """
+
+    def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.hidden_size = config.hidden_size
+        assert config.head_dim
+        self.head_dim = config.head_dim
+        self.head_v_dim = self.head_dim # typically 256
+        self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
+        self.qk_norm = config.qk_norm
+        self.softcap = config.softcap_attn
+        self.scalable_softmax = config.scalable_softmax
+        assert self.head_v_dim == self.head_qk_dim
+
+        projection_dim = self.head_qk_dim * 2 * self.num_attention_heads + self.head_qk_dim * self.num_key_value_heads + self.head_v_dim * self.num_key_value_heads
+        self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
+
+        if self.qk_norm:
+            self.q_norm = DragonNorm(config, self.head_qk_dim)
+            self.k_norm = DragonNorm(config, self.head_qk_dim)
+
+        if self.scalable_softmax:
+            self.softmax_scaler = nn.Parameter(torch.ones(2*self.num_attention_heads, dtype=torch.float32))
+
+        self.lambda_proj = DragonLinear(config, config.hidden_size, self.num_attention_heads, bias=False)
+
+        if ATTN_IMPL == "flex":
+            # score mod (for softcap)
+            def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+                if self.config.softcap_attn > 0.:
+                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
+                return score
+            self.score_mod = score_mod
+            # block mask (for causal & sliding window)
+            def build_mask(wsize):
+                if wsize == -1:
+                    wsize = self.config.max_position_embeddings
+                def sliding_window(b, h, q_idx, kv_idx):
+                    return q_idx - kv_idx <= wsize
+                def causal_mask(b, h, q_idx, kv_idx):
+                    return q_idx >= kv_idx
+                self.attn_mask = and_masks(causal_mask, sliding_window)
+                return wsize
+            self.build_mask = build_mask
+            self.last_wsize = self.build_mask(self.config.slw_wsize)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        **kwargs,
+    ):
+        _, q_len, _ = hidden_states.shape
+        use_precomputed_states = (cache_params is not None and q_len == 1)
+
+        # Q, K, V projections.
+        #query_states, key_states, value_states = get_query_key_value_tensors(self, hidden_states)
+        mixed_qkv = self.linear_qkv(hidden_states)
+        query_states, key_states, value_states = torch.split(
+            mixed_qkv,
+            [2*self.num_attention_heads * self.head_qk_dim,
+             self.num_key_value_heads * self.head_qk_dim,
+             self.num_key_value_heads * self.head_v_dim],
+            dim=-1,
+        ) # WARNING: not TP aware
+        query_states = rearrange(query_states, "b l (h d) -> b l h d", h=2*self.num_attention_heads)
+        key_states   = rearrange(key_states, "b l (h d) -> b l h d", h=self.num_key_value_heads)
+        value_states = rearrange(value_states, "b l (h d) -> b l h d", h=self.num_key_value_heads)
+        assert query_states.size(3) == self.head_qk_dim
+        assert key_states.size(3) == self.head_qk_dim
+        assert value_states.size(3) == self.head_v_dim
+
+        # QK-norm.
+        if self.qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
+        wsize = self.config.slw_wsize
+
+        # scalable softmax.
+        if self.scalable_softmax:
+            # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
+            T = query_states.size(1)
+            pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
+            log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
+            query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
+            # TODO: caching mechanism for log_pos
+
+        # KV-cache.
+        if cache_params is not None:
+            key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
+
+        # attention computation.
+        if ATTN_IMPL == "eager":
+            assert not self.config.intra_doc_masking
+            attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
+        elif ATTN_IMPL == "flex":
+            if wsize != self.last_wsize:
+                self.last_wsize = self.build_mask(wsize)
+            attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
+        elif ATTN_IMPL == "fa2":
+            if not self.config.intra_doc_masking:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
+            else:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
+        elif ATTN_IMPL == "fa3":
+            if not self.config.intra_doc_masking:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
+            else:
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
+        else:
+            raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
+
+        attn_output = attention_interface(
+            query_states.bfloat16(),
+            key_states.bfloat16(),
+            value_states.bfloat16(),
+            causal=True,
+            wsize=wsize,
+            softcap=self.config.softcap_attn,
+            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
+        )
+
+        lambda_val = self.lambda_proj(hidden_states)
+        attn1, attn2 = attn_output[:, :, 0::2], attn_output[:, :, 1::2]
+        attn_output = attn1 - torch.sigmoid(lambda_val).unsqueeze(-1) * attn2
+
+        return attn_output, None, None
+
 class DragonDifferentialMultiLatentAttention(nn.Module):
     FIRST_ATTENTION = None
     """
@@ -3107,56 +3252,56 @@ class DragonMoE(nn.Module):
         return (out + out_experts).reshape(bs, slen, dim), None
 
 class GHyperConnection(nn.Module):
-def __init__(self, dim, m,):
-    super().__init__()
-    self.m, self.n_in, self.n_out = m, n_in, n_out
-    self.factor = 1.0 / math.sqrt(dim // self.m)
+    def __init__(self, dim, m,):
+        super().__init__()
+        self.m, self.n_in, self.n_out = m, n_in, n_out
+        self.factor = 1.0 / math.sqrt(dim // self.m)
 
-    # Initialize static beta: cyclic pattern
-    static_beta_tensor = torch.zeros(self.m, n_in)
-    for j in range(n_in):
-        static_beta_tensor[j % self.m, j] = 1.0
-    self.static_beta = nn.Parameter(static_beta_tensor.T.contiguous())
+        # Initialize static beta: cyclic pattern
+        static_beta_tensor = torch.zeros(self.m, n_in)
+        for j in range(n_in):
+            static_beta_tensor[j % self.m, j] = 1.0
+        self.static_beta = nn.Parameter(static_beta_tensor.T.contiguous())
 
-    # Initialize static alpha: block matrix
-    init_alpha = torch.cat([torch.eye(self.m), torch.eye(self.m),
-    torch.zeros((self.m, self.n_in - self.m))], dim=1)
-    if self.n_in > self.m:
-        part2 = torch.cat([torch.zeros((self.n_in - self.m, self.m * 2)), torch.eye(self.n_in - self.m)], dim=1)
-        init_alpha = torch.cat([init_alpha, part2], dim=0)
-    self.static_alpha = nn.Parameter(init_alpha.contiguous())
+        # Initialize static alpha: block matrix
+        init_alpha = torch.cat([torch.eye(self.m), torch.eye(self.m),
+        torch.zeros((self.m, self.n_in - self.m))], dim=1)
+        if self.n_in > self.m:
+            part2 = torch.cat([torch.zeros((self.n_in - self.m, self.m * 2)), torch.eye(self.n_in - self.m)], dim=1)
+            init_alpha = torch.cat([init_alpha, part2], dim=0)
+        self.static_alpha = nn.Parameter(init_alpha.contiguous())
 
-    # Dynamic parameters
-    self.dynamic_alpha_fn = nn.Parameter(torch.zeros((dim // self.m, self.m + self.n_in)))
-    self.dynamic_alpha_scale = nn.Parameter(torch.ones_like(self.static_alpha))
-    self.dynamic_beta_fn = nn.Parameter(torch.zeros((dim // self.m, self.m)))
-    self.dynamic_beta_scale = nn.Parameter(torch.ones_like(self.static_beta))
-    self.layer_norm = RMSNorm(hidden_size=dim // self.m)
+        # Dynamic parameters
+        self.dynamic_alpha_fn = nn.Parameter(torch.zeros((dim // self.m, self.m + self.n_in)))
+        self.dynamic_alpha_scale = nn.Parameter(torch.ones_like(self.static_alpha))
+        self.dynamic_beta_fn = nn.Parameter(torch.zeros((dim // self.m, self.m)))
+        self.dynamic_beta_scale = nn.Parameter(torch.ones_like(self.static_beta))
+        self.layer_norm = RMSNorm(hidden_size=dim // self.m)
 
-    def _base_width_connection(self, h, dynamic_fn, dynamic_scale, static_scale):
-        h_shape = h.shape
-        N, NMM = static_scale.shape
-        M = (NMM - N) // 2
-        h_reshape = h.reshape((h_shape[:-1].numel(),) + (N, h_shape[-1] // N))
-        norm_h = self.layer_norm(h_reshape)
-        alpha_beta = (safe_tanh(norm_h @ dynamic_fn.T.to(dtype=norm_h.dtype) * self.factor) * dynamic_scale[None, ...] + static_scale[None, ...])
-        alpha, beta = torch.split(alpha_beta, (M + N, M), dim=-1)
-        mix_h = (h_reshape.transpose(1, 2) @ alpha.to(dtype=h_reshape.dtype)).transpose(1, 2)
-        return mix_h.reshape(h_shape[:-1] + mix_h.shape[1:]), beta
+        def _base_width_connection(self, h, dynamic_fn, dynamic_scale, static_scale):
+            h_shape = h.shape
+            N, NMM = static_scale.shape
+            M = (NMM - N) // 2
+            h_reshape = h.reshape((h_shape[:-1].numel(),) + (N, h_shape[-1] // N))
+            norm_h = self.layer_norm(h_reshape)
+            alpha_beta = (safe_tanh(norm_h @ dynamic_fn.T.to(dtype=norm_h.dtype) * self.factor) * dynamic_scale[None, ...] + static_scale[None, ...])
+            alpha, beta = torch.split(alpha_beta, (M + N, M), dim=-1)
+            mix_h = (h_reshape.transpose(1, 2) @ alpha.to(dtype=h_reshape.dtype)).transpose(1, 2)
+            return mix_h.reshape(h_shape[:-1] + mix_h.shape[1:]), beta
 
-    def width_connection(self, h):
-        dynamic_fn = torch.concat([self.dynamic_alpha_fn.T, self.dynamic_beta_fn.T], dim=0)
-        dynamic_scale = torch.concat([self.dynamic_alpha_scale, self.dynamic_beta_scale], dim=-1).contiguous()
-        static_scale = torch.concat([self.static_alpha, self.static_beta], dim=-1)
-        return self._base_width_connection(h, dynamic_fn.to(dtype=h.dtype), dynamic_scale.to(dtype=h.dtype), static_scale.to(dtype=h.dtype))
+        def width_connection(self, h):
+            dynamic_fn = torch.concat([self.dynamic_alpha_fn.T, self.dynamic_beta_fn.T], dim=0)
+            dynamic_scale = torch.concat([self.dynamic_alpha_scale, self.dynamic_beta_scale], dim=-1).contiguous()
+            static_scale = torch.concat([self.static_alpha, self.static_beta], dim=-1)
+            return self._base_width_connection(h, dynamic_fn.to(dtype=h.dtype), dynamic_scale.to(dtype=h.dtype), static_scale.to(dtype=h.dtype))
 
-    def depth_connection(self, mix_h, h_o, beta):
-        h_o_shape = h_o.shape
-        h_o = h_o.reshape(h_o_shape[:-1] + (self.m, h_o_shape[-1] // self.m))
-        h_i = beta.view(h_o.shape[:2] + beta.shape[1:]).to(dtype=h_o.dtype) @ h_o
-        h = h_i + mix_h[..., self.m:, :]
-        h_shape = h.shape
-        return h.reshape(h_shape[:-2] + (h_shape[-2] * h_shape[-1],)).contiguous()
+        def depth_connection(self, mix_h, h_o, beta):
+            h_o_shape = h_o.shape
+            h_o = h_o.reshape(h_o_shape[:-1] + (self.m, h_o_shape[-1] // self.m))
+            h_i = beta.view(h_o.shape[:2] + beta.shape[1:]).to(dtype=h_o.dtype) @ h_o
+            h = h_i + mix_h[..., self.m:, :]
+            h_shape = h.shape
+            return h.reshape(h_shape[:-2] + (h_shape[-2] * h_shape[-1],)).contiguous()
 
 PREVIOUS_MLP = None
 class DragonMonoBlock(GradientCheckpointingLayer):
@@ -3178,6 +3323,11 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.mixer = DragonDifferentialAttention(config, layer_idx=layer_idx)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_signal_heads
+            use_gate = config.gate_attn
+        elif layer_type == 'F':
+            self.mixer = DragonDifferentialAttentionV2(config, layer_idx=layer_idx)
+            head_dim = self.mixer.head_dim
+            num_attention_heads = self.mixer.num_attention_heads
             use_gate = config.gate_attn
         elif layer_type == 'w':
             self.mixer = DragonAttention(config, reuse_kv=False, layer_idx=layer_idx)
@@ -3591,7 +3741,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         self.config = config
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
-        bwd = 1/math.sqrt(config.hidden_size) # if config.dataset_type == "hf" else 1/config.hidden_size
+        bwd = 1/math.sqrt(config.hidden_size)
         if config.reduce_lm_head == 0:
             self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=bwd)
         else:
