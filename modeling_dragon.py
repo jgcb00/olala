@@ -2051,7 +2051,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
                     if not self.config.intra_doc_masking:
                         return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
                     else:
-                        return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
+                        return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
                 D = v.size(3)
                 v1 = v[:, :, :, :D//2]
                 v2 = v[:, :, :, D//2:]
@@ -2308,7 +2308,7 @@ class DragonGatedDeltaNet(nn.Module):
         self.key_dim_local = self.n_heads_local * self.dk
         self.value_dim_local = self.n_heads_local * self.dv
 
-        self.linear_qkv = DragonLinear(
+        """self.linear_qkv = DragonLinear(
             config, config.hidden_size,
             self.num_attention_heads*self.dk + self.n_kv_heads*self.dk + self.n_kv_heads*self.dv,
             bias=False
@@ -2317,6 +2317,12 @@ class DragonGatedDeltaNet(nn.Module):
             config, config.hidden_size,
             self.num_attention_heads + self.num_attention_heads, #+ self.num_attention_heads*self.dv, # b(H), a(H), g(H*dv)
             bias=False
+        )"""
+        self.in_proj = DragonLinear(
+            config,
+            config.hidden_size,
+            self.num_attention_heads*self.dk + self.n_kv_heads*self.dk + 2*self.n_kv_heads*self.dv+2*self.num_attention_heads,
+            bias=False,
         )
 
         if use_ve:
@@ -2401,10 +2407,19 @@ class DragonGatedDeltaNet(nn.Module):
         )
 
         # --- projections ---
-        q, k, v = get_qkv_tensors_gdn(self, hidden_states)     # q:(B,L,H,dk), k/v:(B,L,Ng,dk/dv)
+        """q, k, v = get_qkv_tensors_gdn(self, hidden_states)     # q:(B,L,H,dk), k/v:(B,L,Ng,dk/dv)
         bag = self.linear_ba(hidden_states)                          # (B,L,2H + H*dv)
         #b_proj, a_proj, g_proj = torch.split(bag, [self.num_attention_heads, self.num_attention_heads, self.num_attention_heads*self.dv], dim=-1)
-        b_proj, a_proj = torch.split(bag, [self.num_attention_heads, self.num_attention_heads], dim=-1)
+        b_proj, a_proj = torch.split(bag, [self.num_attention_heads, self.num_attention_heads], dim=-1)"""
+
+        qkvzba = self.in_proj(hidden_states)
+        qkvzba = rearrange(qkvzba, "b l (h p) -> b l h p", h=self.n_heads_local)
+        # split per head: [L, B, H_local, dk+dk+dv/dv/1/1] where dq=dk=do
+        qkv = qkvzba[..., :2*self.dk+self.dv]; accum = 2*self.dk+self.dv
+        g_proj = qkvzba[..., accum:accum+self.dv]; accum += self.dv
+        b_proj = qkvzba[..., accum:accum+1].squeeze(-1); accum += 1
+        a_proj = qkvzba[..., accum:accum+1].squeeze(-1)
+        #q, k, v = torch.split(qkv, [self.dk, self.dk, self.dv], dim=-1)
 
         if cache_params is not None:
             ssm_cache = cache_params.ssm_caches[self.layer_idx]
@@ -2433,10 +2448,12 @@ class DragonGatedDeltaNet(nn.Module):
         # conv
         if self.config.token_conv1d_gdn:
             # --- pack for conv ---
-            q_proj = rearrange(q, "b l h d -> b l (h d)")
+            """q_proj = rearrange(q, "b l h d -> b l (h d)")
             k_proj = rearrange(k, "b l g d -> b l (g d)")
             v_proj = rearrange(v, "b l g d -> b l (g d)")
-            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)
+            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)"""
+            qkv = rearrange(qkv, 'b l h d -> b l (h d)')
+            mixed_qkv = qkv.transpose(1, 2)
 
             if cache_params is not None:
                 conv_cache = cache_params.conv_caches[self.layer_idx]
@@ -2469,20 +2486,24 @@ class DragonGatedDeltaNet(nn.Module):
 
             # split back
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            q_proj, k_proj, v_proj = torch.split(
+            """q_proj, k_proj, v_proj = torch.split(
                 mixed_qkv,
                 [self.num_attention_heads*self.dk, self.n_kv_heads*self.dk, self.n_kv_heads*self.dv],
                 dim=-1,
             )
             q    = rearrange(q_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
             k = rearrange(k_proj, "b l (g d) -> b l g d", g=self.n_kv_heads)
-            v = rearrange(v_proj, "b l (g d) -> b l g d", g=self.n_kv_heads)
+            v = rearrange(v_proj, "b l (g d) -> b l g d", g=self.n_kv_heads)"""
+            mixed_qkv = rearrange(mixed_qkv, "b l (h p) -> b l h p", h=self.n_heads_local)#.contiguous()
+            q = mixed_qkv[..., :self.dk]; accum = self.dk
+            k = mixed_qkv[..., accum:accum+self.dk]; accum += self.dk
+            v = mixed_qkv[..., accum:accum+self.dv]
 
         k = k.repeat_interleave(self.groups, dim=2)
         v = v.repeat_interleave(self.groups, dim=2)
 
-        b_proj = rearrange(b_proj, "b l (h) -> b l h", h=self.num_attention_heads)
-        a_proj = rearrange(a_proj, "b l (h) -> b l h", h=self.num_attention_heads)
+        """b_proj = rearrange(b_proj, "b l (h) -> b l h", h=self.num_attention_heads)
+        a_proj = rearrange(a_proj, "b l (h) -> b l h", h=self.num_attention_heads)"""
         #g_proj = rearrange(g_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
         beta = b_proj.sigmoid()
         dt = F.softplus(a_proj.float() + self.dt_bias)
@@ -2529,6 +2550,8 @@ class DragonGatedDeltaNet(nn.Module):
             g = self.linear_g(hidden_states) # (B, L, H*dv)
             g = rearrange(g, "b l (h d) -> b l h d", h=self.n_kv_heads)
             o = self.output_norm(o, g)
+        
+        o = o * F.silu(g_proj + 1.15)
 
         # update GDN cache
         if cache_params is not None:
@@ -3318,7 +3341,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.mixer = DragonGatedDeltaNet(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
-            use_gate = config.gate_gdn
+            use_gate = False # config.gate_gdn
         elif layer_type == 'f':
             self.mixer = DragonDifferentialAttention(config, layer_idx=layer_idx)
             head_dim = self.mixer.head_dim
