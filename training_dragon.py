@@ -174,6 +174,7 @@ class NanoArgs:
     completed_p_alpha: float = 0.5
     completed_p_wd_other: bool = True
     completed_p_beta_scaling: bool = False
+    completed_p_experts_scaling: str = "none" # linear, sqrt, else for nothing
     learning_rate_scalar: float = 1e-4
     learning_rate_embed: float = 1e-4
     learning_rate_head: float = 1e-4
@@ -181,6 +182,7 @@ class NanoArgs:
     base_dataset_size: int = 0
     base_width: int = 0
     base_depth: int = 0
+    base_routed_experts: int = 0
 
     # data
     vocab_size: int = 50304
@@ -635,7 +637,7 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
 
     return hidden_groups, other_groups
 
-def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, dataset_size_base, width, width_base, depth, depth_base, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, base_wd, base_eps, wd_other, alpha_complete_p):
+def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, dataset_size_base, width, width_base, depth, depth_base, routed_experts, routed_experts_base, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, base_wd, base_eps, wd_other, alpha_complete_p, experts_scaling):
     groups, seen = [], set()
     id2name = {id(p): n for n, p in model.named_parameters()}
 
@@ -645,7 +647,12 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
     rho_adjusted = rho / rho_base
     width_adjusted = width / width_base
     depth_adjusted = depth / depth_base
-
+    if experts_scaling == "linear":
+        routed_experts_adjusted = routed_experts / routed_experts_base
+    elif experts_scaling == "sqrt":
+        routed_experts_adjusted = math.sqrt(routed_experts / routed_experts_base)
+    else:
+        routed_experts_adjusted = 1.0
     print(f"rho scaling: rho={rho:.3e}, rho_adjusted={rho_adjusted:.3e}, depth_adjusted={depth_adjusted:.3e}")
 
     for name, mod in model.named_modules():
@@ -713,9 +720,9 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
             scale_eps = 1/rho_adjusted
         elif "experts.weight" in pname:
             base_lr = base_lr_hidden
-            scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
-            scale_wd = (width_adjusted) * rho_adjusted
-            scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted
+            scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted * routed_experts_adjusted
+            scale_wd = (width_adjusted) * rho_adjusted / routed_experts_adjusted
+            scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted * routed_experts_adjusted
         else:
             base_lr = base_lr_scalar
             scale_lr = (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
@@ -1131,6 +1138,8 @@ elif args.use_completed_p:
         width_base=args.base_width,
         depth=len(args.layers_config),
         depth_base=args.base_depth,
+        routed_experts=args.moe_num_routed_experts,
+        routed_experts_base=args.base_routed_experts,
         base_lr_hidden=args.learning_rate,
         base_lr_scalar=args.learning_rate_scalar,
         base_lr_embed=args.learning_rate_embed,
@@ -1139,6 +1148,7 @@ elif args.use_completed_p:
         base_eps=args.adam_eps,
         wd_other=args.completed_p_wd_other,
         alpha_complete_p=args.completed_p_alpha,
+        experts_scaling=args.completed_p_experts_scaling,
     )
     beta1 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta1 - 1)
     beta2 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta2 - 1)

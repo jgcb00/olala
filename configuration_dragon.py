@@ -92,6 +92,10 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        base_depth: int = 0,
+        completed_p_alpha: float = 0.5,
+        use_completed_p: bool = False,
+        layers_mlp_config: str = "",
         layers_ve_config: str = "",
         use_value_embedding: bool = False,
         reduce_lm_head: int = 0,
@@ -120,6 +124,7 @@ class DragonConfig(PretrainedConfig):
         moe_routed_scaling_factor: float = 2.5,
         moe_routed_intermediate_size: int = 768,
         moe_shared_intermediate_size: int = 768,
+        moe_routed_input_dim: int = 384,
         intra_doc_masking: bool = False,
         seednorm_rank: int = 1,
         seednorm_type: int = 1,
@@ -206,6 +211,10 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.base_depth = base_depth
+        self.completed_p_alpha = completed_p_alpha
+        self.use_completed_p = use_completed_p
+        self.layers_mlp_config = layers_mlp_config
         self.layers_ve_config = layers_ve_config
         self.use_value_embedding = use_value_embedding
         self.reduce_lm_head = reduce_lm_head
@@ -234,6 +243,7 @@ class DragonConfig(PretrainedConfig):
         self.moe_routed_scaling_factor = moe_routed_scaling_factor
         self.moe_routed_intermediate_size = moe_routed_intermediate_size
         self.moe_shared_intermediate_size = moe_shared_intermediate_size
+        self.moe_routed_input_dim = moe_routed_input_dim
         self.intra_doc_masking = intra_doc_masking
         self.seednorm_rank = seednorm_rank
         self.seednorm_type = seednorm_type
