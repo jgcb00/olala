@@ -1809,15 +1809,6 @@ class DragonDifferentialTensorProductAttention(nn.Module):
 
         if self.scalable_softmax:
             self.softmax_scaler = nn.Parameter(torch.ones(self.num_attention_heads, dtype=torch.float32))
-        
-        self.first_attention = False
-        if config.resformer and DragonDifferentialTensorProductAttention.FIRST_ATTENTION is None:
-            DragonDifferentialTensorProductAttention.FIRST_ATTENTION = self
-            self.first_attention = True
-            self.last_values = None
-        
-        if config.resformer:
-            self.resformer_lambda = nn.Parameter(torch.full((2,), 0.5))
 
         self.register_buffer("lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * (layer_idx+1))), persistent=False)
         self.lambda_q1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
@@ -1849,6 +1840,24 @@ class DragonDifferentialTensorProductAttention(nn.Module):
             self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
         else:
             self.rotary_emb = None
+
+    def _signal_noise_local_indices(self, tp_rank: int, tp_size: int, device):
+        H_tot = self.num_attention_heads
+        H_local = H_tot // tp_size
+        S_tot = self.num_signal_heads
+        N_tot = H_tot - S_tot
+        g = math.gcd(S_tot, N_tot)
+        s_block = S_tot // g
+        n_block = N_tot // g
+        cycle = s_block + n_block
+
+        base = tp_rank * H_local                               # global head offset for this TP rank
+        h_global = torch.arange(H_local, device=device) + base # [H_local]
+        pos = h_global % cycle
+        is_signal = pos < s_block
+        sig_idx = torch.nonzero(is_signal, as_tuple=False).squeeze(-1) # local indices
+        noi_idx = torch.nonzero(~is_signal, as_tuple=False).squeeze(-1)
+        return sig_idx, noi_idx
 
     def forward(
         self,
@@ -1887,6 +1896,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
             alpha_v = torch.sigmoid(self.shift_proj_v(hidden_states).float()).float().to(value_states.dtype).unsqueeze(-1) # (B, L, Hkv//2, 1)
 
             if cache_params is not None:
+                assert position_ids is not None, "position_ids required for token-shift with caching!"
                 k_last, v_last = cache_params.get_last_kv(self.layer_idx)
                 B, L = key_states.shape[:2]
 
@@ -1913,13 +1923,17 @@ class DragonDifferentialTensorProductAttention(nn.Module):
             if position_ids is not None:
                 # first token of each doc has pos==0
                 doc_start = (position_ids == 0) # (B, L) bool
-                m = doc_start.unsqueeze(-1).unsqueeze(-1) # (B, L, 1, 1) bool
+            else:
+                B, L = hidden_states.shape[:2]
+                doc_start = torch.zeros(B, L, dtype=torch.bool, device=hidden_states.device)
+                doc_start[:, 0] = True
+            m = doc_start.unsqueeze(-1).unsqueeze(-1) # (B, L, 1, 1) bool
 
-                # zero the previous contribution at boundaries
-                k_prev  = k_prev.masked_fill(m, 0)
-                v_prev  = v_prev.masked_fill(m, 0)
-                alpha_k = alpha_k.masked_fill(m, 0)
-                alpha_v = alpha_v.masked_fill(m, 0)
+            # zero the previous contribution at boundaries
+            k_prev  = k_prev.masked_fill(m, 0)
+            v_prev  = v_prev.masked_fill(m, 0)
+            alpha_k = alpha_k.masked_fill(m, 0)
+            alpha_v = alpha_v.masked_fill(m, 0)
 
             key_states = alpha_k * k_prev + (1 - alpha_k) * key_states
             value_states = alpha_v * v_prev + (1 - alpha_v) * value_states
@@ -1990,8 +2004,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            T = query_states.size(1)
-            pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
+            pos = (position_ids.to(torch.float32).view(1, query_states.size(1), 1, 1) + 1.)
             log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
             query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
             # TODO: caching mechanism for log_pos
@@ -2009,23 +2022,13 @@ class DragonDifferentialTensorProductAttention(nn.Module):
         # query_states : (B, L, num_heads, D) -> q1: (B, L, num_signal_heads), q2: (B, L, num_noise_heads, D)
         # key_states : (B, L, num_kv_heads, D) -> k1: (B, L, num_signal_heads//2), k2: (B, L, num_noise_heads//2, D) # todo: 2 is hardcoded here, but it's the GQA factor!!
         # value_states : (B, L, num_noise_heads//2, 2*D) -> value_states, value_sig_states: (B, L, num_signal_heads//2, 2*D)
-        query1_states, query2_states = query_states[:, :, :self.num_signal_heads, :], query_states[:, :, self.num_signal_heads:, :] # WARNING: not TP aware
-        key1_states, key2_states = key_states[:, :, :self.num_signal_heads, :], key_states[:, :, self.num_signal_heads:, :]
-        # expand v for signal attn
+        #query1_states, query2_states = query_states[:, :, :self.num_signal_heads, :], query_states[:, :, self.num_signal_heads:, :] # WARNING: not TP aware
+        #key1_states, key2_states = key_states[:, :, :self.num_signal_heads, :], key_states[:, :, self.num_signal_heads:, :]
 
-        assert value_states.size(3) == self.head_v_dim
-
-        if self.config.resformer and self.first_attention:
-            self.last_values = value_states
-        elif self.config.resformer:
-            value_states = self.resformer_lambda[0] * DragonDifferentialAttention.FIRST_ATTENTION.last_values + self.resformer_lambda[1] * value_states
-        
-        assert value_states.size(3) == self.head_v_dim
-
-        value_sig_states = value_states.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        assert value_states.size(3) == self.head_v_dim
-        assert value_sig_states.size(3) == self.head_v_dim
+        sig_idx, noi_idx = self._signal_noise_local_indices(tp_rank=0, tp_size=1, device=query_states.device)
+        query1_states, query2_states = query_states.index_select(2, sig_idx), query_states.index_select(2, noi_idx)
+        key1_states, key2_states = key_states.index_select(2, sig_idx), key_states.index_select(2, noi_idx)
+        value_sig_states = value_states.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1) # expand v for signal attn
 
         if DIFF_ATTN_IMPL == "flex_head":
             diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
@@ -2047,7 +2050,7 @@ class DragonDifferentialTensorProductAttention(nn.Module):
             def diff_attention_interface(q, k, v, wsize, **kw):
                 if self.head_qk_dim == self.head_v_dim:
                     if not self.config.intra_doc_masking:
-                        return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
+                        return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
                     else:
                         return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
                 D = v.size(3)
@@ -2618,21 +2621,6 @@ class DragonGatedDeltaNet(nn.Module):
         if use_ve:
             self.ve_scalars = nn.Parameter(torch.zeros(self.num_attention_heads, self.dv, dtype=torch.float32))
 
-        if config.legacy_gate:
-            if config.gate_type == 'kimi':
-                self.linear_g = nn.Sequential(
-                    DragonLinear(config, config.hidden_size, self.dv, bias=False),
-                    DragonLinear(config, self.dv, self.n_kv_heads*self.dv, bias=True),
-                )
-                self.output_norm = FusedRMSNormGated(hidden_size=self.dv, eps=config.norm_epsilon, activation='sigmoid')
-            else:
-                self.linear_g = DragonLinear(
-                    config, config.hidden_size,
-                    self.n_kv_heads * self.dv,
-                    bias=False
-                )
-                self.output_norm = FusedRMSNormGated(hidden_size=self.dv, eps=config.norm_epsilon)
-
         dt_min = config.time_step_min
         dt_max = config.time_step_max
         dt_init_floor = config.time_step_floor
@@ -2836,11 +2824,6 @@ class DragonGatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True
             ) # (B L H dv)
 
-        if self.config.legacy_gate:
-            g = self.linear_g(hidden_states) # (B, L, H*dv)
-            g = rearrange(g, "b l (h d) -> b l h d", h=self.n_kv_heads)
-            o = self.output_norm(o, g)
-        
         o = o * F.silu(g_proj + 1.15)
 
         # update GDN cache
@@ -3261,10 +3244,7 @@ class DragonMamba3Mimo(nn.Module):
         self.rope_proj = DragonLinear(config, self.d_model, self.num_rope_angles, bias=False)
 
         # Order: [z, x, B, C, dt]
-        d_in_proj = 2 * self.d_inner + 2 * self.d_state * self.ngroups * self.mimo_dim + self.nheads
-
-        self.A_proj = DragonLinear(config, self.d_model, self.nheads, bias=False, dtype=torch.float32)
-        self.trapezoid_proj = DragonLinear(config, self.d_model, self.nheads, bias=False)
+        d_in_proj = 2 * self.d_inner + 2 * self.d_state * self.ngroups * self.mimo_dim + 3 * self.nheads
 
         _dt = torch.exp(
             torch.rand(self.nheads) * (math.log(self.dt_max) - math.log(self.dt_min))
@@ -3316,7 +3296,7 @@ class DragonMamba3Mimo(nn.Module):
 
         if config.legacy_gate:
             if config.mamba3_postgate_norm:
-                self.output_norm = RMSNormGated(self.d_inner, eps=config.norm_epsilon, norm_before_gate=False)
+                self.output_norm = RMSNormGated(self.d_inner, group_size=self.d_inner//self.ngroups, eps=config.norm_epsilon, norm_before_gate=False)
 
     def forward(self, hidden_states, ve=None, cache_params: Optional[HybridDragonDynamicCache] = None, **kwargs):
         cached_len = None
@@ -3328,29 +3308,31 @@ class DragonMamba3Mimo(nn.Module):
             cache_params.ssm_caches[self.layer_idx] = hidden_states
 
         # Apply in_proj
-        zxBCdt = self.in_proj(hidden_states)
-        z, xBC, dd_dt = torch.split(
-            zxBCdt,
-            [
-                self.d_inner,
-                self.d_inner + 2 * self.d_state * self.ngroups * self.mimo_dim,
-                self.nheads,
-            ],
-            dim=-1)
+        zxBCdtAtrap = self.in_proj(hidden_states)
+        zxBCdtAtrap = rearrange(zxBCdtAtrap, "b l (G D) -> b l G D", G=self.ngroups)#.contiguous()
+        # split per group: [B, L, G_local, D_group]
+        d_inner_per_group = self.d_inner//self.ngroups
+        nheads_per_group = self.nheads//self.ngroups
+        z = zxBCdtAtrap[..., 0:d_inner_per_group]; accum = d_inner_per_group
+        x = zxBCdtAtrap[..., accum:accum+d_inner_per_group]; accum += d_inner_per_group
+        B = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
+        C = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
+        dt = zxBCdtAtrap[..., accum:accum+nheads_per_group]; accum += nheads_per_group
+        A = zxBCdtAtrap[..., accum:accum+nheads_per_group]; accum += nheads_per_group
+        trap = zxBCdtAtrap[..., accum:accum+2*nheads_per_group]
 
-        _A = -F.softplus((self.A_proj(hidden_states.to(torch.float32))).to(torch.float32)) # (B, L, N)
+        z = rearrange(z, "b l G d -> b l (G d)")
+        x = rearrange(x, "b l G d -> b l (G d)")
+        B = rearrange(B, "b l G d -> b l (G d)")
+        C = rearrange(C, "b l G d -> b l (G d)")
+        dt = rearrange(dt, "b l G n -> b l (G n)")
+        A = rearrange(A, "b l G n -> b l (G n)")
+        trap = rearrange(trap, "b l G n -> b l (G n)")
+
+        _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)
         
-        dt = F.softplus(dd_dt + self.dt_bias) # (B, L, N)
-        
-        x, B, C = torch.split(
-            xBC,
-            [
-                self.d_inner, 
-                self.d_state * self.ngroups * self.mimo_dim, 
-                self.d_state * self.ngroups * self.mimo_dim
-            ], dim=-1
-        )
+        dt = F.softplus(dt + self.dt_bias) # (B, L, N)
 
         # value embeddings
         if ve is not None:
@@ -3388,16 +3370,16 @@ class DragonMamba3Mimo(nn.Module):
 
             x = rearrange(x, "b l (r d) -> b l r d", r=self.mimo_dim)
 
-        B = rearrange(B, "b l (r g n) -> b l r g n", g=self.ngroups, r=self.mimo_dim) 
-        C = rearrange(C, "b l (r g n) -> b l r g n", g=self.ngroups, r=self.mimo_dim)
+        B = rearrange(B, "b l (g r n) -> b l r g n", g=self.ngroups, r=self.mimo_dim) 
+        C = rearrange(C, "b l (g r n) -> b l r g n", g=self.ngroups, r=self.mimo_dim)
 
         B = self.B_norm(B)
         C = self.C_norm(C)
 
         if self.ngroups != self.nheads:
-            B = B.expand(-1, -1, -1, self.nheads, -1) # (B, L, R, N, S)
-            C = C.expand(-1, -1, -1, self.nheads, -1) # (B, L, R, N, S)
-
+            n_repeat = self.nheads // self.ngroups
+            B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
+            C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
 
         angle = self.rope_proj(hidden_states) # (B, L, S)
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads, -1) # (B, L, G, S)
@@ -3410,7 +3392,7 @@ class DragonMamba3Mimo(nn.Module):
         A = _A * dt
         gating_factor = dt # B, L, N
 
-        trap = F.sigmoid(self.trapezoid_proj(hidden_states)) # (B, L, N)
+        trap = F.sigmoid(trap) # (B, L, N)
 
         alpha_arr = torch.exp(A)
         beta_arr = (1-trap)*gating_factor*alpha_arr
@@ -3422,8 +3404,6 @@ class DragonMamba3Mimo(nn.Module):
 
         x_scalar = (gamma_arr*_alpha_arr + _beta_arr).to(torch.bfloat16)
 
-        z = rearrange(z, "b l r (h p) -> b l r h p", p=self.headdim)
-
         y = mamba_mimo_chunk_scan_discretized_fused_combined(
             x=x.bfloat16(),
             A=A.bfloat16(),
@@ -3434,14 +3414,11 @@ class DragonMamba3Mimo(nn.Module):
             gamma=gamma_arr,
             CB_sum=CB_sum,
             D=self.D,
-            z=z if not (self.config.legacy_gate and self.config.mamba3_postgate_norm) else None,
+            z=None,
         )
 
         y = rearrange(y, "b l r h p -> b l r (h p)")
-
-        if self.config.legacy_gate and self.config.mamba3_postgate_norm:
-            z = rearrange(z, "b l r h p -> b l r (h p)")
-            y = self.output_norm(y, z)
+        y = self.output_norm(y, z)
 
         #if seqlen_og is not None:
         #    y = rearrange(y, "b l r d -> (b l) r d")
@@ -3449,7 +3426,7 @@ class DragonMamba3Mimo(nn.Module):
         # Perform MIMO down projection (mimo_rank*d_inner -> d_inner)
         y = rearrange(y, "b l r d -> b l (r d)")
         y = rearrange(y, "b l (g d) -> b l g d", g=self.mimo_dim*self.mimo_proj_block_order)
-        y = torch.einsum("blgd,drg->bldr", y, self.out_proj_mimo)
+        y = torch.einsum("blgd,drg->bldr", y, self.out_proj_mimo.to(y.dtype))
         y = rearrange(y, "b l d r -> b l (d r)")
         y = rearrange(y, "b l (h d) -> b l h d", d=self.headdim)
 
@@ -3487,7 +3464,7 @@ class DragonMLP(nn.Module):
         if self.config.mlp_linking:
             self.mlp_link = hidden_states[...,:self.link_size]
         hidden_states = self.fc_2(hidden_states)
-        return hidden_states, None
+        return hidden_states
     
     def get_mlp_link(self):
         mlp_link = self.mlp_link
@@ -3558,11 +3535,10 @@ class DragonMoE(nn.Module):
         out_experts = self.experts(x0, probs, top_indices)
         if self.config.moe_routed_input_dim:
             out_experts = self.up_proj(out_experts).to(out_experts.dtype)
-        out = self.shared_experts(x)[0] if self.shared_experts is not None else None
+        out = self.shared_experts(x) if self.shared_experts is not None else None
         if out is None:
             return out_experts.reshape(bs, slen, dim)
-
-        return (out + out_experts).reshape(bs, slen, dim), None
+        return (out + out_experts).reshape(bs, slen, dim)
 
 class GHyperConnection(nn.Module):
     def __init__(self, dim, m,):
@@ -3794,7 +3770,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         # MLP.
         residual = hidden_states
         hidden_states = self.lns * self.postmixer_norm(hidden_states)
-        y_mlp, router_prev = self.mlp(hidden_states, router_prev) # (B, L, D)
+        y_mlp = self.mlp(hidden_states, router_prev) # (B, L, D)
         hidden_states = self.b * residual + self.a * y_mlp
 
         return hidden_states, last_key_states, last_value_states, router_prev

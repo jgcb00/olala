@@ -174,7 +174,7 @@ class DragonConfig(PretrainedConfig):
         vocab_size=151936,
         tie_word_embeddings=False,
         max_position_embeddings=8192,
-        use_uscaling=True,
+        use_uscaling=False,
         hidden_size=2048,
         intermediate_size=8192,
         expand_factor=2,
