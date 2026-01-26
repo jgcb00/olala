@@ -2123,7 +2123,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
 
         assert self.num_signal_heads % self.num_noise_heads == 0, "number of signal heads must be a multiple of number of noise heads."
         self.snr = self.num_signal_heads // self.num_noise_heads
-        self.num_key_value_heads = self.num_attention_heads // self.snr
+        self.num_key_value_heads = self.num_noise_heads
 
         self.c_q = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.head_dim, bias=False)
         self.W_A_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads * self.rank, bias=False)
@@ -2248,13 +2248,17 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             if position_ids is not None:
                 # first token of each doc has pos==0
                 doc_start = (position_ids == 0) # (B, L) bool
-                m = doc_start.unsqueeze(-1).unsqueeze(-1) # (B, L, 1, 1) bool
+            else:
+                B, L = hidden_states.shape[:2]
+                doc_start = torch.zeros(B, L, dtype=torch.bool, device=hidden_states.device)
+                doc_start[:, 0] = True
+            m = doc_start.unsqueeze(-1).unsqueeze(-1) # (B, L, 1, 1) bool
 
-                # zero the previous contribution at boundaries
-                k_prev  = k_prev.masked_fill(m, 0)
-                v_prev  = v_prev.masked_fill(m, 0)
-                alpha_k = alpha_k.masked_fill(m, 0)
-                alpha_v = alpha_v.masked_fill(m, 0)
+            # zero the previous contribution at boundaries
+            k_prev  = k_prev.masked_fill(m, 0)
+            v_prev  = v_prev.masked_fill(m, 0)
+            alpha_k = alpha_k.masked_fill(m, 0)
+            alpha_v = alpha_v.masked_fill(m, 0)
 
             key_states = alpha_k * k_prev + (1 - alpha_k) * key_states
             value_states = alpha_v * v_prev + (1 - alpha_v) * value_states
@@ -2325,8 +2329,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            T = query_states.size(1)
-            pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
+            pos = (position_ids.to(torch.float32).view(1, query_states.size(1), 1, 1) + 1.)
             log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
             query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
             # TODO: caching mechanism for log_pos
@@ -2357,7 +2360,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
         # num_heads = num_signal_heads + num_noise_heads
-        # num_kv_heads = (num_signal_heads // (snr * gqa)
+        # num_kv_heads = num_signal_heads // (snr * gqa)
         # where snr = num_signal_heads // num_noise_heads
         #       gqa = num_heads // num_kv_heads
         # identity : snr+1 = num_heads/num_noise_heads
