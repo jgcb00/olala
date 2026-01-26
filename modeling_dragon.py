@@ -637,11 +637,6 @@ class DragonAttention(nn.Module):
             key_states, value_states = key_value_last_layer
             last_key_states, last_value_states = None, None
 
-        # token-shift.
-        assert not self.config.token_shift_attn
-        # conv.
-        assert not self.config.token_conv1d_attn
-
         # QK-norm.
         if self.qk_norm:
             query_states = self.q_norm(query_states)
@@ -687,9 +682,9 @@ class DragonAttention(nn.Module):
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
             if not self.config.intra_doc_masking:
-                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
-                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
@@ -2056,8 +2051,8 @@ class DragonDifferentialTensorProductAttention(nn.Module):
                 D = v.size(3)
                 v1 = v[:, :, :, :D//2]
                 v2 = v[:, :, :, D//2:]
-                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)[0]
-                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)[0]
+                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
+                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
                 o = torch.cat([o1, o2], dim=-1)
                 return o
         elif DIFF_ATTN_IMPL == "flex":
@@ -2355,9 +2350,9 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
             if not self.config.intra_doc_masking:
-                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
-                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
+                attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         else:
             raise ValueError(f"Unknown ATTN_IMPL: {ATTN_IMPL}")
 
@@ -3790,14 +3785,6 @@ class DragonPreTrainedModel(PreTrainedModel):
         "hidden_states": DragonMonoBlock,
         "attentions": DragonMonoBlock,
     }
-
-    def _init_weights(self, module):
-        if isinstance(module, (DragonLinear, nn.Conv1d)):
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-            nn.init.normal_(module.weight, mean=0., std=self.config.initializer_range)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0., std=self.config.initializer_range)
 
 @dataclass
 class DragonOutput(ModelOutput):
