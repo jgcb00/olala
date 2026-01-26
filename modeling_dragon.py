@@ -3277,9 +3277,9 @@ class DragonMamba3Mimo(nn.Module):
         self.act = nn.SiLU()
 
         # Initialize up/down MIMO projection (for x and z)
-        in_proj_mimo_x_init_weights = torch.ones(self.dr_out_dim, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)
+        in_proj_mimo_x_init_weights = torch.ones(self.dr_out_dim, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)/self.mimo_dim
         in_proj_mimo_z_init_weights = torch.ones(self.dr_out_dim, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)
-        out_proj_mimo_init_weights = torch.ones(self.dr_out_dim, self.mimo_proj_block_order, self.mimo_dim*self.mimo_proj_block_order)
+        out_proj_mimo_init_weights = torch.ones(self.dr_out_dim, self.mimo_proj_block_order, self.mimo_dim*self.mimo_proj_block_order)/self.mimo_dim
 
         self.in_proj_mimo_x = nn.Parameter(in_proj_mimo_x_init_weights, requires_grad=True)
         self.in_proj_mimo_z = nn.Parameter(in_proj_mimo_z_init_weights, requires_grad=True)
