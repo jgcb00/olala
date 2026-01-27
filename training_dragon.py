@@ -81,6 +81,7 @@ class NanoArgs:
     reduce_lm_head: int = 0
     use_value_embedding: bool = False
     layers_ve_config: str = ""
+    layers_stem_config: str = ""
 
     # MoE
     moe: bool = False
@@ -744,7 +745,7 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
 
     return groups
 
-args = tyro.cli(NanoArgs)
+args: NanoArgs = tyro.cli(NanoArgs)
 
 if args.intra_doc_masking:
     if args.device_batch_size != 1:
@@ -896,6 +897,7 @@ config_hf = DragonConfig(
     base_depth=args.base_depth,
     completed_p_alpha=args.completed_p_alpha,
     use_completed_p=args.use_completed_p,
+    layers_stem_config=args.layers_stem_config,
     layers_mlp_config=args.layers_mlp_config,
     layers_ve_config=args.layers_ve_config,
     use_value_embedding=args.use_value_embedding,

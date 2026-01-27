@@ -95,6 +95,7 @@ class DragonConfig(PretrainedConfig):
         base_depth: int = 0,
         completed_p_alpha: float = 0.5,
         use_completed_p: bool = False,
+        layers_stem_config: str = "",
         layers_mlp_config: str = "",
         layers_ve_config: str = "",
         use_value_embedding: bool = False,
@@ -214,6 +215,7 @@ class DragonConfig(PretrainedConfig):
         self.base_depth = base_depth
         self.completed_p_alpha = completed_p_alpha
         self.use_completed_p = use_completed_p
+        self.layers_stem_config = layers_stem_config
         self.layers_mlp_config = layers_mlp_config
         self.layers_ve_config = layers_ve_config
         self.use_value_embedding = use_value_embedding

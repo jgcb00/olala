@@ -2666,7 +2666,7 @@ class DragonGatedDeltaNet(nn.Module):
 
     def forward(self,
                 hidden_states: torch.Tensor,
-                position_embeddings: tuple[torch.Tensor, torch.Tensor],
+                position_embeddings: tuple[torch.Tensor, torch.Tensor] = None,
                 cache_params: Optional[HybridDragonDynamicCache] = None,
                 cu_seqlens: Optional[torch.Tensor] = None,
                 ve=None,
@@ -3438,36 +3438,27 @@ class DragonMLP(nn.Module):
         super().__init__()
         self.config = config
         intermediate_size = intermediate_size or config.intermediate_size
-        #print("previous MLP : ", PREVIOUS_MLP)
-        self.link_size = 16
-        self.mlp_linking = config.mlp_linking and PREVIOUS_MLP is not None
-        if self.mlp_linking:
-            self.previous_mlp = PREVIOUS_MLP
-            self.fc_1 = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
-            self.lambda1 = nn.Parameter(torch.zeros(self.link_size))  # sigmoid->0.5
-        else : 
-            self.fc_1 = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
+        self.fc_1 = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
         self.fc_2 = DragonLinear(config, intermediate_size, config.hidden_size, bias=False)
         self.register_buffer("_2_sqrt_5", torch.tensor(2/math.sqrt(5)) if config.use_uscaling else torch.tensor(1.), persistent=False)
 
-    def forward(self, hidden_states, router_prev=None):
-        if self.mlp_linking:
-            #hidden_states = torch.concat([hidden_states, self.previous_mlp.get_mlp_link()], dim=-1)
-            #link = hidden_states[...,:self.link_size] + self.previous_mlp.get_mlp_link()
-            lambda1 = torch.sigmoid(self.lambda1)
-            link = lambda1 * hidden_states[...,:self.link_size] + (1 - lambda1) * self.previous_mlp.get_mlp_link()
-            hidden_states = torch.concat([link, hidden_states[...,self.link_size:]], dim=-1)
+    def forward(self, hidden_states, router_prev=None, stem_emb=None):
         hidden_states = self.fc_1(hidden_states)
         hidden_states = self._2_sqrt_5 * F.relu(hidden_states).square()
-        if self.config.mlp_linking:
-            self.mlp_link = hidden_states[...,:self.link_size]
         hidden_states = self.fc_2(hidden_states)
         return hidden_states
-    
-    def get_mlp_link(self):
-        mlp_link = self.mlp_link
-        self.mlp_link = None
-        return mlp_link
+
+class DragonSTEMMLP(nn.Module):
+    def __init__(self, config: DragonConfig, intermediate_size: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = DragonLinear(config, intermediate_size, config.hidden_size, bias=False)
+
+    def forward(self, hidden_states, router_prev=None, stem_emb=None):
+        assert stem_emb is not None, "stem_emb must be provided for DragonSTEMMLP"
+        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * stem_emb)
 
 class DragonMoE(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int):
@@ -3508,7 +3499,7 @@ class DragonMoE(nn.Module):
             self.experts.experts.weight.normal_(mean=0.0, std=self.config.initializer_range)
             self.experts.output_experts.weight.normal_(mean=0.0, std=self.config.initializer_range)
 
-    def forward(self, x: torch.Tensor, router_prev=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, router_prev=None, stem_emb=None) -> torch.Tensor:
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
@@ -3592,7 +3583,7 @@ class GHyperConnection(nn.Module):
 
 PREVIOUS_MLP = None
 class DragonMonoBlock(GradientCheckpointingLayer):
-    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
+    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd', use_stem=False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -3696,10 +3687,13 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         self.input_norm = DragonNorm(config, config.hidden_size)
         self.postmixer_norm = DragonNorm(config, config.hidden_size)
         if not config.moe or mlp_type == 'd':
-            if config.mlp_type == "simple":
-                self.mlp = DragonMLP(config)
-            elif config.mlp_type == "gated":
-                self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
+            if not use_stem:
+                if config.mlp_type == "simple":
+                    self.mlp = DragonMLP(config)
+                elif config.mlp_type == "gated":
+                    self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
+            else:
+                self.mlp = DragonSTEMMLP(config)
         elif mlp_type == 'm':
             self.mlp = DragonMoE(config, layer_idx=layer_idx)
         else:
@@ -3733,6 +3727,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         router_prev=None,
+        stem_emb=None,
         ve=None,
         **kwargs,
     ):
@@ -3768,7 +3763,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         # MLP.
         residual = hidden_states
         hidden_states = self.lns * self.postmixer_norm(hidden_states)
-        y_mlp = self.mlp(hidden_states, router_prev) # (B, L, D)
+        y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
         hidden_states = self.b * residual + self.a * y_mlp
 
         return hidden_states, last_key_states, last_value_states, router_prev
@@ -3866,6 +3861,20 @@ class DragonModel(DragonPreTrainedModel):
                 self.value_embedding_map.append(len(self.value_embedding))
                 self.value_embedding.append(nn.Embedding(config.vocab_size, out_dim, self.padding_idx))
 
+        self.use_stem = False
+        if "1" in config.layers_stem_config:
+            self.use_stem = True
+            layers_stem_flags = [c == "1" for c in config.layers_stem_config]
+            assert len(layers_stem_flags) == len(config.layers_config)
+            self.stem_embedding = nn.ModuleList()
+            self.stem_embedding_map = []
+            for use_stem, layer_type in zip(layers_stem_flags, config.layers_config):
+                if not use_stem:
+                    self.stem_embedding_map.append(-1)
+                    continue
+                self.stem_embedding_map.append(len(self.stem_embedding))
+                self.stem_embedding.append(nn.Embedding(config.vocab_size, config.intermediate_size, self.padding_idx))
+
         layers_mlp_config = config.layers_mlp_config
         if self.config.layers_mlp_config == '':
             if self.config.moe:
@@ -3874,18 +3883,16 @@ class DragonModel(DragonPreTrainedModel):
                 layers_mlp_config = 'd' * len(config.layers_config)
         assert len(layers_mlp_config) == len(config.layers_config)
 
+        layers_stem_config = config.layers_stem_config
+        if self.config.layers_stem_config == '':
+            layers_stem_config = '0' * len(config.layers_config)
+
         if not self.config.vwn:
             if not self.config.use_value_embedding:
-                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) for i, (layer, mlp_type) in enumerate(zip(config.layers_config, layers_mlp_config))])
+                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, use_stem=int(use_stem)) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, use_stem=int(use_stem)) for i, (layer, mlp_type, use_stem) in enumerate(zip(config.layers_config, layers_mlp_config, layers_stem_config))])
             else:
                 assert len(config.layers_ve_config) == len(config.layers_config)
-                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
-        else:
-            if not self.config.use_value_embedding:
-                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoVirtualBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) for i, (layer, mlp_type) in enumerate(zip(config.layers_config, layers_mlp_config))])
-            else:
-                assert len(config.layers_ve_config) == len(config.layers_config)
-                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoVirtualBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
+                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, use_stem=int(use_stem)) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type, use_stem=int(use_stem)) for i, (layer, ve, mlp_type, use_stem) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config, layers_stem_config))])
 
         self.rotary_emb = None
         if self.config.rope_type != '' and self.config.rope_theta > 0.:
@@ -3978,6 +3985,12 @@ class DragonModel(DragonPreTrainedModel):
                 j = self.value_embedding_map[i]
                 if j != -1:
                     ve_i = self.value_embedding[j](input_ids)
+            
+            stem_emb = None
+            if self.use_stem:
+                j = self.stem_embedding_map[i]
+                if j != -1:
+                    stem_emb = self.stem_embedding[j](input_ids)
 
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -3992,6 +4005,7 @@ class DragonModel(DragonPreTrainedModel):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 router_prev=router_prev,
+                stem_emb=stem_emb,
                 ve=ve_i,
                 **kwargs,
             )
