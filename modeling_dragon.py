@@ -3529,59 +3529,125 @@ class DragonMoE(nn.Module):
             return out_experts.reshape(bs, slen, dim)
         return (out + out_experts).reshape(bs, slen, dim)
 
-class GHyperConnection(nn.Module):
-    def __init__(self, dim, m,):
+def _logit(p: float) -> float:
+    p = min(max(float(p), 1e-6), 1.0 - 1e-6)
+    return math.log(p) - math.log(1.0 - p)
+
+class DeepDeltaResidualVdim1(nn.Module):
+    def __init__(self, config: DragonConfig):
         super().__init__()
-        self.m, self.n_in, self.n_out = m, n_in, n_out
-        self.factor = 1.0 / math.sqrt(dim // self.m)
+        self.config = config
 
-        # Initialize static beta: cyclic pattern
-        static_beta_tensor = torch.zeros(self.m, n_in)
-        for j in range(n_in):
-            static_beta_tensor[j % self.m, j] = 1.0
-        self.static_beta = nn.Parameter(static_beta_tensor.T.contiguous())
+        self.k_eps = 1e-6
+        self.v_sigmoid = True
+        self.v_sigmoid_scale = 4.
 
-        # Initialize static alpha: block matrix
-        init_alpha = torch.cat([torch.eye(self.m), torch.eye(self.m),
-        torch.zeros((self.m, self.n_in - self.m))], dim=1)
-        if self.n_in > self.m:
-            part2 = torch.cat([torch.zeros((self.n_in - self.m, self.m * 2)), torch.eye(self.n_in - self.m)], dim=1)
-            init_alpha = torch.cat([init_alpha, part2], dim=0)
-        self.static_alpha = nn.Parameter(init_alpha.contiguous())
+        self.beta = DragonLinear(config, config.hidden_size, 1, bias=True)
+        self.v_proj = DragonLinear(config, config.hidden_size, 1, bias=True)
 
-        # Dynamic parameters
-        self.dynamic_alpha_fn = nn.Parameter(torch.zeros((dim // self.m, self.m + self.n_in)))
-        self.dynamic_alpha_scale = nn.Parameter(torch.ones_like(self.static_alpha))
-        self.dynamic_beta_fn = nn.Parameter(torch.zeros((dim // self.m, self.m)))
-        self.dynamic_beta_scale = nn.Parameter(torch.ones_like(self.static_beta))
-        self.layer_norm = RMSNorm(hidden_size=dim // self.m)
+        with torch.no_grad():
+            self.beta.bias.fill_(_logit(0.))
 
-        def _base_width_connection(self, h, dynamic_fn, dynamic_scale, static_scale):
-            h_shape = h.shape
-            N, NMM = static_scale.shape
-            M = (NMM - N) // 2
-            h_reshape = h.reshape((h_shape[:-1].numel(),) + (N, h_shape[-1] // N))
-            norm_h = self.layer_norm(h_reshape)
-            alpha_beta = (safe_tanh(norm_h @ dynamic_fn.T.to(dtype=norm_h.dtype) * self.factor) * dynamic_scale[None, ...] + static_scale[None, ...])
-            alpha, beta = torch.split(alpha_beta, (M + N, M), dim=-1)
-            mix_h = (h_reshape.transpose(1, 2) @ alpha.to(dtype=h_reshape.dtype)).transpose(1, 2)
-            return mix_h.reshape(h_shape[:-1] + mix_h.shape[1:]), beta
+    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C), k_in: (B, T, C), context: (B, T, C)
 
-        def width_connection(self, h):
-            dynamic_fn = torch.concat([self.dynamic_alpha_fn.T, self.dynamic_beta_fn.T], dim=0)
-            dynamic_scale = torch.concat([self.dynamic_alpha_scale, self.dynamic_beta_scale], dim=-1).contiguous()
-            static_scale = torch.concat([self.static_alpha, self.static_beta], dim=-1)
-            return self._base_width_connection(h, dynamic_fn.to(dtype=h.dtype), dynamic_scale.to(dtype=h.dtype), static_scale.to(dtype=h.dtype))
+        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
+        k_dim = int(k_in.size(-1))
+        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
+        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
+        k_scale = 1.0 / math.sqrt(k_dim)
 
-        def depth_connection(self, mix_h, h_o, beta):
-            h_o_shape = h_o.shape
-            h_o = h_o.reshape(h_o_shape[:-1] + (self.m, h_o_shape[-1] // self.m))
-            h_i = beta.view(h_o.shape[:2] + beta.shape[1:]).to(dtype=h_o.dtype) @ h_o
-            h = h_i + mix_h[..., self.m:, :]
-            h_shape = h.shape
-            return h.reshape(h_shape[:-2] + (h_shape[-2] * h_shape[-1],)).contiguous()
+        # beta(X) in [0, 2]
+        beta_logits = self.beta(context).float()
+        beta = 2.0 * torch.sigmoid(beta_logits) # fp32
 
-PREVIOUS_MLP = None
+        # k^T x, scalar projection (B, T, 1)
+        proj_rms = torch.sum(k_rms * x, dim=-1, keepdim=True, dtype=torch.float32) # fp32
+        proj = proj_rms * k_scale
+
+        # v(X) is scalar for d_v=1.
+        v = self.v_proj(x)
+        v = torch.sigmoid(v) * self.v_sigmoid_scale
+
+        # x <- x + beta * k * (v - k^T x)
+        delta_scaled = ((beta * (v - proj)) * k_scale).to(dtype=x.dtype) # (B, T, 1)
+        update = delta_scaled * k_rms
+        return x + update
+
+class ResidualShortConvCompressor(nn.Module):
+    def __init__(self, config: DragonConfig):
+        super().__init__()
+        self.config = config
+
+        self.hidden_size = int(config.hidden_size)
+        self.value_channels = 4        
+        self.residual_size = self.hidden_size * self.value_channels
+
+        self.shortconv = nn.Conv1d(in_channels=self.residual_size, out_channels=self.residual_size, bias=False, kernel_size=4, groups=self.residual_size, padding=3)
+
+        read_init = 1.0 / float(self.value_channels)
+        self.read = nn.Parameter(torch.full((self.value_channels,), read_init))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, d, d_v)
+        B, T, d, dv = x.shape
+        if d != self.hidden_size:
+            raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
+        if dv != self.value_channels:
+            raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
+
+        x_flat = x.reshape(B, T, self.residual_size)
+        x_conv = self.shortconv(x_flat).reshape(B, T, d, dv)
+        return torch.sum(x_conv * self.read, dim=-1)
+
+class DeepDeltaResidualExpanded(nn.Module):
+    def __init__(self, config: DragonConfig):
+        super().__init__()
+        self.config = config
+
+        self.value_channels = 4
+
+        self.k_eps = 1e-5
+        self.v_sigmoid_scale = 4.
+
+        self.beta = DragonLinear(config, config.hidden_size, 1, bias=True)
+        self.v_proj = DragonLinear(config, config.hidden_size, self.value_channels, bias=True)
+
+        with torch.no_grad():
+            self.beta.bias.fill_(_logit(0))
+
+    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, v_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
+
+        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
+        k_dim = int(k_in.size(-1))
+        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
+        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
+        k_scale = 1.0 / math.sqrt(k_dim)
+
+        # beta(X) in [0, 2]
+        beta_logits = self.beta(context).float()
+        beta = 2.0 * torch.sigmoid(beta_logits) # fp32
+
+        if x.ndim != 4:
+            raise ValueError(f"Expected x with shape (B, T, d, d_v), got {tuple(x.shape)}")
+        if int(x.size(-2)) != k_dim:
+            raise ValueError(f"Expected x feature dim {k_dim}, got {int(x.size(-2))}.")
+        if int(x.size(-1)) != self.value_channels:
+            raise ValueError(f"Expected x value channels {self.value_channels}, got {int(x.size(-1))}.")
+
+        # k^T X, row vector projection (B, T, d_v)
+        proj_rms = torch.sum(k_rms.unsqueeze(-1) * x, dim=-2, dtype=torch.float32) # fp32
+        proj = proj_rms * k_scale
+
+        v = self.v_proj(v_in)
+        v = torch.sigmoid(v) * self.v_sigmoid_scale
+
+        # X <- X + beta * k * (v^T - k^T X)
+        delta_row = (beta * (v - proj)) * k_scale # fp32 (B, T, d_v)
+        update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2) # (B, T, d, d_v)
+        return x + update
+
 class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd', use_stem=False):
         super().__init__()
@@ -3686,6 +3752,14 @@ class DragonMonoBlock(GradientCheckpointingLayer):
 
         self.input_norm = DragonNorm(config, config.hidden_size)
         self.postmixer_norm = DragonNorm(config, config.hidden_size)
+
+        if self.config.ddl_type == 'vdim1':
+            self.ddl_attn = DeepDeltaResidualVdim1(config)
+            self.ddl_mlp = DeepDeltaResidualVdim1(config)
+        elif self.config.ddl_type == 'expanded':
+            self.ddl_attn = DeepDeltaResidualExpanded(config)
+            self.ddl_mlp = DeepDeltaResidualExpanded(config)
+
         if not config.moe or mlp_type == 'd':
             if not use_stem:
                 if config.mlp_type == "simple":
@@ -3758,13 +3832,21 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             y_mixer = self.mixer_group_norm(y_mixer)
         y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
         y_mixer = self.mixer_proj(y_mixer)
-        hidden_states = self.b * residual + self.a * y_mixer
+
+        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded':
+            hidden_states = self.ddl_attn(residual, k_in=y_mixer, context=hidden_states)
+        else:
+            hidden_states = self.b * residual + self.a * y_mixer
 
         # MLP.
         residual = hidden_states
         hidden_states = self.lns * self.postmixer_norm(hidden_states)
         y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
-        hidden_states = self.b * residual + self.a * y_mlp
+
+        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded':
+            hidden_states = self.ddl_mlp(residual, k_in=y_mlp, context=hidden_states)
+        else:
+            hidden_states = self.b * residual + self.a * y_mlp
 
         return hidden_states, last_key_states, last_value_states, router_prev
 

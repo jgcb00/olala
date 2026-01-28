@@ -82,6 +82,7 @@ class NanoArgs:
     use_value_embedding: bool = False
     layers_ve_config: str = ""
     layers_stem_config: str = ""
+    ddl_type: str = "" # "", vdim1, extended
 
     # MoE
     moe: bool = False
@@ -727,9 +728,10 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
         else:
             base_lr = base_lr_scalar
             scale_lr = (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
-            scale_wd = rho_adjusted
             if not wd_other:
                 scale_wd = 0.0
+            if getattr(p, "requires_weight_decay", False):
+                scale_wd = scale_wd
             if not("q_norm" in pname or "k_norm" in pname):
                 scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted
             else:
@@ -894,6 +896,7 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    ddl_type=args.ddl_type,
     base_depth=args.base_depth,
     completed_p_alpha=args.completed_p_alpha,
     use_completed_p=args.use_completed_p,

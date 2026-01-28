@@ -92,6 +92,7 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        ddl_type: str = "",
         base_depth: int = 0,
         completed_p_alpha: float = 0.5,
         use_completed_p: bool = False,
@@ -212,6 +213,7 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.ddl_type = ddl_type
         self.base_depth = base_depth
         self.completed_p_alpha = completed_p_alpha
         self.use_completed_p = use_completed_p
