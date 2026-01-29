@@ -101,6 +101,7 @@ class NanoArgs:
     swa_window_size : int = 1024
     slw_warmup_iters: float = 0
     slw_start: int = 8 # window size at the start of training
+    slw_end: int = 8192
     slw_increment: int = 64 # window size increment at each step
     softcap_attn: float = 0.0 # logit soft-capping for attn logits, as per Gemma2 (0.0 = no soft-capping)
     qk_norm: bool = True
@@ -1331,9 +1332,9 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         slw_warmup_iters = int(args.slw_warmup_iters * args.total_iterations)
 
         progress_ratio = iter_ / slw_warmup_iters
-        window = args.slw_start + progress_ratio * (args.sequence_length - args.slw_start)
+        window = args.slw_start + progress_ratio * (args.slw_end - args.slw_start)
         window = args.slw_increment * math.ceil(window / args.slw_increment) # quantize
-        window = int(min(window, args.sequence_length)) # cap
+        window = int(min(window, args.slw_end)) # cap
         raw_model.config.slw_wsize = window
 
         to_log['slw_window'] = window
