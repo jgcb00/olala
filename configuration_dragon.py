@@ -92,6 +92,10 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        ngram_embeddings: bool = False,
+        ngram_embeddings_neighbor: int = 4,
+        ngram_embeddings_channels: int = 4,
+        ngram_embeddings_ratio: int = 15,
         ddl_type: str = "",
         base_depth: int = 0,
         completed_p_alpha: float = 0.5,
@@ -213,6 +217,10 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.ngram_embeddings = ngram_embeddings
+        self.ngram_embeddings_neighbor = ngram_embeddings_neighbor
+        self.ngram_embeddings_channels = ngram_embeddings_channels
+        self.ngram_embeddings_ratio = ngram_embeddings_ratio
         self.ddl_type = ddl_type
         self.base_depth = base_depth
         self.completed_p_alpha = completed_p_alpha

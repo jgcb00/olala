@@ -1,7 +1,7 @@
 # coding=utf-8
 """PyTorch Dragon model."""
 
-from typing import Any, Dict, Optional, Tuple, Union, List
+from typing import Any, Dict, Optional, Tuple, Union, List, Literal
 from dataclasses import dataclass
 import inspect
 
@@ -3574,18 +3574,201 @@ class DeepDeltaResidualVdim1(nn.Module):
         update = delta_scaled * k_rms
         return x + update
 
+class DeepDeltaResidualExpanded(nn.Module):
+    def __init__(self, config: DragonConfig):
+        super().__init__()
+        
+        hidden_size = config.hidden_size
+        self.value_channels = 4
+        self.k_eps = 1e-5
+        self.v_sigmoid = True
+        self.v_sigmoid_scale = 4.
+        self.v_constant = False
+        self.v_constant_value = 2.0
+
+        self.beta_single_linear = True
+        self.beta = DragonLinear(config, hidden_size, 1, bias=True)
+        
+        # v is a vector in R^{d_v} in the expanded-state regime.
+        self.v_proj = DragonLinear(config, hidden_size, self.value_channels, bias=True)
+
+        beta_init = 0.
+        beta_init = min(max(beta_init, 0.0), 2.0)
+        beta_init_p = beta_init / 2.0
+        with torch.no_grad():
+            if self.beta_single_linear:
+                self.beta.bias.fill_(_logit(beta_init_p))
+            else:
+                self.beta_out.bias.fill_(_logit(beta_init_p))
+
+    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, v_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
+        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
+        k_dim = int(k_in.size(-1))
+        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
+        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
+        k_scale = 1.0 / math.sqrt(k_dim)
+
+        # beta(X) in [0, 2]
+        beta_logits = self.beta(context).float()
+        beta = 2.0 * torch.sigmoid(beta_logits)  # fp32
+
+        if x.ndim != 4:
+            raise ValueError(f"Expected x with shape (B, T, d, d_v), got {tuple(x.shape)}")
+        if int(x.size(-2)) != k_dim:
+            raise ValueError(f"Expected x feature dim {k_dim}, got {int(x.size(-2))}.")
+        if int(x.size(-1)) != self.value_channels:
+            raise ValueError(f"Expected x value channels {self.value_channels}, got {int(x.size(-1))}.")
+
+        # k^T X, row vector projection (B, T, d_v)
+        proj_rms = torch.sum(k_rms.unsqueeze(-1) * x, dim=-2, dtype=torch.float32)  # fp32
+        proj = proj_rms * k_scale
+
+        v = self.v_proj(v_in)
+        v = torch.sigmoid(v) * self.v_sigmoid_scale
+
+        # X <- X + beta * k * (v^T - k^T X)
+        delta_row = (beta * (v - proj)) * k_scale  # fp32 (B, T, d_v)
+        update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2)  # (B, T, d, d_v)
+        return x + update
+    
+ActivationName = Literal["silu", "relu", "elu+1", "identity"]
+_ACTIVATION_NAMES: set[str] = {"silu", "relu", "elu+1", "identity"}
+def apply_activation(x: torch.Tensor, activation: str | None) -> torch.Tensor:
+    if activation is None or activation == "identity":
+        return x
+    if activation == "silu":
+        return F.silu(x)
+    if activation == "relu":
+        return F.relu(x)
+    if activation == "elu+1":
+        return (F.elu(x, 1.0, False) + 1.0).to(dtype=x.dtype)
+    raise ValueError(f"Unsupported activation {activation!r}. Expected one of: {sorted(_ACTIVATION_NAMES)!r}.")
+    
+class DepthwiseShortConv1d(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        kernel_size: int,
+        activation: ActivationName | None = None,
+        shift_right1: bool = False,
+    ) -> None:
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        if self.kernel_size <= 0:
+            raise ValueError(f"kernel_size must be positive, got {self.kernel_size}.")
+        self.activation = activation
+        self.shift_right1 = bool(shift_right1)
+        self.conv = nn.Conv1d(
+            hidden_size,
+            hidden_size,
+            kernel_size=self.kernel_size,
+            padding=0,
+            groups=hidden_size,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2).contiguous()  # (B, C, T)
+        pad_left = self.kernel_size - 1 + (1 if self.shift_right1 else 0)
+        x = F.pad(x, (pad_left, 0)).contiguous()
+        x = self.conv(x)
+        if self.shift_right1:
+            x = x[:, :, :-1]
+        if x.device.type == "mps":
+            x = _Transpose12Contiguous.apply(x)
+        else:
+            x = x.transpose(1, 2).contiguous()  # (B, T, C)
+        return apply_activation(x, self.activation)
+    
+class InputEmbedShortConvExpander(nn.Module):
+    def __init__(self, config: DragonConfig) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.value_channels = 4
+        if self.value_channels <= 1:
+            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
+
+        kernel_size = 4
+        if kernel_size <= 0:
+            raise ValueError(f"input_embed_shortconv_kernel_size must be positive, got {kernel_size}.")
+        self.kernel_size = kernel_size
+
+        self.conv = nn.Conv1d(
+            self.hidden_size,
+            self.hidden_size * self.value_channels,
+            kernel_size=self.kernel_size,
+            padding=0,
+            groups=self.hidden_size,
+            bias=False,
+        )
+
+    def reset_parameters_identity(self) -> None:
+        with torch.no_grad():
+            self.conv.weight.zero_()
+            self.conv.weight[:, 0, self.kernel_size - 1] = 1.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, d) -> (B, T, d, d_v)
+        if x.ndim != 3:
+            raise ValueError(f"Expected x with shape (B, T, d), got {tuple(x.shape)}")
+        B, T, d = x.shape
+        if d != self.hidden_size:
+            raise ValueError(f"Expected x feature dim {self.hidden_size}, got {d}.")
+
+        x_t = x.transpose(1, 2).contiguous()  # (B, d, T)
+        pad_left = self.kernel_size - 1
+        x_t = F.pad(x_t, (pad_left, 0)).contiguous()
+        y = self.conv(x_t)  # (B, d*d_v, T)
+        y = y.transpose(1, 2).contiguous()  # (B, T, d*d_v)
+        return y.reshape(B, T, d, self.value_channels)
+
+    def forward_with_past(
+        self, x: torch.Tensor, *, past: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim != 3:
+            raise ValueError(f"Expected x with shape (B, T, d), got {tuple(x.shape)}")
+        B, T, d = x.shape
+        if d != self.hidden_size:
+            raise ValueError(f"Expected x feature dim {self.hidden_size}, got {d}.")
+
+        x_t = x.transpose(1, 2).contiguous()  # (B, d, T)
+        past_len = self.kernel_size - 1
+        if past_len <= 0:
+            expanded = self.forward(x)
+            empty = x_t[:, :, :0].contiguous()
+            return expanded, empty
+
+        if past is None:
+            past = torch.zeros((B, d, past_len), device=x.device, dtype=x.dtype)
+        if past.ndim != 3 or int(past.shape[0]) != B or int(past.shape[1]) != d or int(past.shape[2]) != past_len:
+            raise ValueError(f"Expected past with shape (B, d, {past_len}), got {tuple(past.shape)}")
+
+        x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, d, past_len+T)
+        y = self.conv(x_cat)  # (B, d*d_v, T)
+        y = y.transpose(1, 2).contiguous()  # (B, T, d*d_v)
+        expanded = y.reshape(B, T, d, self.value_channels)
+        past_out = x_cat[:, :, -past_len:].contiguous()
+        return expanded, past_out
+
 class ResidualShortConvCompressor(nn.Module):
     def __init__(self, config: DragonConfig):
         super().__init__()
-        self.config = config
-
-        self.hidden_size = int(config.hidden_size)
-        self.value_channels = 4        
+        self.hidden_size = config.hidden_size
+        self.value_channels = 4
+        if self.value_channels <= 1:
+            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
         self.residual_size = self.hidden_size * self.value_channels
 
-        self.shortconv = nn.Conv1d(in_channels=self.residual_size, out_channels=self.residual_size, bias=False, kernel_size=4, groups=self.residual_size, padding=3)
+        kernel_size = 4
+        self.shortconv = DepthwiseShortConv1d(self.residual_size, kernel_size=kernel_size)
 
-        read_init = 1.0 / float(self.value_channels)
+        read_init_raw = None
+        if read_init_raw is None:
+            read_init = 1.0 / float(self.value_channels)
+        else:
+            read_init = float(read_init_raw)
         self.read = nn.Parameter(torch.full((self.value_channels,), read_init))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -3600,53 +3783,205 @@ class ResidualShortConvCompressor(nn.Module):
         x_conv = self.shortconv(x_flat).reshape(B, T, d, dv)
         return torch.sum(x_conv * self.read, dim=-1)
 
-class DeepDeltaResidualExpanded(nn.Module):
-    def __init__(self, config: DragonConfig):
+    def forward_with_past(
+        self, x: torch.Tensor, *, past: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # past: (B, C, k-1) where C = hidden_size * value_channels
+        B, T, d, dv = x.shape
+        if d != self.hidden_size:
+            raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
+        if dv != self.value_channels:
+            raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
+
+        kernel_size = int(getattr(self.shortconv, "kernel_size", 0))
+        if kernel_size <= 1:
+            return self.forward(x), None
+
+        if bool(getattr(self.shortconv, "shift_right1", False)):
+            raise NotImplementedError("shift_right1 shortconv is not supported in DDL kv-cache mode.")
+
+        x_flat = x.reshape(B, T, self.residual_size)
+        x_t = x_flat.transpose(1, 2).contiguous()  # (B, C, T)
+        past_len = kernel_size - 1
+
+        if past is None:
+            past = torch.zeros((B, self.residual_size, past_len), device=x.device, dtype=x.dtype)
+        if (
+            past.ndim != 3
+            or int(past.shape[0]) != B
+            or int(past.shape[1]) != self.residual_size
+            or int(past.shape[2]) != past_len
+        ):
+            raise ValueError(f"Expected past with shape (B, C, {past_len}), got {tuple(past.shape)}")
+
+        x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, C, past_len+T)
+        weight = self.shortconv.conv.weight
+        y = F.conv1d(x_cat, weight, bias=None, stride=1, padding=0, groups=self.residual_size)  # (B, C, T)
+
+        y_bt = y.transpose(1, 2).contiguous()  # (B, T, C)
+        y_bt = apply_activation(y_bt, getattr(self.shortconv, "activation", None))
+        y = y_bt.reshape(B, T, d, dv)
+        out = torch.sum(y * self.read, dim=-1)
+        past_out = x_cat[:, :, -past_len:].contiguous()
+        return out, past_out
+
+class DragonNgramEmbedding(nn.Module):
+    """
+    Computes embeddings enriched with N-gram features without maintaining internal state.
+    """
+    def __init__(self, config: DragonConfig, base_embeddings):
         super().__init__()
         self.config = config
 
-        self.value_channels = 4
+        self.word_embeddings = base_embeddings
+        
+        self.m = config.ngram_embeddings_ratio * config.vocab_size
+        self.k = config.ngram_embeddings_channels
+        self.n = config.ngram_embeddings_neighbor
+        
+        self._init_ngram_embeddings()
+        self._vocab_mods_cache = None
+        
+    def _init_ngram_embeddings(self) -> None:
+        """Initialize N-gram embedding and projection layers."""
+        num_embedders = self.k * (self.n - 1)
+        emb_dim = self.config.hidden_size // num_embedders
+        
+        embedders = []
+        post_projs = []
 
-        self.k_eps = 1e-5
-        self.v_sigmoid_scale = 4.
-
-        self.beta = DragonLinear(config, config.hidden_size, 1, bias=True)
-        self.v_proj = DragonLinear(config, config.hidden_size, self.value_channels, bias=True)
-
-        with torch.no_grad():
-            self.beta.bias.fill_(_logit(0))
-
-    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, v_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
-
-        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
-        k_dim = int(k_in.size(-1))
-        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
-        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
-        k_scale = 1.0 / math.sqrt(k_dim)
-
-        # beta(X) in [0, 2]
-        beta_logits = self.beta(context).float()
-        beta = 2.0 * torch.sigmoid(beta_logits) # fp32
-
-        if x.ndim != 4:
-            raise ValueError(f"Expected x with shape (B, T, d, d_v), got {tuple(x.shape)}")
-        if int(x.size(-2)) != k_dim:
-            raise ValueError(f"Expected x feature dim {k_dim}, got {int(x.size(-2))}.")
-        if int(x.size(-1)) != self.value_channels:
-            raise ValueError(f"Expected x value channels {self.value_channels}, got {int(x.size(-1))}.")
-
-        # k^T X, row vector projection (B, T, d_v)
-        proj_rms = torch.sum(k_rms.unsqueeze(-1) * x, dim=-2, dtype=torch.float32) # fp32
-        proj = proj_rms * k_scale
-
-        v = self.v_proj(v_in)
-        v = torch.sigmoid(v) * self.v_sigmoid_scale
-
-        # X <- X + beta * k * (v^T - k^T X)
-        delta_row = (beta * (v - proj)) * k_scale # fp32 (B, T, d_v)
-        update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2) # (B, T, d, d_v)
-        return x + update
+        if num_embedders == 6:
+            primes = [754573, 754627, 754703, 754771, 754829, 754891]
+            print("Using fixed prime vocab sizes for N-gram embedders.")
+        
+        for i in range(num_embedders):
+            if num_embedders == 6:
+                vocab_size = primes[i]
+            else:
+                vocab_size = int(self.m + i * 2 + 1)
+            emb = nn.Embedding(vocab_size, emb_dim, padding_idx=self.config.pad_token_id)
+            proj = DragonLinear(self.config, emb_dim, self.config.hidden_size, bias=False)
+            embedders.append(emb)
+            post_projs.append(proj)
+        
+        self.embedders = nn.ModuleList(embedders)
+        self.post_projs = nn.ModuleList(post_projs)
+    
+    def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int, eos_token_id: int = 2) -> torch.Tensor:
+        """Shift tensor right by n positions, resetting at EOS tokens."""
+        batch_size, seq_len = tensor.shape
+        result = torch.zeros_like(tensor)
+        eos_mask = (tensor == eos_token_id)
+        
+        for i in range(batch_size):
+            eos_positions = eos_mask[i].nonzero(as_tuple=True)[0]
+            prev_idx = 0
+            
+            for eos_idx in eos_positions:
+                end_idx = eos_idx.item() + 1
+                if end_idx - prev_idx > n:
+                    result[i, prev_idx+n:end_idx] = tensor[i, prev_idx:end_idx-n]
+                prev_idx = end_idx
+            
+            if prev_idx < seq_len and seq_len - prev_idx > n:
+                result[i, prev_idx+n:seq_len] = tensor[i, prev_idx:seq_len-n]
+        
+        return result
+    
+    def _precompute_vocab_mods(self) -> Dict[Tuple[int, int], List[int]]:
+        """Precompute modular arithmetic values for vocabulary."""
+        if self._vocab_mods_cache is not None:
+            return self._vocab_mods_cache
+        
+        vocab_mods = {}
+        vocab_size = self.config.vocab_size
+        
+        for i in range(2, self.n + 1):
+            for j in range(self.k):
+                index = (i - 2) * self.k + j
+                emb_vocab_dim = int(self.m + index * 2 + 1)
+                
+                mods = []
+                power_mod = 1
+                for _ in range(i - 1):
+                    power_mod = (power_mod * vocab_size) % emb_vocab_dim
+                    mods.append(power_mod)
+                
+                vocab_mods[(i, j)] = mods
+        
+        self._vocab_mods_cache = vocab_mods
+        return vocab_mods
+    
+    def _get_ngram_ids(
+        self, 
+        input_ids: torch.Tensor, 
+        shifted_ids: Dict[int, torch.Tensor], 
+        vocab_mods: List[int], 
+        ngram: int
+    ) -> torch.Tensor:
+        """Compute N-gram hash IDs using polynomial rolling hash."""
+        ngram_ids = input_ids.clone()
+        for k in range(2, ngram + 1):
+            ngram_ids = ngram_ids + shifted_ids[k] * vocab_mods[k - 2]
+        return ngram_ids
+    
+    def forward(
+        self, 
+        input_ids: torch.Tensor, 
+        ngram_context: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Stateless forward pass.
+        
+        Args:
+            input_ids: Current input token IDs of shape (batch_size, seq_len)
+            ngram_context: Optional historical context of shape (batch_size, context_len)
+            
+        Returns:
+            Embedding tensor of shape (batch_size, seq_len, hidden_size)
+        """
+        seq_len = input_ids.size(-1)
+        
+        # Determine complete context
+        if ngram_context is not None:
+            context = torch.cat([ngram_context[..., -(self.n-1):], input_ids], dim=-1)
+        else:
+            context = input_ids
+        
+        # Base word embeddings
+        device = self.word_embeddings.weight.device
+        x = self.word_embeddings(input_ids.to(device)).clone()
+        
+        # Precompute modular values
+        vocab_mods = self._precompute_vocab_mods()
+        
+        # Compute shifted IDs
+        shifted_ids = {}
+        for i in range(2, self.n + 1):
+            shifted_ids[i] = self._shift_right_ignore_eos(
+                context, i - 1, eos_token_id=50256
+            )
+        
+        # Add N-gram embeddings
+        for i in range(2, self.n + 1):
+            for j in range(self.k):
+                index = (i - 2) * self.k + j
+                emb_vocab_dim = int(self.m + index * 2 + 1)
+                
+                ngram_ids = self._get_ngram_ids(context, shifted_ids, vocab_mods[(i, j)], ngram=i)
+                new_ids = (ngram_ids % emb_vocab_dim)[..., -seq_len:]
+                
+                embedder_device = self.embedders[index].weight.device
+                x_ngram = self.embedders[index](new_ids.to(embedder_device))
+                
+                proj_device = self.post_projs[index].weight.device
+                x_proj = self.post_projs[index](x_ngram.to(proj_device))
+                x = x + x_proj.to(x.device)
+        
+        # Normalize
+        x = x / (1 + self.k * (self.n - 1))
+        
+        return x
 
 class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd', use_stem=False):
@@ -3759,6 +4094,10 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         elif self.config.ddl_type == 'expanded':
             self.ddl_attn = DeepDeltaResidualExpanded(config)
             self.ddl_mlp = DeepDeltaResidualExpanded(config)
+        elif self.config.ddl_type == 'ec':
+            self.compress = ResidualShortConvCompressor(config)
+            self.ddl_attn = DeepDeltaResidualExpanded(config)
+            self.ddl_mlp = DeepDeltaResidualExpanded(config)
 
         if not config.moe or mlp_type == 'd':
             if not use_stem:
@@ -3807,7 +4146,10 @@ class DragonMonoBlock(GradientCheckpointingLayer):
     ):
         # MIXER.
         residual = hidden_states
-        hidden_states = self.lns * self.input_norm(hidden_states) # (B, L, D)
+        x_in = hidden_states
+        if self.config.ddl_type == 'ec':
+            x_in = self.compress(residual)
+        hidden_states = self.lns * self.input_norm(x_in) # (B, L, D)
         y_mixer, last_key_states, last_value_states = self.mixer(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -3833,18 +4175,21 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
         y_mixer = self.mixer_proj(y_mixer)
 
-        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded':
-            hidden_states = self.ddl_attn(residual, k_in=y_mixer, context=hidden_states)
+        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
+            hidden_states = self.ddl_attn(residual, k_in=y_mixer, v_in=x_in, context=hidden_states)
         else:
             hidden_states = self.b * residual + self.a * y_mixer
 
         # MLP.
         residual = hidden_states
-        hidden_states = self.lns * self.postmixer_norm(hidden_states)
+        x_in = hidden_states
+        if self.config.ddl_type == 'ec':
+            x_in = self.compress(residual)
+        hidden_states = self.lns * self.postmixer_norm(x_in)
         y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
 
-        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded':
-            hidden_states = self.ddl_mlp(residual, k_in=y_mlp, context=hidden_states)
+        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
+            hidden_states = self.ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states)
         else:
             hidden_states = self.b * residual + self.a * y_mlp
 
@@ -3914,11 +4259,20 @@ class DragonCausalLMOutput(ModelOutput):
 class DragonModel(DragonPreTrainedModel):
     def __init__(self, config: DragonConfig):
         super().__init__(config)
-        self.config = config
+        self.config: DragonConfig = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        if self.config.ngram_embeddings:
+            self.embedding = DragonNgramEmbedding(config, self.embedding)
+            
+        if self.config.ddl_type == 'ec':
+            self.input_conv = InputEmbedShortConvExpander(config)
+            self.readout = ResidualShortConvCompressor(config)
+            
+            self.input_conv.reset_parameters_identity()
+
         if self.config.vwn:
             self.hidden_size_expanded = int(config.vwn_n/config.vwn_m * config.hidden_size)
             self.expand_embedding = DragonLinear(config, config.hidden_size, self.hidden_size_expanded, bias=False)
@@ -4018,9 +4372,15 @@ class DragonModel(DragonPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.embedding(input_ids)
+            if not self.config.ngram_embeddings:
+                inputs_embeds = self.embedding(input_ids)
+            else:
+                inputs_embeds = self.embedding(input_ids, ngram_context=None)
         if self.config.vwn:
             inputs_embeds = self.expand_embedding(inputs_embeds) # (B, L, D')
+            
+        if self.config.ddl_type == 'ec':
+            inputs_embeds, embed_state_out = self.input_conv.forward_with_past(inputs_embeds, past=None)
 
         if self.config.patch_level_training:
             # (B, KL, D) => (B, L, D) OR (B, L, D) ==> (B, L//K, D)
@@ -4098,6 +4458,9 @@ class DragonModel(DragonPreTrainedModel):
                 B, L, D = hidden_states.shape
                 hidden_states = self.gn(hidden_states.reshape(-1, D)).view(B, L, D)
             hidden_states = self.reduce_h(hidden_states) # back to (B, L, D)
+            
+        if self.config.ddl_type == 'ec':
+            hidden_states, _ = self.readout.forward_with_past(hidden_states, past=None)
 
         if self.config.final_norm:
             hidden_states = self.final_norm(hidden_states)

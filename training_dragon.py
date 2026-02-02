@@ -83,6 +83,10 @@ class NanoArgs:
     layers_ve_config: str = ""
     layers_stem_config: str = ""
     ddl_type: str = "" # "", vdim1, extended
+    ngram_embeddings: bool = False
+    ngram_embeddings_neighbor: int = 4
+    ngram_embeddings_channels: int = 4
+    ngram_embeddings_ratio: int = 15
 
     # MoE
     moe: bool = False
@@ -146,13 +150,14 @@ class NanoArgs:
 
     # optim
     seed: int = 123456789
-    optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus
+    optim: str = "adamw" # adamw, spam, stable-spam, muon, muon_moonlight, splus, adamh, ademamixh
     second_order_optim : Optional[str] = None # snoo
     batch_size: int = 8*64 # batch size, in sequences, across all devices
     device_batch_size: int = 64 # batch size, in sequences, per device
     total_iterations: int = 1000 # number of iterations to run
     learning_rate: float = 1e-4
     wd_emb: bool = False
+    wd_ngram: bool = False
     weight_decay: float = 0.
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -181,6 +186,7 @@ class NanoArgs:
     learning_rate_scalar: float = 1e-4
     learning_rate_embed: float = 1e-4
     learning_rate_head: float = 1e-4
+    learning_rate_expert: Optional[float] = None
     base_batch_size: int = 0
     base_dataset_size: int = 0
     base_width: int = 0
@@ -640,7 +646,7 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
 
     return hidden_groups, other_groups
 
-def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, dataset_size_base, width, width_base, depth, depth_base, routed_experts, routed_experts_base, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, base_wd, base_eps, wd_other, alpha_complete_p, experts_scaling):
+def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, dataset_size_base, width, width_base, depth, depth_base, routed_experts, routed_experts_base, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, base_lr_expert, base_wd, base_eps, wd_other, wd_emb, wd_ngram, alpha_complete_p, experts_scaling):
     groups, seen = [], set()
     id2name = {id(p): n for n, p in model.named_parameters()}
 
@@ -713,6 +719,13 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
             scale_wd = rho_adjusted
             if not wd_other:
                 scale_wd = 0.0
+            if wd_emb:
+                scale_wd = rho_adjusted
+            if "embedding.embedders" in pname:
+                if wd_ngram:
+                    scale_wd = rho_adjusted
+                else:
+                    scale_wd = 0.0
             scale_eps = ((width_adjusted) ** (-1)) * 1/rho_adjusted
         elif "final_norm" in pname:
             base_lr = base_lr_scalar
@@ -722,7 +735,7 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
                 scale_wd = 0.0
             scale_eps = 1/rho_adjusted
         elif "experts.weight" in pname:
-            base_lr = base_lr_hidden
+            base_lr = base_lr_expert
             scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted * routed_experts_adjusted
             scale_wd = (width_adjusted) * rho_adjusted / routed_experts_adjusted
             scale_eps = (width_adjusted ** (-1)) * (depth_adjusted ** (-alpha_complete_p)) * 1/rho_adjusted * routed_experts_adjusted
@@ -747,6 +760,50 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
         print(f"param {name} | hidden {False} | shape {p.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
 
     return groups
+
+def param_groups_hyperball(model, base_lr_hidden, base_lr_scalar, base_lr_embed):
+    adamh_groups, adam_groups = [], []
+    seen = set()
+    id2name = {id(p): n for n, p in model.named_parameters()}
+
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and getattr(mod, "weight", None) is not None:
+            w = mod.weight
+            if id(w) not in seen:
+                adamh_groups.append({"params": [w], "lr": base_lr_hidden})
+                seen.add(id(w))
+                print(f"AdamH  {mod_name}.weight | shape {tuple(w.shape)} | lr={base_lr_hidden}")
+
+            if mod.bias is not None:
+                b = mod.bias
+                if id(b) not in seen:
+                    adam_groups.append({"params": [b], "lr": base_lr_scalar, "weight_decay": 0.0})
+                    seen.add(id(b))
+                    print(f"Adam   {mod_name}.bias  | shape {tuple(b.shape)} | lr={base_lr_scalar} | wd=0")
+
+    for name, p in model.named_parameters():
+        if id(p) in seen:
+            continue
+
+        pname = id2name.get(id(p), name)
+
+        if "embedding" in pname:
+            lr = base_lr_embed
+            adam_groups.append({"params": [p], "lr": lr, "weight_decay": 0.0})
+            print(f"Adam   {pname} | shape {tuple(p.shape)} | lr={lr} | wd=0")
+        elif "experts.weight" in pname:
+            lr = base_lr_hidden
+            assert p.ndim >= 2, f"experts.weight should be >=2D, got {tuple(p.shape)}"
+            adamh_groups.append({"params": [p], "lr": lr})
+            print(f"AdamH  {pname} | shape {tuple(p.shape)} | lr={lr}")
+        else:
+            lr = base_lr_scalar
+            adam_groups.append({"params": [p], "lr": lr, "weight_decay": 0.0})
+            print(f"Adam   {pname} | shape {tuple(p.shape)} | lr={lr} | wd=0")
+
+        seen.add(id(p))
+
+    return adamh_groups, adam_groups
 
 args: NanoArgs = tyro.cli(NanoArgs)
 
@@ -897,6 +954,10 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    ngram_embeddings=args.ngram_embeddings,
+    ngram_embeddings_neighbor=args.ngram_embeddings_neighbor,
+    ngram_embeddings_channels=args.ngram_embeddings_channels,
+    ngram_embeddings_ratio=args.ngram_embeddings_ratio,
     ddl_type=args.ddl_type,
     base_depth=args.base_depth,
     completed_p_alpha=args.completed_p_alpha,
@@ -1042,7 +1103,7 @@ if args.intra_doc_masking:
     print0("It is only compatible with GDN (conv+chunk), KDA (conv+chunk), standard attention, DA, GDTPA layers. For DA/GDTPA, kv shift is also compatible. All other config will not have intra-doc masking support!!")
 
 # init model properly
-if resume_dir is None and args.use_completed_p:
+if resume_dir is None and (args.use_completed_p or args.optim == "adamh" or args.optim == "ademamixh"):
     with torch.no_grad():
         groups, seen = [], set()
         id2name = {id(p): n for n, p in model.named_parameters()}
@@ -1150,9 +1211,12 @@ elif args.use_completed_p:
         base_lr_scalar=args.learning_rate_scalar,
         base_lr_embed=args.learning_rate_embed,
         base_lr_head=args.learning_rate_head,
+        base_lr_expert=args.learning_rate_expert if args.learning_rate_expert is not None else args.learning_rate,
         base_wd=args.weight_decay,
         base_eps=args.adam_eps,
         wd_other=args.completed_p_wd_other,
+        wd_emb=args.wd_emb,
+        wd_ngram=args.wd_ngram,
         alpha_complete_p=args.completed_p_alpha,
         experts_scaling=args.completed_p_experts_scaling,
     )
@@ -1183,6 +1247,37 @@ else:
             eps=args.adam_eps,
             foreach=False,
         )
+    elif args.optim == "adamh":
+        print("Using AdamH optimizer..")
+        from .optimizers.adamh import AdamH
+        adamh_groups, adam_groups = param_groups_hyperball(
+            raw_model,
+            base_lr_hidden=args.learning_rate,
+            base_lr_scalar=args.learning_rate_scalar,
+            base_lr_embed=args.learning_rate_embed,
+        )
+        h_ids = {id(p) for g in adamh_groups for p in g["params"]}
+        a_ids = {id(p) for g in adam_groups  for p in g["params"]}
+        assert h_ids.isdisjoint(a_ids), "Some params are in both AdamH and Adam groups"
+        optim1 = AdamH(adamh_groups, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+        optim2 = torch.optim.Adam(adam_groups, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps) # no WD anyway here
+    elif args.optim == "ademamixh":
+        print("Using AdemamixH optimizer..")
+        from .optimizers.Ademamix import AdEMAMix
+        from .optimizers.ademamixh import AdEMAMixH
+        adamh_groups, adam_groups = param_groups_hyperball(
+            raw_model,
+            base_lr_hidden=args.learning_rate,
+            base_lr_scalar=args.learning_rate_scalar,
+            base_lr_embed=args.learning_rate_embed,
+        )
+        h_ids = {id(p) for g in adamh_groups for p in g["params"]}
+        a_ids = {id(p) for g in adam_groups  for p in g["params"]}
+        assert h_ids.isdisjoint(a_ids), "Some params are in both AdamH and Adam groups"
+        beta3_warmup = args.total_iterations
+        alpha_warmup = args.total_iterations
+        optim1 = AdEMAMixH(adamh_groups, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2, 0.999), beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, eps=args.adam_eps)
+        optim2 = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2, 0.999), beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
     elif args.optim == "ademamix":
         from .optimizers.Ademamix import AdEMAMix
 
@@ -1192,7 +1287,7 @@ else:
     else:
         raise ValueError(f"Unknown Optimizer: {args.optim}")
 
-if args.optim != "muon" and args.optim != "muon_modded" and args.optim != "normuon":
+if args.optim != "muon" and args.optim != "muon_modded" and args.optim != "normuon" and args.optim != "adamh" and args.optim != "ademamixh":
     optimizers = [optimizer]
 else:
     optimizers = [optim1, optim2]
@@ -1236,7 +1331,8 @@ def print_params_stats_and_hparams(model, optimizer, *, max_name=80, only_traina
         print0(f"{nm:{max_name}}  {shp:>16}  {str(p.dtype):>10}  {str(p.device):>10}  "
               f"{mean:12.5e}  {std:12.5e}  {lr:10.3e}  {wd:10.3e}  {eps:10.3e}  {gi:4d}")
 
-print_params_stats_and_hparams(raw_model, optimizer)
+for opt in optimizers:
+    print_params_stats_and_hparams(raw_model, opt)
 
 if args.second_order_optim == "snoo":
     from .optimizers.Snoo import Snoo
