@@ -4,6 +4,7 @@
 from typing import Any, Dict, Optional, Tuple, Union, List, Literal
 from dataclasses import dataclass
 import inspect
+from contextlib import nullcontext
 
 import math
 from einops import rearrange, repeat
@@ -39,6 +40,12 @@ try:
 except ImportError as exc:
     print("Warning: No Mamba-3 found !")
     mamba_chunk_scan_discretized_combined, angle_dt, rotary_qk = None, None, None
+
+try:
+    from dragon_mamba3_fast.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
+    from dragon_mamba3_fast.angle_cumsum import angle_dt
+except ImportError:
+    print("dragon_mamba3_fast not found")
 
 try:
     import scattermoe
@@ -309,6 +316,8 @@ class HybridDragonDynamicCache(DynamicCache):
         self.conv_states = []
         self.prev_hs = []
         self.has_previous_state = False
+        # mamba3 (naive prefix replay cache): stores (B, T_seen, D) per layer
+        self.mamba3_hs = [None for _ in range(len(config.layers_config))]
 
         for idx, layer_type in enumerate(config.layers_config):
             if not layer_type == "r":
@@ -2734,13 +2743,13 @@ class DragonGatedDeltaNet(nn.Module):
             if cache_params is not None:
                 conv_cache = cache_params.conv_caches[self.layer_idx]
 
-            if use_precomputed_states:
+            if use_precomputed_states and conv_cache is not None:
                 mixed_qkv = self.causal_conv1d_update(
-                    mixed_qkv,
-                    conv_cache,
-                    self.qkv_conv1d.weight.squeeze(1),
-                    self.qkv_conv1d.bias,
-                    'silu',
+                    x=mixed_qkv,
+                    conv_state=conv_cache,
+                    weight=self.qkv_conv1d.weight.squeeze(1),
+                    bias=self.qkv_conv1d.bias,
+                    activation='silu',
                 ) # conv_cache is updated in-place here
             else:
                 if cache_params is not None:
@@ -3432,6 +3441,205 @@ class DragonMamba3Mimo(nn.Module):
             y = y[:, cached_len:, :] # keep only the new Ln steps
 
         return y, None, None
+    
+class DragonMamba3MimoFast(nn.Module):
+    def __init__(self, config: DragonConfig, layer_idx: int, use_ve: bool = False):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.d_model = config.hidden_size
+        self.d_inner = 2*self.d_model
+        self.rope_fraction = 0.5
+        self.rotary_dim_divisor = 4
+        self.A_floor = 1e-4
+        self.mimo_dim = config.mamba_mimo_dim
+        self.d_state = config.mamba_d_state
+        self.headdim = config.mamba_headdim
+        self.ngroups = config.mamba_ngroups
+        self.mimo_proj_block_order = 1
+        
+        self.nheads = self.d_inner // self.headdim
+        self.dr_out_dim = self.d_inner // self.mimo_proj_block_order
+        self.chunk_size = 64 // self.mimo_dim
+
+        self.split_tensor_size = int(self.d_state * self.rope_fraction)
+        if self.split_tensor_size % 2 != 0:
+            self.split_tensor_size -= 1
+        self.num_rope_angles = self.split_tensor_size // 2
+
+        tp_size = 1
+
+        # Ensure that each TP rank gets at least one head:
+        assert self.nheads % tp_size == 0, "nheads must be evenly divisble by tp_size"
+        self.nheads_per_group = self.nheads // self.ngroups
+        self.nheads_local_tp = self.nheads // tp_size
+
+        # Note that we do not need to confirm that `d_inner % tp_size == 0` because
+        # `d_inner % headdim == 0`, `nheads = d_inner // headdim`, and `nheads % tp_size == 0`
+        self.d_inner_per_group = self.d_inner // self.ngroups
+        self.d_inner_local_tp = self.d_inner // tp_size
+        self.dr_out_dim_local_tp = self.dr_out_dim // tp_size
+
+        # Ensure that each TP rank gets at least one group:
+        assert self.ngroups % tp_size == 0, "ngroups must be evenly divisible by tp_size"
+        self.ngroups_local_tp = self.ngroups // tp_size
+
+        # Ensure that each group has a positive integer number of heads:
+        assert self.nheads % self.ngroups == 0, "nheads must be evenly divisible by ngroups"
+
+        # Assume sequence parallelism: input is already partitioned along the sequence dimension
+        self.in_proj = DragonLinear(
+            config,
+            self.d_model,
+            self.d_inner * 2 + 2 * self.ngroups * self.d_state * self.mimo_dim + 3 * self.nheads,
+            bias=False,
+        )
+        self.rope_proj = DragonLinear(
+            config,
+            self.d_model,
+            self.num_rope_angles,
+            bias=False,
+        )
+
+        self.B_bias = nn.Parameter(torch.ones((self.nheads_local_tp, self.mimo_dim, self.d_state), dtype=torch.float32), requires_grad=True)
+        self.C_bias = nn.Parameter(torch.ones((self.nheads_local_tp, self.mimo_dim, self.d_state), dtype=torch.float32), requires_grad=True)
+        self.B_norm = DragonNorm(config, self.d_state)
+        self.C_norm = DragonNorm(config, self.d_state)
+
+        # Initialize up/down MIMO projection (for x and z)
+        in_proj_mimo_x_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)/self.mimo_dim
+        in_proj_mimo_z_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)
+        out_proj_mimo_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)/self.mimo_dim
+        self.in_proj_mimo_x = nn.Parameter(in_proj_mimo_x_init_weights, requires_grad=True)
+        self.in_proj_mimo_z = nn.Parameter(in_proj_mimo_z_init_weights, requires_grad=True)
+        self.out_proj_mimo = nn.Parameter(out_proj_mimo_init_weights, requires_grad=True)
+
+        with nullcontext():
+            dt_min = 0.001
+            dt_max = 0.1
+            dt_init_floor = 1e-4
+            # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+            dt = torch.exp(
+                torch.rand(
+                    self.nheads_local_tp,
+                    device=torch.cuda.current_device(),
+                )
+                * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            ).clamp(min=dt_init_floor)
+            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+            inv_dt = dt + torch.log(-torch.expm1(-dt))
+            self.dt_bias = nn.Parameter(inv_dt)
+            # Our initialization would set all Linear.bias to zero,
+            # need to mark this one as _no_reinit
+            self.dt_bias._no_reinit = True
+            # Just to be explicit. Without this we already don't
+            # put wd on dt_bias because of the check
+            # name.endswith("bias") in param_grouping.py
+            self.dt_bias._no_weight_decay = True
+
+        # D "skip" parameter
+        self.D = nn.Parameter(torch.ones(self.nheads_local_tp, device=torch.cuda.current_device())) # Keep in fp32
+        self.D._no_weight_decay = True # useless flag
+
+        self.output_norm = DragonNorm(config, self.d_inner_local_tp)
+
+    def forward(self, hidden_states, cache_params: Optional[HybridDragonDynamicCache] = None, **kwargs):
+        """
+        hidden_states: (nL, B, D) / (L B D)
+        Returns: same shape as hidden_states
+        """
+
+        layer_idx = self.layer_idx
+        L_new = hidden_states.size(1)
+        if cache_params is not None:
+            prev = cache_params.mamba3_hs[layer_idx]  # (B, T_prev, D) or None
+            if prev is None:
+                hidden_full = hidden_states
+            else:
+                hidden_full = torch.cat([prev, hidden_states], dim=1)
+
+            # Save full prefix for next step (detach to avoid holding graphs)
+            cache_params.mamba3_hs[layer_idx] = hidden_full.detach()
+            cache_params.past_length[layer_idx] += L_new
+            cache_params.has_previous_state = True
+        else:
+            hidden_full = hidden_states
+
+        # Input projection
+        zxBCdtAtrap = self.in_proj(hidden_full)
+        zxBCdtAtrap = rearrange(zxBCdtAtrap, "b l (G D) -> b l G D", G=self.ngroups_local_tp)
+        # split per group: [B, L, G_local, D_group]
+        z = zxBCdtAtrap[..., 0:self.d_inner_per_group]; accum = self.d_inner_per_group
+        x = zxBCdtAtrap[..., accum:accum+self.d_inner_per_group]; accum += self.d_inner_per_group
+        B = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
+        C = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
+        dt = zxBCdtAtrap[..., accum:accum+self.nheads_per_group]; accum += self.nheads_per_group
+        A = zxBCdtAtrap[..., accum:accum+self.nheads_per_group]; accum += self.nheads_per_group
+        trap = zxBCdtAtrap[..., accum:accum+2*self.nheads_per_group]
+        z = rearrange(z, "b l G (h p) -> b l (G h) p", p=self.headdim)
+        x = rearrange(x, "b l G (h p) -> b l (G h) p", p=self.headdim)
+        B = rearrange(B, "b l G (r n) -> b l r G n", r=self.mimo_dim)
+        C = rearrange(C, "b l G (r n) -> b l r G n", r=self.mimo_dim)
+        dt = rearrange(dt, "b l G n -> b l (G n)").to(torch.float32)
+        A = rearrange(A, "b l G n -> b l (G n)")
+        trap = rearrange(trap, "b l G n -> b (G n) l")
+
+        _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
+        _A = torch.clamp(_A, max=-self.A_floor)
+        dt = F.softplus(dt + self.dt_bias) # (B, L, N)
+        ADT = _A * dt
+
+        B = self.B_norm(B)
+        C = self.C_norm(C)
+
+        if self.ngroups != self.nheads:
+            n_repeat = self.nheads_local_tp // self.ngroups_local_tp
+            assert self.nheads_local_tp % self.ngroups_local_tp == 0
+            B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
+            C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
+
+        angle = self.rope_proj(hidden_full) # (B, L, S)
+        angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
+        angle = angle_dt(angle, dt)
+
+        dt = rearrange(dt, "b l n -> b n l")
+        ADT = rearrange(ADT, "b l n -> b n l")
+        y = mamba3_tilelang(
+            Q=C.contiguous(),
+            K=B.contiguous(),
+            V=x.contiguous(),
+            ADT=ADT.to(torch.float32).contiguous(),
+            DT=dt.to(torch.float32).contiguous(),
+            Trap=trap.contiguous(),
+            Q_bias=self.C_bias.to(torch.float32),
+            K_bias=self.B_bias.to(torch.float32),
+            MIMO_V=self.in_proj_mimo_x.to(torch.float32),
+            MIMO_Z=self.in_proj_mimo_z.to(torch.float32),
+            MIMO_Out=self.out_proj_mimo.to(torch.float32),
+            Angles=angle.to(torch.float32).contiguous(),
+            D=self.D.to(torch.float32).contiguous(),
+            Z=z.contiguous(),
+            chunk_size=self.chunk_size,
+            rotary_dim_divisor=self.rotary_dim_divisor,
+            dtype=x.dtype,
+        )
+
+        y = rearrange(y, "b l h p -> b l (h p)")
+        y = self.output_norm(y)
+        y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads_local_tp)
+        
+        if cache_params is not None:
+            y = y[:, -L_new:, ...].contiguous()
+
+        return y, None, None
 
 class DragonMLP(nn.Module):
     def __init__(self, config: DragonConfig, intermediate_size: Optional[int] = None):
@@ -3601,7 +3809,7 @@ class DeepDeltaResidualExpanded(nn.Module):
             else:
                 self.beta_out.bias.fill_(_logit(beta_init_p))
 
-    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, v_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, v_in: torch.Tensor, context: torch.Tensor, scalar: torch.Tensor) -> torch.Tensor:
         # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
         # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
         k_dim = int(k_in.size(-1))
@@ -3630,7 +3838,7 @@ class DeepDeltaResidualExpanded(nn.Module):
         # X <- X + beta * k * (v^T - k^T X)
         delta_row = (beta * (v - proj)) * k_scale  # fp32 (B, T, d_v)
         update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2)  # (B, T, d, d_v)
-        return x + update
+        return x + scalar * update
     
 ActivationName = Literal["silu", "relu", "elu+1", "identity"]
 _ACTIVATION_NAMES: set[str] = {"silu", "relu", "elu+1", "identity"}
@@ -3644,44 +3852,34 @@ def apply_activation(x: torch.Tensor, activation: str | None) -> torch.Tensor:
     if activation == "elu+1":
         return (F.elu(x, 1.0, False) + 1.0).to(dtype=x.dtype)
     raise ValueError(f"Unsupported activation {activation!r}. Expected one of: {sorted(_ACTIVATION_NAMES)!r}.")
-    
+
 class DepthwiseShortConv1d(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        *,
-        kernel_size: int,
-        activation: ActivationName | None = None,
-        shift_right1: bool = False,
-    ) -> None:
+    def __init__(self, hidden_size: int, *, kernel_size: int, activation: ActivationName | None = None, shift_right1: bool = False) -> None:
         super().__init__()
         self.kernel_size = int(kernel_size)
         if self.kernel_size <= 0:
             raise ValueError(f"kernel_size must be positive, got {self.kernel_size}.")
         self.activation = activation
         self.shift_right1 = bool(shift_right1)
-        self.conv = nn.Conv1d(
-            hidden_size,
-            hidden_size,
-            kernel_size=self.kernel_size,
-            padding=0,
-            groups=hidden_size,
-            bias=False,
-        )
+        self.weight = nn.Parameter(torch.empty(hidden_size, self.kernel_size))
+        bound = 1 / math.sqrt(self.kernel_size) 
+        nn.init.uniform_(self.weight, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2).contiguous()  # (B, C, T)
-        pad_left = self.kernel_size - 1 + (1 if self.shift_right1 else 0)
-        x = F.pad(x, (pad_left, 0)).contiguous()
-        x = self.conv(x)
+        # pad_left = self.kernel_size - 1 + (1 if self.shift_right1 else 0)
         if self.shift_right1:
-            x = x[:, :, :-1]
+            # x = F.pad(x, (self.kernel_size, 0)).contiguous()
+            x = F.pad(x, (1, 0)).contiguous()
+            x = causal_conv1d_fn(x, weight=self.weight)[:, :, :-1]
+        else:
+            x = causal_conv1d_fn(x, weight=self.weight)
         if x.device.type == "mps":
             x = _Transpose12Contiguous.apply(x)
         else:
             x = x.transpose(1, 2).contiguous()  # (B, T, C)
         return apply_activation(x, self.activation)
-    
+
 class InputEmbedShortConvExpander(nn.Module):
     def __init__(self, config: DragonConfig) -> None:
         super().__init__()
@@ -3753,25 +3951,25 @@ class InputEmbedShortConvExpander(nn.Module):
         return expanded, past_out
 
 class ResidualShortConvCompressor(nn.Module):
-    def __init__(self, config: DragonConfig):
+    def __init__(self, config):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.value_channels = 4
+        self.hidden_size = int(config.hidden_size)
+        self.value_channels = int(getattr(config, "ddl_value_channels", 4))
         if self.value_channels <= 1:
             raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
         self.residual_size = self.hidden_size * self.value_channels
 
-        kernel_size = 4
+        kernel_size = int(getattr(config, "ddl_state_shortconv_kernel_size", 4))
         self.shortconv = DepthwiseShortConv1d(self.residual_size, kernel_size=kernel_size)
 
-        read_init_raw = None
+        read_init_raw = getattr(config, "ddl_state_read_init", None)
         if read_init_raw is None:
             read_init = 1.0 / float(self.value_channels)
         else:
             read_init = float(read_init_raw)
         self.read = nn.Parameter(torch.full((self.value_channels,), read_init))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_past: bool = False) -> torch.Tensor:
         # x: (B, T, d, d_v)
         B, T, d, dv = x.shape
         if d != self.hidden_size:
@@ -3781,12 +3979,18 @@ class ResidualShortConvCompressor(nn.Module):
 
         x_flat = x.reshape(B, T, self.residual_size)
         x_conv = self.shortconv(x_flat).reshape(B, T, d, dv)
-        return torch.sum(x_conv * self.read, dim=-1)
+        if return_past:
+            past = x_flat.transpose(1, 2)[:, :, -(self.shortconv.kernel_size - 1):].contiguous()
+            return torch.sum(x_conv * self.read, dim=-1), past
+        else:
+            return torch.sum(x_conv * self.read, dim=-1)
 
     def forward_with_past(
         self, x: torch.Tensor, *, past: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # past: (B, C, k-1) where C = hidden_size * value_channels
+        if past is None:
+            return self.forward(x, return_past=True)
         B, T, d, dv = x.shape
         if d != self.hidden_size:
             raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
@@ -3815,9 +4019,8 @@ class ResidualShortConvCompressor(nn.Module):
             raise ValueError(f"Expected past with shape (B, C, {past_len}), got {tuple(past.shape)}")
 
         x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, C, past_len+T)
-        weight = self.shortconv.conv.weight
+        weight = self.shortconv.weight.unsqueeze(1)
         y = F.conv1d(x_cat, weight, bias=None, stride=1, padding=0, groups=self.residual_size)  # (B, C, T)
-
         y_bt = y.transpose(1, 2).contiguous()  # (B, T, C)
         y_bt = apply_activation(y_bt, getattr(self.shortconv, "activation", None))
         y = y_bt.reshape(B, T, d, dv)
@@ -4043,8 +4246,13 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
             use_gate = config.gate_gdn
-        elif layer_type == 'M':
+        elif layer_type == '_':
             self.mixer = DragonMamba3Mimo(config, layer_idx=layer_idx, use_ve=use_ve)
+            head_dim = self.mixer.headdim
+            num_attention_heads = self.mixer.nheads
+            use_gate = False # inside Mamba3Mimo
+        elif layer_type == 'M':
+            self.mixer = DragonMamba3MimoFast(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
             use_gate = False # inside Mamba3Mimo
@@ -4176,7 +4384,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         y_mixer = self.mixer_proj(y_mixer)
 
         if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
-            hidden_states = self.ddl_attn(residual, k_in=y_mixer, v_in=x_in, context=hidden_states)
+            hidden_states = self.ddl_attn(residual, k_in=y_mixer, v_in=x_in, context=hidden_states, scalar=self.a)
         else:
             hidden_states = self.b * residual + self.a * y_mixer
 
@@ -4189,7 +4397,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
 
         if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
-            hidden_states = self.ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states)
+            hidden_states = self.ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states, scalar=self.a)
         else:
             hidden_states = self.b * residual + self.a * y_mlp
 
