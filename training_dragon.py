@@ -136,7 +136,7 @@ class NanoArgs:
     shrink_qk_gdn: int = 2
     kda_allow_neg_eigval: bool = False
     kda_num_v_heads: Optional[int] = None
-    mamba_mimo_dim: Optional[int] = 2
+    mamba_mimo_dim: Optional[int] = 4
     mamba_ngroups: Optional[int] = 1
     mamba_d_state: int = 128
     mamba_headdim: int = 64
@@ -147,6 +147,7 @@ class NanoArgs:
     mamba3_is_A_dd: bool = True
     mamba3_add_trapezoid: bool = True
     mamba3_postgate_norm: bool = False # only works if legacy_gate is True!!
+    mamba3_derf: bool = False
 
     # optim
     seed: int = 123456789
@@ -967,7 +968,6 @@ config_hf = DragonConfig(
     layers_ve_config=args.layers_ve_config,
     use_value_embedding=args.use_value_embedding,
     reduce_lm_head=args.reduce_lm_head,
-    dataset_type=args.dataset_type,
     vwn=args.vwn,
     vwn_m=args.vwn_m,
     vwn_n=args.vwn_n,
@@ -986,6 +986,7 @@ config_hf = DragonConfig(
     mamba3_is_A_dd=args.mamba3_is_A_dd,
     mamba3_add_trapezoid=args.mamba3_add_trapezoid,
     mamba3_postgate_norm=args.mamba3_postgate_norm,
+    mamba3_derf=args.mamba3_derf,
     moe=args.moe,
     moe_router_type=args.moe_router_type,
     moe_num_routed_experts=args.moe_num_routed_experts,

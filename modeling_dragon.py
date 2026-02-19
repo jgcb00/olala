@@ -246,6 +246,22 @@ class DragonLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         return F.layer_norm(x.float(), (self.hidden_size,), self.weight, self.bias, self.eps).type_as(x)
 
+class DragonDeRF(nn.Module):
+    def __init__(self, config: DragonConfig, normalized_shape, alpha_init_value=0.5, shift_init_value=0.0):
+        super().__init__()
+        self.config = config
+        self.normalized_shape = normalized_shape
+        self.alpha_init_value = alpha_init_value
+        self.shift_init_value = shift_init_value
+
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.shift = nn.Parameter(torch.ones(1) * shift_init_value)
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+
+    def forward(self, x):
+        return self.weight * torch.erf(self.alpha * x + self.shift) + self.bias
+
 class ScaledGrad(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, forward_scale, backward_scale):
@@ -3480,6 +3496,7 @@ class DragonMamba3MimoFast(nn.Module):
         assert self.nheads % tp_size == 0, "nheads must be evenly divisble by tp_size"
         self.nheads_per_group = self.nheads // self.ngroups
         self.nheads_local_tp = self.nheads // tp_size
+        self.n_repeat = self.nheads_local_tp // self.ngroups
 
         # Note that we do not need to confirm that `d_inner % tp_size == 0` because
         # `d_inner % headdim == 0`, `nheads = d_inner // headdim`, and `nheads % tp_size == 0`
@@ -3498,13 +3515,13 @@ class DragonMamba3MimoFast(nn.Module):
         self.in_proj = DragonLinear(
             config,
             self.d_model,
-            self.d_inner * 2 + 2 * self.ngroups * self.d_state * self.mimo_dim + 3 * self.nheads,
+            self.d_inner * 2 + 3 * self.nheads,
             bias=False,
         )
-        self.rope_proj = DragonLinear(
+        self.in_proj_dyn = DragonLinear(
             config,
             self.d_model,
-            self.num_rope_angles,
+            2 * self.ngroups * self.d_state * self.mimo_dim + self.num_rope_angles,
             bias=False,
         )
 
@@ -3549,7 +3566,11 @@ class DragonMamba3MimoFast(nn.Module):
         self.D = nn.Parameter(torch.ones(self.nheads_local_tp, device=torch.cuda.current_device())) # Keep in fp32
         self.D._no_weight_decay = True # useless flag
 
-        self.output_norm = DragonNorm(config, self.d_inner_local_tp)
+        if self.config.mamba3_postgate_norm:
+            if not self.config.mamba3_derf:
+                self.output_norm = DragonNorm(config, self.d_inner_local_tp)
+            else:
+                self.output_norm = DragonDeRF(config, self.d_inner_local_tp)
 
     def forward(self, hidden_states, cache_params: Optional[HybridDragonDynamicCache] = None, **kwargs):
         """
@@ -3574,23 +3595,27 @@ class DragonMamba3MimoFast(nn.Module):
             hidden_full = hidden_states
 
         # Input projection
-        zxBCdtAtrap = self.in_proj(hidden_full)
-        zxBCdtAtrap = rearrange(zxBCdtAtrap, "b l (G D) -> b l G D", G=self.ngroups_local_tp)
-        # split per group: [B, L, G_local, D_group]
-        z = zxBCdtAtrap[..., 0:self.d_inner_per_group]; accum = self.d_inner_per_group
-        x = zxBCdtAtrap[..., accum:accum+self.d_inner_per_group]; accum += self.d_inner_per_group
-        B = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
-        C = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
-        dt = zxBCdtAtrap[..., accum:accum+self.nheads_per_group]; accum += self.nheads_per_group
-        A = zxBCdtAtrap[..., accum:accum+self.nheads_per_group]; accum += self.nheads_per_group
-        trap = zxBCdtAtrap[..., accum:accum+2*self.nheads_per_group]
-        z = rearrange(z, "b l G (h p) -> b l (G h) p", p=self.headdim)
-        x = rearrange(x, "b l G (h p) -> b l (G h) p", p=self.headdim)
-        B = rearrange(B, "b l G (r n) -> b l r G n", r=self.mimo_dim)
-        C = rearrange(C, "b l G (r n) -> b l r G n", r=self.mimo_dim)
-        dt = rearrange(dt, "b l G n -> b l (G n)").to(torch.float32)
-        A = rearrange(A, "b l G n -> b l (G n)")
-        trap = rearrange(trap, "b l G n -> b (G n) l")
+        zxdtAtrap = self.in_proj(hidden_full)
+        offset = 0
+        z = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
+        x = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
+        dt = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
+        A = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
+        trap = zxdtAtrap[..., offset : offset + 2 * self.nheads_local_tp] # Trap might need 2x? check dim
+
+        BCangle = self.in_proj_dyn(hidden_full)
+        B = BCangle[..., 0:self.ngroups*self.mimo_dim*self.d_state]
+        C = BCangle[..., self.ngroups*self.mimo_dim*self.d_state:2*self.ngroups*self.mimo_dim*self.d_state]
+        angle = BCangle[..., 2*self.ngroups*self.mimo_dim*self.d_state:] # (L, B, S)
+
+        z = rearrange(z, "b l (G h p) -> b l (G h) p",G=self.ngroups, p=self.headdim)
+        x = rearrange(x, "b l (G h p) -> b l (G h) p", G=self.ngroups, p=self.headdim)
+        B = rearrange(B, "b l (G r n) -> b l r G n", G=self.ngroups, r=self.mimo_dim)
+        C = rearrange(C, "b l (G r n) -> b l r G n", G=self.ngroups, r=self.mimo_dim)
+        dt = rearrange(dt, "b l n -> b l n").to(torch.float32)
+        dt = dt.to(torch.float32)
+        A = rearrange(A, "b l n -> b l n")
+        trap = rearrange(trap, "b l n -> b n l")
 
         _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)
@@ -3599,19 +3624,22 @@ class DragonMamba3MimoFast(nn.Module):
 
         B = self.B_norm(B)
         C = self.C_norm(C)
-
         if self.ngroups != self.nheads:
-            n_repeat = self.nheads_local_tp // self.ngroups_local_tp
-            assert self.nheads_local_tp % self.ngroups_local_tp == 0
-            B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
-            C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
+            B = B.repeat(1, 1, 1, self.n_repeat, 1) # (B, L, R, N, S)
+            C = C.repeat(1, 1, 1, self.n_repeat, 1) # (B, L, R, N, S)
+        B = rearrange(B, "b l r G n -> b l r G n").contiguous()
+        C = rearrange(C, "b l r G n -> b l r G n").contiguous()
+        a, b, c, d, e = C.size()
+        C = C.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
+        a, b, c, d, e = B.size()
+        B = B.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
 
-        angle = self.rope_proj(hidden_full) # (B, L, S)
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
         angle = angle_dt(angle, dt)
 
-        dt = rearrange(dt, "b l n -> b n l")
         ADT = rearrange(ADT, "b l n -> b n l")
+        dt = rearrange(dt, "b l n -> b n l")
+
         y = mamba3_tilelang(
             Q=C.contiguous(),
             K=B.contiguous(),
@@ -3633,9 +3661,10 @@ class DragonMamba3MimoFast(nn.Module):
         )
 
         y = rearrange(y, "b l h p -> b l (h p)")
-        y = self.output_norm(y)
-        y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads_local_tp)
-        
+        if self.config.mamba3_postgate_norm:
+            y = self.output_norm(y)
+        #y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads_local_tp)
+
         if cache_params is not None:
             y = y[:, -L_new:, ...].contiguous()
 
@@ -4390,7 +4419,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
 
         # MLP.
         residual = hidden_states
-        x_in = hidden_states
+        x_in = residual
         if self.config.ddl_type == 'ec':
             x_in = self.compress(residual)
         hidden_states = self.lns * self.postmixer_norm(x_in)

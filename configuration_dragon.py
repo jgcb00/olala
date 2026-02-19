@@ -123,8 +123,8 @@ class DragonConfig(PretrainedConfig):
         mamba3_is_A_dd: bool = True,
         mamba3_add_trapezoid: bool = True,
         mamba3_postgate_norm: bool = False,
+        mamba3_derf: bool = False,
         moe: bool = False,
-        moe_router_type: str = "classic",
         moe_num_routed_experts: int = 2,
         moe_num_active_experts: int = 1,
         moe_routed_scaling_factor: float = 2.5,
@@ -248,8 +248,8 @@ class DragonConfig(PretrainedConfig):
         self.mamba3_is_A_dd = mamba3_is_A_dd
         self.mamba3_add_trapezoid = mamba3_add_trapezoid
         self.mamba3_postgate_norm = mamba3_postgate_norm
+        self.mamba3_derf = mamba3_derf
         self.moe = moe
-        self.moe_router_type = moe_router_type
         self.moe_num_active_experts = moe_num_active_experts
         self.moe_num_routed_experts = moe_num_routed_experts
         self.moe_routed_scaling_factor = moe_routed_scaling_factor
