@@ -92,6 +92,7 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        geodesic_update: bool = False,
         ngram_embeddings: bool = False,
         ngram_embeddings_neighbor: int = 4,
         ngram_embeddings_channels: int = 4,
@@ -131,6 +132,7 @@ class DragonConfig(PretrainedConfig):
         moe_routed_intermediate_size: int = 768,
         moe_shared_intermediate_size: int = 768,
         moe_routed_input_dim: int = 384,
+        moe_shared_expert_gate: bool = False,
         intra_doc_masking: bool = False,
         seednorm_rank: int = 1,
         seednorm_type: int = 1,
@@ -217,6 +219,7 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.geodesic_update=geodesic_update
         self.ngram_embeddings = ngram_embeddings
         self.ngram_embeddings_neighbor = ngram_embeddings_neighbor
         self.ngram_embeddings_channels = ngram_embeddings_channels
@@ -256,6 +259,7 @@ class DragonConfig(PretrainedConfig):
         self.moe_routed_intermediate_size = moe_routed_intermediate_size
         self.moe_shared_intermediate_size = moe_shared_intermediate_size
         self.moe_routed_input_dim = moe_routed_input_dim
+        self.moe_shared_expert_gate = moe_shared_expert_gate
         self.intra_doc_masking = intra_doc_masking
         self.seednorm_rank = seednorm_rank
         self.seednorm_type = seednorm_type

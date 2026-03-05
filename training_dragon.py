@@ -29,6 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import transformers
 from transformers import get_wsd_schedule
+from transformers import AutoModelForCausalLM
 
 from .configuration_dragon import DragonConfig
 from .modeling_dragon import DragonForCausalLM, DragonMoE
@@ -87,6 +88,7 @@ class NanoArgs:
     ngram_embeddings_neighbor: int = 4
     ngram_embeddings_channels: int = 4
     ngram_embeddings_ratio: int = 15
+    geodesic_update: bool = False
 
     # MoE
     moe: bool = False
@@ -218,6 +220,7 @@ class NanoArgs:
     coord_check_sweep_dir: Optional[str] = None
     coord_check_steps: str = "1,2,5,10"
 
+    start_from_dir: Optional[str] = None
     load_arg_from_config: bool = True
     load_optim: bool = True
     load_sched: bool = True
@@ -476,11 +479,11 @@ def _peek_hf_shard(filename):
     return ntok
 
 def _peek_mg_shard(filename):
-    tokens = np.memmap(filename, dtype=np.uint16, mode="r")
+    tokens = np.memmap(filename, dtype=np.uint32, mode="r")
     return int(tokens.size)
 
 def _load_mg_shard(filename):
-    return np.memmap(filename, dtype=np.uint16, mode="r")
+    return np.memmap(filename, dtype=np.uint32, mode="r")
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, intra_doc_masking,B, T, process_rank, num_processes, bos_id, dataset_type='hf'):
@@ -492,8 +495,11 @@ class DistributedDataLoader:
         self.T = T
         self.dataset_type = dataset_type
 
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
+        if self.dataset_type == 'hf':
+            # glob files that match the pattern
+            self.files = sorted(glob.glob(filename_pattern))
+        elif self.dataset_type == 'mg':
+            self.files = [filename_pattern]
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
         # load and validate all data shards, count number of tokens in total
@@ -955,6 +961,7 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    geodesic_update=args.geodesic_update,
     ngram_embeddings=args.ngram_embeddings,
     ngram_embeddings_neighbor=args.ngram_embeddings_neighbor,
     ngram_embeddings_channels=args.ngram_embeddings_channels,
@@ -1063,8 +1070,17 @@ config_hf = DragonConfig(
 )
 
 if resume_dir is None:
-    model = DragonForCausalLM(config_hf)
-    model = model.cuda()
+    if args.start_from_dir is None:
+        model = DragonForCausalLM(config_hf)
+        model = model.cuda()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.start_from_dir, # converted_hf/dragon-7A1B-pretraining-2/iter_46500
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            device_map="auto"
+        ).cuda()
+        config_hf = model.config
 else:
     model = DragonForCausalLM.from_pretrained(resume_dir, config=config_hf, torch_dtype=torch.bfloat16)
     model = model.cuda()

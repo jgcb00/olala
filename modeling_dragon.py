@@ -283,8 +283,8 @@ class DragonLinear(nn.Linear):
         if not config.use_uscaling:
             alpha_fwd, alpha_bwd = 1, None
 
-        self.register_buffer("alpha_fwd", torch.tensor(float(alpha_fwd)), persistent=False)
-        self.register_buffer("alpha_bwd", torch.tensor(float(alpha_bwd if alpha_bwd is not None else alpha_fwd)), persistent=False)
+        self.alpha_fwd = float(alpha_fwd)
+        self.alpha_bwd = float(alpha_bwd if alpha_bwd is not None else alpha_fwd)
 
     def forward(self, x):
         out = super().forward(x)
@@ -3677,7 +3677,7 @@ class DragonMLP(nn.Module):
         intermediate_size = intermediate_size or config.intermediate_size
         self.fc_1 = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
         self.fc_2 = DragonLinear(config, intermediate_size, config.hidden_size, bias=False)
-        self.register_buffer("_2_sqrt_5", torch.tensor(2/math.sqrt(5)) if config.use_uscaling else torch.tensor(1.), persistent=False)
+        self._2_sqrt_5 = 2/math.sqrt(5) if config.use_uscaling else 1.0
 
     def forward(self, hidden_states, router_prev=None, stem_emb=None):
         hidden_states = self.fc_1(hidden_states)
@@ -3703,7 +3703,7 @@ class DragonMoE(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        self.gate = DragonLinear(config, config.hidden_size, config.moe_num_routed_experts, bias=False)
+        self.moe_gate = DragonLinear(config, config.hidden_size, config.moe_num_routed_experts, bias=False)
         if self.config.moe_routed_input_dim:
             self.down_proj = DragonLinear(config, config.hidden_size, config.moe_routed_input_dim, bias=False)
             self.up_proj = DragonLinear(config, config.moe_routed_input_dim, config.hidden_size, bias=False)
@@ -3715,6 +3715,8 @@ class DragonMoE(nn.Module):
             alpha=1.0/math.sqrt(config.moe_routed_input_dim or config.hidden_size) if config.use_uscaling else 1.0,
             activation=lambda x: F.relu(x).square() * (2 / math.sqrt(5)) if config.use_uscaling else F.relu(x).square()
         )
+        if self.config.moe_shared_expert_gate:
+            self.shared_gate = DragonLinear(config, config.hidden_size, 1, bias=False)
         self.shared_experts = (
             DragonMLP(config, config.moe_shared_intermediate_size)
             if config.moe_shared_intermediate_size and config.moe_shared_intermediate_size > 0
@@ -3736,23 +3738,28 @@ class DragonMoE(nn.Module):
             self.experts.experts.weight.normal_(mean=0.0, std=self.config.initializer_range)
             self.experts.output_experts.weight.normal_(mean=0.0, std=self.config.initializer_range)
 
-    def forward(self, x: torch.Tensor, router_prev=None, stem_emb=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_non_lns: torch.Tensor, router_prev=None, stem_emb=None) -> torch.Tensor:
         bs, slen, dim = x.shape
+        input_dtype = x.dtype
         x = x.view(-1, dim)
 
         # router.
-        logits = self.gate(x) # (B*L, E)
+        logits = torch.matmul(x.float(), self.moe_gate.weight.float().t())
+
         scores = torch.sigmoid(logits.float()).type_as(logits)
-        scores_for_routing = scores + self.expert_bias
+        scores_for_routing = scores + self.expert_bias.float()
+        #scores_orig = scores_for_routing.clone()
         _, top_indices = torch.topk(scores_for_routing, k=self.config.moe_num_active_experts, dim=1)
         scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.config.moe_num_active_experts > 1 else scores
         probs = probs * self.config.moe_routed_scaling_factor
+        probs = probs.to(input_dtype)
 
-        with torch.no_grad():
-            idx = top_indices.reshape(-1) # (N*K,)
-            tpe = torch.bincount(idx, minlength=self.config.moe_num_routed_experts).to(self.tokens_per_expert.dtype).to(x.device)
-            self.tokens_per_expert.add_(tpe)
+        if self.training:
+            with torch.no_grad():
+                idx = top_indices.reshape(-1) # (N*K,)
+                tpe = torch.bincount(idx, minlength=self.config.moe_num_routed_experts).to(self.tokens_per_expert.dtype).to(x.device)
+                self.tokens_per_expert.add_(tpe)
 
         # experts.
         x0 = x
@@ -3761,10 +3768,18 @@ class DragonMoE(nn.Module):
         out_experts = self.experts(x0, probs, top_indices)
         if self.config.moe_routed_input_dim:
             out_experts = self.up_proj(out_experts).to(out_experts.dtype)
-        out = self.shared_experts(x) if self.shared_experts is not None else None
+        # shared experts.
+        out = None
+        if self.shared_experts is not None:
+            out = self.shared_experts(x)
+            if self.config.moe_shared_expert_gate:
+                x_non_lns = x_non_lns.view(-1, dim)
+                logits = self.shared_gate(x_non_lns)
+                scores = torch.sigmoid(logits.float()).type_as(logits)
+                out = out * scores
         if out is None:
             return out_experts.reshape(bs, slen, dim)
-        return (out + out_experts).reshape(bs, slen, dim)
+        return (out + out_experts).reshape(bs, slen, dim)#, top_indices, scores_orig
 
 def _logit(p: float) -> float:
     p = min(max(float(p), 1e-6), 1.0 - 1e-6)
@@ -4214,6 +4229,32 @@ class DragonNgramEmbedding(nn.Module):
         x = x / (1 + self.k * (self.n - 1))
         
         return x
+    
+class DragonGeodesicNorm(nn.Module):
+    def __init__(self, config: DragonConfig, layer_idx: int):
+        super().__init__()
+
+        self.scale = nn.Parameter(torch.tensor(1.))
+        self.bias = nn.Parameter(torch.tensor(0.))
+        self.clamp = torch.pi/4
+        self.layer_idx = layer_idx
+
+    def forward(self, x, g):
+        """
+        x: residual;
+        g: ffn(x) or attn(x);
+        """
+
+        gradient = g - (x * g).sum(dim=-1,keepdim=True) / (torch.norm(x, p=2, dim=-1, keepdim=True) ** 2) * x
+        tangent_norm = torch.norm(gradient, p=2, dim=-1, keepdim=True)
+        safe_tangent_norm = torch.clamp(tangent_norm, min=1e-8)
+        unit_tangent = gradient / safe_tangent_norm
+        R = torch.norm(x, p=2, dim=-1, keepdim=True)
+        safe_R = torch.clamp(R, min=1e-6)
+        theta = torch.clamp(safe_tangent_norm / safe_R, max=self.clamp)
+        theta = torch.clamp((theta * self.scale + self.bias) / (self.layer_idx + 1), max=self.clamp)
+        output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
+        return output
 
 class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd', use_stem=False):
@@ -4307,7 +4348,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             val = 0.
             if self.config.zero_centered_gate:
                 val = 1.15
-            self.register_buffer("gate_bias", torch.tensor(val), persistent=False)
+            self.gate_bias = val
             if self.config.gate_act == "silu":
                 self.gate_act = F.silu
             elif self.config.gate_act == "sigmoid":
@@ -4322,8 +4363,15 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         if config.mixer_gn:
             self.mixer_group_norm = DragonHeadWiseRMSNorm(n_heads=num_attention_heads, d_head=head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
 
-        self.input_norm = DragonNorm(config, config.hidden_size)
-        self.postmixer_norm = DragonNorm(config, config.hidden_size)
+        if not config.geodesic_update:
+            self.input_norm = DragonNorm(config, config.hidden_size)
+            self.postmixer_norm = DragonNorm(config, config.hidden_size)
+        else:
+            assert self.config.ddl_type == ""
+            self.input_norm = torch.nn.Identity()
+            self.postmixer_norm = torch.nn.Identity()
+            self.geodesic_mixer = DragonGeodesicNorm(config, self.layer_idx)
+            self.geodesic_mlp = DragonGeodesicNorm(config, self.layer_idx)
 
         if self.config.ddl_type == 'vdim1':
             self.ddl_attn = DeepDeltaResidualVdim1(config)
@@ -4354,7 +4402,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         lns = 1.
         if config.layer_norm_scaling:
             lns = 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))
-        self.register_buffer("lns", torch.tensor(lns), persistent=False)
+        self.lns = float(lns)
 
         a = 1.
         b = 1.
@@ -4363,8 +4411,8 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             b = math.sqrt(1.0 - self.config.uscaling_tau)
         elif self.config.use_completed_p:
             a = (len(self.config.layers_config)/self.config.base_depth) ** (-self.config.completed_p_alpha)
-        self.register_buffer("a", torch.tensor(a), persistent=False)
-        self.register_buffer("b", torch.tensor(b), persistent=False)
+        self.a = float(a)
+        self.b = float(b)
 
     def forward(
         self,
@@ -4414,6 +4462,8 @@ class DragonMonoBlock(GradientCheckpointingLayer):
 
         if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
             hidden_states = self.ddl_attn(residual, k_in=y_mixer, v_in=x_in, context=hidden_states, scalar=self.a)
+        elif self.config.geodesic_update:
+            hidden_states = self.geodesic_mixer(residual, y_mixer)
         else:
             hidden_states = self.b * residual + self.a * y_mixer
 
@@ -4423,10 +4473,15 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         if self.config.ddl_type == 'ec':
             x_in = self.compress(residual)
         hidden_states = self.lns * self.postmixer_norm(x_in)
-        y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
+        if isinstance(self.mlp, DragonMoE):
+            y_mlp = self.mlp(hidden_states, self.postmixer_norm(x_in), router_prev, stem_emb=stem_emb) # (B, L, D)
+        else:
+            y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
 
         if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
             hidden_states = self.ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states, scalar=self.a)
+        elif self.config.geodesic_update:
+            hidden_states = self.geodesic_mlp(residual, y_mlp)
         else:
             hidden_states = self.b * residual + self.a * y_mlp
 
