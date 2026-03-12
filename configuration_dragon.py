@@ -92,6 +92,8 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        cosnet_rank: int = 64,
+        cosnet: bool = False,
         geodesic_update: bool = False,
         ngram_embeddings: bool = False,
         ngram_embeddings_neighbor: int = 4,
@@ -205,6 +207,7 @@ class DragonConfig(PretrainedConfig):
         eos_token_id=2,
         sliding_window_size=1024,
         slw_wsize=-1,
+        complete_slw=False,
         rope_type="",
         rope_theta=0.,
         uscaling_tau=0.2,
@@ -219,6 +222,8 @@ class DragonConfig(PretrainedConfig):
         mlp_linking=False,
         **kwargs,
     ):
+        self.cosnet_rank = cosnet_rank
+        self.cosnet = cosnet
         self.geodesic_update=geodesic_update
         self.ngram_embeddings = ngram_embeddings
         self.ngram_embeddings_neighbor = ngram_embeddings_neighbor
@@ -325,6 +330,7 @@ class DragonConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.sliding_window_size = sliding_window_size
         self.slw_wsize = slw_wsize
+        self.complete_slw = complete_slw
         self.attention_dropout = attention_dropout
         self.hidden_dropout = hidden_dropout
         self.max_position_embeddings = max_position_embeddings

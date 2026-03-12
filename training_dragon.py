@@ -32,7 +32,7 @@ from transformers import get_wsd_schedule
 from transformers import AutoModelForCausalLM
 
 from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM, DragonMoE
+from .modeling_dragon import DragonForCausalLM, DragonMoE, DragonGeodesicNorm
 
 # TODO: save code files!!!!
 
@@ -52,7 +52,7 @@ class NanoArgs:
     eps_rmsnorm: float = 1e-6
     mlp_expand: float = 4. # expand factor for MLP
     intermediate_size: Optional[int] = None
-    fused_loss_computation : bool = True # whether to use fused linear + cross entropy loss
+    fused_loss_computation : bool = False # whether to use fused linear + cross entropy loss
     use_uscaling: bool = False
     uscaling_tau: float = 0.2
     zero_centered_gamma: bool = False
@@ -89,6 +89,10 @@ class NanoArgs:
     ngram_embeddings_channels: int = 4
     ngram_embeddings_ratio: int = 15
     geodesic_update: bool = False
+    cosnet: bool = False
+    cosnet_rank: int = 64
+    prores: bool = False
+    prores_warmup_iters: int = 1000
 
     # MoE
     moe: bool = False
@@ -109,6 +113,7 @@ class NanoArgs:
     slw_start: int = 8 # window size at the start of training
     slw_end: int = 8192
     slw_increment: int = 64 # window size increment at each step
+    complete_slw: bool = False # whether to apply sliding window to all layers or just attention ones
     softcap_attn: float = 0.0 # logit soft-capping for attn logits, as per Gemma2 (0.0 = no soft-capping)
     qk_norm: bool = True
     scalable_softmax: bool = True
@@ -164,6 +169,7 @@ class NanoArgs:
     weight_decay: float = 0.
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
+    adam_beta3: float = 0.999
     adam_eps: float = 1e-8
     alpha_normalize: bool = False # whether to normalize update by (1+alpha) in AdEMAMix
     alpha_ademamix: float = 8.0
@@ -470,9 +476,9 @@ def _peek_hf_shard(filename):
     with open(filename, "rb") as f:
         header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
     if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print0("ERROR: magic number mismatch in the data .bin file!")
+        print0("---> HINT: Are you passing in a correct file with --input_bin?")
+        print0("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
         exit(1)
     assert header[1] == 1, "unsupported version"
     ntok = int(header[2])
@@ -507,7 +513,6 @@ class DistributedDataLoader:
         self.shard_ntoks = []
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname, dataset_type=self.dataset_type)
-            #print(f"shard {fname} has {shard_ntok} tokens")
             assert shard_ntok >= num_processes * B * T + 1
             self.shard_ntoks.append(shard_ntok)
             ntok_total += int(shard_ntok)
@@ -534,7 +539,7 @@ class DistributedDataLoader:
                 return f"{n/1e9:.2f}B" if n >= 1_000_000_000 else (
                     f"{n/1e6:.2f}M" if n >= 1_000_000 else str(n))
 
-            print(
+            print0(
                 f"Advancing to shard {self.current_shard}/{len(self.files)-1} "
                 f"(this={_fmt(shard_tokens)} tok, cum={_fmt(cum_tokens)}/{_fmt(self.ntok_total)})"
             )
@@ -610,7 +615,7 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
             target.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled})
             seen.add(mod.weight)
 
-            print(f"param {name}.weight | hidden {target is hidden_groups} | shape {mod.weight.shape} | scale {scale} | lr={lr_scaled} | wd_mult={wd_mult:.3e}")
+            #print0(f"param {name}.weight | hidden {target is hidden_groups} | shape {mod.weight.shape} | scale {scale} | lr={lr_scaled} | wd_mult={wd_mult:.3e}")
 
             if mod.bias is not None:
                 other_groups.append({"params": [mod.bias], "lr": base_lr_scalar, "weight_decay": 0.0})
@@ -649,7 +654,7 @@ def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_
 
         target.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled})
 
-        print(f"param {name} | hidden {False} | shape {p.shape} | scale {scale} | lr={lr_scaled} | wd_mult={wd_mult:.3e}")
+        #print0(f"param {name} | hidden {False} | shape {p.shape} | scale {scale} | lr={lr_scaled} | wd_mult={wd_mult:.3e}")
 
     return hidden_groups, other_groups
 
@@ -669,7 +674,7 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
         routed_experts_adjusted = math.sqrt(routed_experts / routed_experts_base)
     else:
         routed_experts_adjusted = 1.0
-    print(f"rho scaling: rho={rho:.3e}, rho_adjusted={rho_adjusted:.3e}, depth_adjusted={depth_adjusted:.3e}")
+    print0(f"rho scaling: rho={rho:.3e}, rho_adjusted={rho_adjusted:.3e}, depth_adjusted={depth_adjusted:.3e}")
 
     for name, mod in model.named_modules():
         if isinstance(mod, nn.Linear):
@@ -693,7 +698,7 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
             groups.append({"params": [mod.weight], "lr": lr_scaled, "weight_decay": wd_scaled, "eps": eps_scaled})
             seen.add(mod.weight)
 
-            print(f"param {name}.weight | shape {mod.weight.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
+            #print0(f"param {name}.weight | shape {mod.weight.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
 
             if mod.bias is not None:
                 scale_lr = (depth_adjusted ** (alpha_complete_p-1)) * rho_adjusted
@@ -713,7 +718,7 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
                 groups.append({"params": [mod.bias], "lr": lr_scaled, "weight_decay": wd_scaled, "eps": eps_scaled})
                 seen.add(mod.bias)
 
-                print(f"param {name}.bias  | shape {mod.bias.shape} | lr={lr_scaled} | wd={wd_scaled:.3e}")
+                #print0(f"param {name}.bias  | shape {mod.bias.shape} | lr={lr_scaled} | wd={wd_scaled:.3e}")
 
     for name, p in model.named_parameters():
         if p in seen:
@@ -764,7 +769,7 @@ def param_groups_completed_p(model, batch_size, batch_size_base, dataset_size, d
 
         groups.append({"params": [p], "lr": lr_scaled, "weight_decay": wd_scaled, "eps": eps_scaled})
 
-        print(f"param {name} | hidden {False} | shape {p.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
+        #print0(f"param {name} | hidden {False} | shape {p.shape} | lr={lr_scaled} | wd={wd_scaled:.3e} | eps={eps_scaled:.3e}")
 
     return groups
 
@@ -779,14 +784,14 @@ def param_groups_hyperball(model, base_lr_hidden, base_lr_scalar, base_lr_embed)
             if id(w) not in seen:
                 adamh_groups.append({"params": [w], "lr": base_lr_hidden})
                 seen.add(id(w))
-                print(f"AdamH  {mod_name}.weight | shape {tuple(w.shape)} | lr={base_lr_hidden}")
+                print0(f"AdamH  {mod_name}.weight | shape {tuple(w.shape)} | lr={base_lr_hidden}")
 
             if mod.bias is not None:
                 b = mod.bias
                 if id(b) not in seen:
                     adam_groups.append({"params": [b], "lr": base_lr_scalar, "weight_decay": 0.0})
                     seen.add(id(b))
-                    print(f"Adam   {mod_name}.bias  | shape {tuple(b.shape)} | lr={base_lr_scalar} | wd=0")
+                    print0(f"Adam   {mod_name}.bias  | shape {tuple(b.shape)} | lr={base_lr_scalar} | wd=0")
 
     for name, p in model.named_parameters():
         if id(p) in seen:
@@ -797,20 +802,43 @@ def param_groups_hyperball(model, base_lr_hidden, base_lr_scalar, base_lr_embed)
         if "embedding" in pname:
             lr = base_lr_embed
             adam_groups.append({"params": [p], "lr": lr, "weight_decay": 0.0})
-            print(f"Adam   {pname} | shape {tuple(p.shape)} | lr={lr} | wd=0")
+            print0(f"Adam   {pname} | shape {tuple(p.shape)} | lr={lr} | wd=0")
         elif "experts.weight" in pname:
             lr = base_lr_hidden
             assert p.ndim >= 2, f"experts.weight should be >=2D, got {tuple(p.shape)}"
             adamh_groups.append({"params": [p], "lr": lr})
-            print(f"AdamH  {pname} | shape {tuple(p.shape)} | lr={lr}")
+            print0(f"AdamH  {pname} | shape {tuple(p.shape)} | lr={lr}")
         else:
             lr = base_lr_scalar
             adam_groups.append({"params": [p], "lr": lr, "weight_decay": 0.0})
-            print(f"Adam   {pname} | shape {tuple(p.shape)} | lr={lr} | wd=0")
+            print0(f"Adam   {pname} | shape {tuple(p.shape)} | lr={lr} | wd=0")
 
         seen.add(id(p))
 
     return adamh_groups, adam_groups
+
+def param_groups_cosnet(model, base_lr, weight_decay, cosnet_rank):
+    param_groups = []
+
+    for pname, p in raw_model.named_parameters():
+        lr = base_lr
+        wd = weight_decay
+
+        if getattr(p, "_no_weight_decay", False) or len(p.shape) < 2:
+            wd = 0
+
+        if "cosnet_branch.up" in pname:
+            lr = lr * (p.dim_factor/cosnet_rank) ** (2 * 0.3)
+        elif "cosnet_branch.mix" in pname:
+            lr = lr * (p.dim_factor/cosnet_rank) ** 0.45
+        elif "cosnet_branch.omega" in pname:
+            lr = lr * 3.
+        elif "cosnet_branch.phi" in pname:
+            lr = lr * 5.
+
+        param_groups.append({"params": [p], "lr": lr, "weight_decay": wd})
+
+    return param_groups
 
 args: NanoArgs = tyro.cli(NanoArgs)
 
@@ -961,6 +989,8 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    cosnet=args.cosnet,
+    cosnet_rank=args.cosnet_rank,
     geodesic_update=args.geodesic_update,
     ngram_embeddings=args.ngram_embeddings,
     ngram_embeddings_neighbor=args.ngram_embeddings_neighbor,
@@ -1066,7 +1096,8 @@ config_hf = DragonConfig(
     rope_type=args.rope_type,
     rope_theta=args.rope_theta,
     uscaling_tau=args.uscaling_tau,
-    mlp_linking=args.mlp_linking
+    mlp_linking=args.mlp_linking,
+    complete_slw=args.complete_slw,
 )
 
 if resume_dir is None:
@@ -1134,12 +1165,12 @@ if resume_dir is None and (args.use_completed_p or args.optim == "adamh" or args
                 else:
                     mod.weight.normal_(mean=0.0, std=args.init_std * ((args.d_model/args.base_width) ** -0.5))
                 seen.add(mod.weight)
-                print(f"param {name}.weight | shape {mod.weight.shape} | std={mod.weight.std().item():.3e}")
+                #print0(f"param {name}.weight | shape {mod.weight.shape} | std={mod.weight.std().item():.3e}")
 
                 if mod.bias is not None:
                     mod.bias.zero_()
                     seen.add(mod.bias)
-                    print(f"param {name}.bias  | shape {mod.bias.shape} | std={mod.bias.std().item():.3e}")
+                    #print0(f"param {name}.bias  | shape {mod.bias.shape} | std={mod.bias.std().item():.3e}")
 
         for name, p in model.named_parameters():
             if p in seen:
@@ -1147,23 +1178,23 @@ if resume_dir is None and (args.use_completed_p or args.optim == "adamh" or args
             pname = id2name.get(id(p), "<unnamed>")
             if "embedding" in pname:
                 p.normal_(mean=0.0, std=args.init_std)
-            print(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
+            #print0(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
 elif resume_dir is None:
     with torch.no_grad():
         groups, seen = [], set()
         id2name = {id(p): n for n, p in model.named_parameters()}
 
         for name, mod in model.named_modules():
-            if isinstance(mod, nn.Linear):
+            if isinstance(mod, nn.Linear) or "experts.weight" in name: # TODO: .weight ???
                 pname = id2name.get(id(mod.weight), "")
-                mod.weight.normal_(mean=0.0, std=args.init_std)
+                mod.weight.normal_(mean=0.0, std=args.init_std if not args.cosnet else args.init_std/2.)
                 seen.add(mod.weight)
-                print(f"param {name}.weight | shape {mod.weight.shape} | std={mod.weight.std().item():.3e}")
+                #print0(f"param {name}.weight | shape {mod.weight.shape} | std={mod.weight.std().item():.3e}")
 
                 if mod.bias is not None:
                     mod.bias.zero_()
                     seen.add(mod.bias)
-                    print(f"param {name}.bias  | shape {mod.bias.shape} | std={mod.bias.std().item():.3e}")
+                    #print0(f"param {name}.bias  | shape {mod.bias.shape} | std={mod.bias.std().item():.3e}")
 
         for name, p in model.named_parameters():
             if p in seen:
@@ -1171,12 +1202,23 @@ elif resume_dir is None:
             pname = id2name.get(id(p), "<unnamed>")
             if "embedding" in pname:
                 p.normal_(mean=0.0, std=args.init_std)
-            print(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
+            #print0(f"param {name} | shape {p.shape} | std={p.std().item():.3e}")
 
         if args.init_gpt2:
             for pn, p in model.named_parameters():
-                if pn.endswith('fc2.weight') or pn.endswith('mixer_proj.weight'):
+                if pn.endswith('fc_2.weight') or pn.endswith('mixer_proj.weight') or pn.endswith('output_experts.weight'):
                     torch.nn.init.normal_(p, mean=0.0, std=args.init_std/math.sqrt(2 * len(args.layers_config)))
+
+if args.cosnet:
+    for pname, p in model.named_parameters():
+        if "cosnet_branch.omega" in pname:
+            torch.nn.init.uniform_(p, a=0.8, b=1.2)
+        elif "cosnet_branch.phi" in pname:
+            torch.nn.init.normal_(p, mean=0., std=0.1)
+        elif "cosnet_branch.mix" in pname:
+            torch.nn.init.xavier_uniform_(p)
+        elif "cosnet_branch.up" in pname:
+            torch.nn.init.normal_(p, mean=0., std=args.init_std/math.sqrt(args.cosnet_rank))
 
 # load optimizers & schedulers.
 if args.use_uscaling:
@@ -1237,35 +1279,82 @@ elif args.use_completed_p:
         alpha_complete_p=args.completed_p_alpha,
         experts_scaling=args.completed_p_experts_scaling,
     )
-    beta1 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta1 - 1)
-    beta2 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta2 - 1)
-    print0(f"Completed-p AdamW betas adjusted to: beta1={beta1:.6f}, beta2={beta2:.6f}")
 
-    optimizer = torch.optim.AdamW(groups, betas=(beta1, beta2))
+    if args.optim == "adamw":
+        beta1 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta1 - 1)
+        beta2 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta2 - 1)
+        print0(f"Completed-p AdamW betas adjusted to: beta1={beta1:.6f}, beta2={beta2:.6f}")
+        optimizer = torch.optim.AdamW(groups, betas=(beta1, beta2))
+    elif args.optim == "ademamix":
+        beta1 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta1 - 1)
+        beta2 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta2 - 1)
+        beta3 = 1 + ((args.batch_size * args.sequence_length) / args.base_batch_size) / ((args.batch_size * args.sequence_length * args.total_iterations) / args.base_dataset_size) * (args.adam_beta3 - 1)
+        print0(f"Completed-p Ademamix betas adjusted to: beta1={beta1:.6f}, beta2={beta2:.6f}, beta3={beta3:.6f}")
+
+        from .optimizers.Ademamix import AdEMAMix
+        beta3_warmup = args.total_iterations
+        alpha_warmup = args.total_iterations
+        optimizer = AdEMAMix(groups, betas=(beta1, beta2, beta3), alpha=args.alpha_ademamix, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize)
 else:
     if args.optim == "adamw":
-        #optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+        print0("Using AdamW optimizer..")
         decay_params = []
         no_decay_params = []
         for name, p in raw_model.named_parameters():
             if not p.requires_grad:
                 continue
-            if getattr(p, "_no_weight_decay", False):
+            if getattr(p, "_no_weight_decay", False) or len(p.shape) < 2:
                 no_decay_params.append(p)
             else:
                 decay_params.append(p)
-        optimizer = torch.optim.AdamW(
-            [
+
+        if args.cosnet:
+            param_groups = param_groups_cosnet(raw_model, args.learning_rate, args.weight_decay, args.cosnet_rank)
+        else:
+            param_groups = [
                 {"params": decay_params, "weight_decay": args.weight_decay},
                 {"params": no_decay_params, "weight_decay": 0.0},
-            ],
+            ]
+        
+        optimizer = torch.optim.AdamW(
+            param_groups,
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_eps,
             foreach=False,
         )
+    elif args.optim == "muon":
+        print0("Using Muon optimizer..")
+
+        hidden_groups = []
+        other_groups = []
+
+        for pname, p in raw_model.named_parameters():
+            lr = args.learning_rate
+            wd = args.weight_decay
+
+            if getattr(p, "_no_weight_decay", False) or len(p.shape) < 2:
+                wd = 0.
+
+            if "weight" in pname and "conv" not in pname and "lm_head" not in pname and "embedding" not in pname and "norm" not in pname:
+                if len(p.shape) > 2:
+                    print0("booo")
+                    print0(f"Muon  {pname} | shape {tuple(p.shape)} | lr={lr} | wd={wd}")
+                target = hidden_groups
+            else:
+                target = other_groups
+                if "lm_head" in pname:
+                    lr = args.learning_rate_head
+                elif "embedding" in pname:
+                    lr = args.learning_rate_embed
+                else:
+                    lr = args.learning_rate_scalar
+            target.append({"params": [p], "lr": lr, "weight_decay": wd})
+
+        optim1 = torch.optim.Muon(hidden_groups, eps=1e-7, adjust_lr_fn='match_rms_adamw')
+        optim2 = torch.optim.AdamW(other_groups, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
     elif args.optim == "adamh":
-        print("Using AdamH optimizer..")
+        print0("Using AdamH optimizer..")
         from .optimizers.adamh import AdamH
         adamh_groups, adam_groups = param_groups_hyperball(
             raw_model,
@@ -1279,7 +1368,7 @@ else:
         optim1 = AdamH(adamh_groups, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
         optim2 = torch.optim.Adam(adam_groups, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps) # no WD anyway here
     elif args.optim == "ademamixh":
-        print("Using AdemamixH optimizer..")
+        print0("Using AdemamixH optimizer..")
         from .optimizers.Ademamix import AdEMAMix
         from .optimizers.ademamixh import AdEMAMixH
         adamh_groups, adam_groups = param_groups_hyperball(
@@ -1296,11 +1385,31 @@ else:
         optim1 = AdEMAMixH(adamh_groups, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2, 0.999), beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, eps=args.adam_eps)
         optim2 = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2, 0.999), beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
     elif args.optim == "ademamix":
-        from .optimizers.Ademamix import AdEMAMix
+        print0("Using Ademamix optimizer..")
+        decay_params = []
+        no_decay_params = []
+        for name, p in raw_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if getattr(p, "_no_weight_decay", False) or len(p.shape) < 2:
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
 
+        from .optimizers.Ademamix import AdEMAMix
         beta3_warmup = args.total_iterations
         alpha_warmup = args.total_iterations
-        optimizer = AdEMAMix(raw_model.parameters(), lr=args.learning_rate, beta3_warmup=beta3_warmup, alpha_warmup=alpha_warmup, normalize_alpha=args.alpha_normalize, alpha=args.alpha_ademamix, weight_decay=args.weight_decay)
+        optimizer = AdEMAMix(
+            [
+                {"params": decay_params, "weight_decay": args.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=args.learning_rate,
+            beta3_warmup=beta3_warmup,
+            alpha_warmup=alpha_warmup,
+            normalize_alpha=args.alpha_normalize,
+            alpha=args.alpha_ademamix,
+            weight_decay=args.weight_decay)
     else:
         raise ValueError(f"Unknown Optimizer: {args.optim}")
 
@@ -1446,11 +1555,28 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
 
         progress_ratio = iter_ / slw_warmup_iters
         window = args.slw_start + progress_ratio * (args.slw_end - args.slw_start)
-        window = args.slw_increment * math.ceil(window / args.slw_increment) # quantize
-        window = int(min(window, args.slw_end)) # cap
+        if not args.complete_slw:
+            window = args.slw_increment * math.ceil(window / args.slw_increment) # quantize
+            window = int(min(window, args.slw_end)) # cap
+        else:
+            assert args.sequence_length % args.slw_end == 0, "For complete SLW, sequence length must be divisible by the SLW end window size."
+            # find divisors so that we can divide the sequence length, in mini_batches
+            valid_divisors = [d for d in range(1, args.slw_end + 1) 
+                        if args.slw_end % d == 0 and d >= args.slw_start]
+            if not valid_divisors:
+                valid_divisors = [args.slw_end]
+            # Round to the NEAREST divisor
+            window = min(valid_divisors, key=lambda d: abs(d - window)) 
         raw_model.config.slw_wsize = window
 
         to_log['slw_window'] = window
+
+    # PRORES SCALARS UPDATE
+    if args.prores:
+        for mod in raw_model.modules():
+            if isinstance(mod, DragonGeodesicNorm):
+                mod.prosres_scalar.fill_(min(iter_ / args.prores_warmup_iters * (mod.layer_idx + 1), 1))
+                to_log[f'prores_scalar/layer_{mod.layer_idx}'] = mod.prosres_scalar.item()
 
     # ----------- VALIDATION SECTION -----------
     if (last_iter or (args.val_loss_every > 0 and iter_ % args.val_loss_every == 0)):
@@ -1587,16 +1713,28 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
 
     # param norm (logging)
     param_norms = {}
+    param_mins = {}
+    param_maxs = {}
+    param_avgs = {}
     if master_process and (iter_ % 150 == 0):
         with torch.no_grad():
             names = []
             norm_tensors = []
+            min_tensors = []
+            max_tensors = []
+            avg_tensors = []
             for name, p in raw_model.named_parameters():
                 names.append(name)
                 norm_tensors.append(p.detach().float().norm())
+                min_tensors.append(p.detach().float().min())
+                max_tensors.append(p.detach().float().max())
+                avg_tensors.append(p.detach().float().mean())
 
             norms = torch.stack(norm_tensors).cpu().tolist()
-            param_norms = {f"param_norm/{n}": v for n, v in zip(names, norms)}
+            param_norms = {f"param_norm/{n}".replace("_orig_mod.", ""): v for n, v in zip(names, norms)}
+            param_mins = {f"param_min/{n}".replace("_orig_mod.", ""): v for n, v in zip(names, min_tensors)}
+            param_maxs = {f"param_max/{n}".replace("_orig_mod.", ""): v for n, v in zip(names, max_tensors)}
+            param_avgs = {f"param_avg/{n}".replace("_orig_mod.", ""): v for n, v in zip(names, avg_tensors)}
 
     # ----------- LOGGING SECTION -----------
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
@@ -1604,7 +1742,7 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
     print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} grad_norm:{grad_norm.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
-        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms, **param_norms}, step=iter_)
+        wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms, **param_norms, **param_mins, **param_maxs, **param_avgs}, step=iter_)
 
 if recorder is not None and master_process:
     DeltaWRecorder.rebuild_plots(args.coord_check_sweep_dir)

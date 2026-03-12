@@ -32,20 +32,12 @@ except ImportError:
     RMSNormGated = None
 
 try:
-    from dragon_mamba3_ops.siso_variant.ssd_combined_fused import mamba_chunk_scan_discretized_combined
-    from dragon_mamba3_ops.mimo_variant.ssd_mimo import mamba_chunk_scan_discretized_fused_combined as mamba_mimo_chunk_scan_discretized_fused_combined
-    from dragon_mamba3_ops.angle_cumsum import angle_dt
-    from dragon_mamba3_ops.rotary_mamba import rotary_qk
-    from dragon_mamba3_ops.rotary_mamba_mimo import rotary_qk as mimo_rotary_qk
-except ImportError as exc:
-    print("Warning: No Mamba-3 found !")
-    mamba_chunk_scan_discretized_combined, angle_dt, rotary_qk = None, None, None
-
-try:
-    from dragon_mamba3_fast.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
-    from dragon_mamba3_fast.angle_cumsum import angle_dt
+    from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
+    from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_rotary_step import apply_rotary_qk_inference_fwd
+    from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_step_fn import mamba3_step_fn
+    from dragon_mamba3_fast_step.angle_cumsum import angle_dt
 except ImportError:
-    print("dragon_mamba3_fast not found")
+    print("dragon_mamba3_fast_step not found")
 
 try:
     import scattermoe
@@ -274,8 +266,16 @@ class ScaledGrad(torch.autograd.Function):
 
 class DragonLinear(nn.Linear):
     """Linear layer with different forward/backward scalings."""
-    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, alpha_fwd=None, alpha_bwd=None, **kwargs):
+    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, alpha_fwd=None, alpha_bwd=None, cosnet=True, **kwargs):
         super().__init__(in_features, out_features, bias, **kwargs)
+        self.config = config
+
+        if self.config.cosnet and cosnet:
+            self.cosnet_branch = DragonCosNetBranch(
+                in_features=in_features,
+                out_features=out_features,
+                rank=config.cosnet_rank,
+            )
 
         if alpha_fwd is None:
             alpha_fwd = 1.0 / math.sqrt(in_features)
@@ -288,7 +288,42 @@ class DragonLinear(nn.Linear):
 
     def forward(self, x):
         out = super().forward(x)
+        if self.config.cosnet:
+            out = out + self.cosnet_branch(x)
         return ScaledGrad.apply(out, self.alpha_fwd, self.alpha_bwd)
+
+class DragonCosNetBranch(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int = 128,
+        wmin: float = 0.8,
+        wmax: float = 1.2,
+        phase_std: float = 0.1,
+        up_scale: float = 0.01,
+    ):
+        super().__init__()
+
+        self.rank = rank
+
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.mix = nn.Linear(rank, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        self.up.weight.dim_factor = min(in_features, out_features)
+        self.mix.weight.dim_factor = min(in_features, out_features)
+
+        self.omega1 = nn.Parameter(torch.ones(rank))
+        self.phi1 = nn.Parameter(torch.ones(rank))
+        self.omega2 = nn.Parameter(torch.ones(rank))
+        self.phi2 = nn.Parameter(torch.ones(rank))
+
+    def forward(self, x):
+        h = self.down(x)
+        h = torch.cos(h * self.omega1 + self.phi1)
+        h = self.mix(h)
+        h = torch.cos(h * self.omega2 + self.phi2)
+        return self.up(h)
 
 class DragonScale(nn.Module):
     def __init__(self, s: float):
@@ -334,6 +369,10 @@ class HybridDragonDynamicCache(DynamicCache):
         self.has_previous_state = False
         # mamba3 (naive prefix replay cache): stores (B, T_seen, D) per layer
         self.mamba3_hs = [None for _ in range(len(config.layers_config))]
+        self.mamba3_angle_states = [None for _ in range(len(config.layers_config))]
+        self.mamba3_ssm_states = [None for _ in range(len(config.layers_config))]
+        self.mamba3_k_states = [None for _ in range(len(config.layers_config))]
+        self.mamba3_v_states = [None for _ in range(len(config.layers_config))]
 
         for idx, layer_type in enumerate(config.layers_config):
             if not layer_type == "r":
@@ -1379,8 +1418,38 @@ class DragonDifferentialAttentionV2(nn.Module):
             key_states = self.k_norm(key_states)
 
         wsize = self.config.slw_wsize
+        if self.config.complete_slw:
+            b, L = query_states.size(0), query_states.size(1)
+            
+            if cu_seqlens is None and max_seqlen is None and b > 1:
+                raise NotImplementedError("Batch size > 1, can not implement complete slw")
 
-        # scalable softmax.
+            # 1. Generate window boundaries
+            window_boundaries = torch.arange(0, L + wsize, wsize, device=query_states.device)
+            window_boundaries = torch.unique(torch.clamp(window_boundaries, max=L))
+            if cu_seqlens is None or max_seqlen is None:
+                max_seqlen = wsize
+                cu_seqlens = window_boundaries 
+                boundaries_1d = window_boundaries
+            else: 
+                # Combine both 1D boundary lists directly
+                combined = torch.cat([window_boundaries, cu_seqlens])
+                # torch.unique automatically removes duplicates and sorts them in ascending order
+                cu_seqlens = torch.unique(combined, sorted=True)
+                max_seqlen = min(max_seqlen, wsize) if wsize > 0 else max_seqlen
+                boundaries_1d = cu_seqlens
+
+            # 3. Update position_ids based on the new boundaries
+            seq_range = torch.arange(L, device=query_states.device)
+            
+            # Find which chunk index each token belongs to
+            chunk_indices = torch.searchsorted(boundaries_1d, seq_range, right=True) - 1
+            chunk_starts = boundaries_1d[chunk_indices]
+            
+            # Calculate position IDs and expand to batch size
+            # position_ids usually still needs to be (b, L) for embedding layers
+            position_ids = (seq_range - chunk_starts).unsqueeze(0).expand(b, -1)
+                            
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
             T = query_states.size(1)
@@ -1401,12 +1470,12 @@ class DragonDifferentialAttentionV2(nn.Module):
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and not self.config.complete_slw:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and not self.config.complete_slw:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
@@ -2354,7 +2423,10 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
         # scalable softmax.
         if self.scalable_softmax:
             # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            pos = (position_ids.to(torch.float32).view(1, query_states.size(1), 1, 1) + 1.)
+            pos = position_ids.to(torch.float32)
+            if pos.dim() == 1:
+                pos = pos.unsqueeze(0)
+            pos = pos.unsqueeze(-1).unsqueeze(-1) + 1.0
             log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
             query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
             # TODO: caching mechanism for log_pos
@@ -3572,30 +3644,65 @@ class DragonMamba3MimoFast(nn.Module):
             else:
                 self.output_norm = DragonDeRF(config, self.d_inner_local_tp)
 
+        self.previous_window_size = 0
+
     def forward(self, hidden_states, cache_params: Optional[HybridDragonDynamicCache] = None, **kwargs):
         """
-        hidden_states: (nL, B, D) / (L B D)
+        hidden_states: (B L D)
         Returns: same shape as hidden_states
         """
 
         layer_idx = self.layer_idx
-        L_new = hidden_states.size(1)
-        if cache_params is not None:
-            prev = cache_params.mamba3_hs[layer_idx]  # (B, T_prev, D) or None
-            if prev is None:
-                hidden_full = hidden_states
-            else:
-                hidden_full = torch.cat([prev, hidden_states], dim=1)
+        batch, L_new, _ = hidden_states.shape
 
-            # Save full prefix for next step (detach to avoid holding graphs)
-            cache_params.mamba3_hs[layer_idx] = hidden_full.detach()
+        if cache_params is not None:
+            state = (
+                cache_params.mamba3_angle_states[layer_idx],
+                cache_params.mamba3_ssm_states[layer_idx],
+                cache_params.mamba3_k_states[layer_idx],
+                cache_params.mamba3_v_states[layer_idx],
+            )
+
+            if state[0] is None:
+                state = self.allocate_inference_cache(
+                    batch_size=batch,
+                    max_seqlen=1,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            
+            ys = []
+            for t in range(L_new):
+                y_t, *state = self.step(hidden_states[:, t, :], *state)
+                ys.append(y_t)
+
+            (
+                cache_params.mamba3_angle_states[layer_idx],
+                cache_params.mamba3_ssm_states[layer_idx],
+                cache_params.mamba3_k_states[layer_idx],
+                cache_params.mamba3_v_states[layer_idx],
+            ) = state
             cache_params.past_length[layer_idx] += L_new
-            cache_params.has_previous_state = True
-        else:
-            hidden_full = hidden_states
+
+            y = torch.stack(ys, dim=1)  # (B, L_new, D)
+
+            if self.config.mamba3_postgate_norm:
+                y = self.output_norm(y)
+            
+            return y, None, None
+
+        if self.config.complete_slw and self.config.slw_wsize > 128:
+            if self.previous_window_size != self.config.slw_wsize:
+                logger.info(f"Mamba3Mimo complete_slw: updating previous_window_size from {self.previous_window_size} to {self.config.slw_wsize}")
+                self.previous_window_size = self.config.slw_wsize
+            batch, l, dim = hidden_states.shape
+            assert batch == 1, "complete_slw only supports batch size of 1"
+            #print(f"Mamba3Mimo : hidden_states shape before reshape for complete_slw: {hidden_states.shape}, with config.slw_wsize={self.config.slw_wsize}")
+            hidden_states = hidden_states.reshape(-1, self.config.slw_wsize, dim).contiguous()
+            #print(f"Mamba3Mimo : hidden_states reshaped to {hidden_states.shape} for complete_slw")
 
         # Input projection
-        zxdtAtrap = self.in_proj(hidden_full)
+        zxdtAtrap = self.in_proj(hidden_states)
         offset = 0
         z = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
         x = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
@@ -3603,7 +3710,7 @@ class DragonMamba3MimoFast(nn.Module):
         A = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
         trap = zxdtAtrap[..., offset : offset + 2 * self.nheads_local_tp] # Trap might need 2x? check dim
 
-        BCangle = self.in_proj_dyn(hidden_full)
+        BCangle = self.in_proj_dyn(hidden_states)
         B = BCangle[..., 0:self.ngroups*self.mimo_dim*self.d_state]
         C = BCangle[..., self.ngroups*self.mimo_dim*self.d_state:2*self.ngroups*self.mimo_dim*self.d_state]
         angle = BCangle[..., 2*self.ngroups*self.mimo_dim*self.d_state:] # (L, B, S)
@@ -3641,9 +3748,9 @@ class DragonMamba3MimoFast(nn.Module):
         dt = rearrange(dt, "b l n -> b n l")
 
         y = mamba3_tilelang(
-            Q=C.contiguous(),
-            K=B.contiguous(),
-            V=x.contiguous(),
+            Q=C.contiguous().bfloat16(),
+            K=B.contiguous().bfloat16(),
+            V=x.contiguous().bfloat16(),
             ADT=ADT.to(torch.float32).contiguous(),
             DT=dt.to(torch.float32).contiguous(),
             Trap=trap.contiguous(),
@@ -3665,10 +3772,152 @@ class DragonMamba3MimoFast(nn.Module):
             y = self.output_norm(y)
         #y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads_local_tp)
 
+        if self.config.complete_slw and self.config.slw_wsize > 128:
+            y = y.reshape(batch, l, -1).contiguous()
         if cache_params is not None:
             y = y[:, -L_new:, ...].contiguous()
 
         return y, None, None
+    
+    def _preprocess(self, A_proj, dd_dt, B, C, x, z, trap_proj, angle_proj):
+        _A = -F.softplus(A_proj.to(torch.float32))
+        _A = torch.clamp(_A, max=-self.A_floor)
+        DT = F.softplus(dd_dt + self.dt_bias)
+        trap = torch.sigmoid(trap_proj)
+
+        B = rearrange(B, "b (r g s) -> b r g s", g=self.ngroups, r=self.mimo_dim)
+        C = rearrange(C, "b (r g s) -> b r g s", g=self.ngroups, r=self.mimo_dim)
+        B = self.B_norm(B)
+        C = self.C_norm(C)
+        B = B.expand(-1, -1, self.nheads, -1) # (B, R, N, S)
+        C = C.expand(-1, -1, self.nheads, -1) # (B, R, N, S)
+    
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+
+        angles = angle_proj.unsqueeze(-2).expand(-1, self.nheads, -1)
+
+        return DT, B, C, x, z, trap, _A, angles
+
+    def step(self, u, angle_state, ssm_state, k_state, v_state):
+        """
+        Decode function using CuteDSL kernel from mamba3_step_fn.py.
+
+        NOTE: Only tested on H100. Compatibility with other hardware
+        will be made available in the future.
+
+        Args:
+            u: (batch, d_model)
+            angle_state: (batch, nheads, num_rope_angles)
+            ssm_state: (batch, nheads, headdim, d_state)
+            k_state: (batch, R, nheads, d_state), where R = mimo_rank
+            v_state: (batch, nheads, headdim)
+        Returns:
+            out: (batch, d_model)
+            nxt_angle_state: (batch, nheads, num_rope_angles)
+            state_out: (batch, nheads, headdim, d_state)
+            nxt_k_state: (batch, R, nheads, d_state), where R = mimo_rank
+            nxt_v_state: (batch, nheads, headdim)
+        """
+
+        zxdtAtrap = self.in_proj(u)
+        offset = 0
+        z = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
+        x = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
+        dt = zxdtAtrap[..., offset : offset + self.nheads_local_tp].float(); offset += self.nheads_local_tp
+        A = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
+        trap = zxdtAtrap[..., offset : offset + 2 * self.nheads_local_tp] # todo Trap might need 2x? check dim
+
+        BCangle = self.in_proj_dyn(u)
+        B = BCangle[..., 0:self.ngroups*self.mimo_dim*self.d_state]
+        C = BCangle[..., self.ngroups*self.mimo_dim*self.d_state:2*self.ngroups*self.mimo_dim*self.d_state]
+        angles = BCangle[..., 2*self.ngroups*self.mimo_dim*self.d_state:] # (L, B, S)
+
+        DT, B, C, x, z, trap, A, angles = self._preprocess(A, dt, B, C, x, z, trap, angles)
+
+        bias_q = rearrange(self.C_bias, "h r n -> r h n")
+        bias_k = rearrange(self.B_bias, "h r n -> r h n")
+
+        C, B, nxt_angle_state = apply_rotary_qk_inference_fwd(
+            q=C,
+            k=B,
+            angle_state=angle_state, 
+            angle_proj=angles,
+            dt=DT,
+            bias_q=bias_q,
+            bias_k=bias_k, 
+            conjugate=False,
+            inplace=False,
+            rotate_pairwise=False
+        )
+
+        nxt_v_state = x
+        nxt_k_state = B
+
+        xpj = rearrange(self.in_proj_mimo_x, "h r p -> r h p", p=self.headdim).contiguous()
+        zpj = rearrange(self.in_proj_mimo_z, "h r p -> r h p", p=self.headdim).contiguous()
+        outpj = rearrange(self.out_proj_mimo, "h r p -> r h p", p=self.headdim).contiguous()
+
+        state_out = torch.empty_like(ssm_state)
+        y = torch.empty_like(x)
+        mamba3_step_fn(
+            ssm_state.to(torch.float32),
+            k_state.to(torch.bfloat16),
+            v_state.to(torch.bfloat16),
+            A,
+            B.to(torch.bfloat16),
+            C.to(torch.bfloat16),
+            self.D,
+            x,
+            DT,
+            trap,
+            xpj,
+            outpj,
+            state_out,
+            y,
+            z=z,
+            zproj=zpj,
+            tile_D=64,
+            num_warps=4,
+        )
+
+        y = rearrange(y, "b h p -> b (h p)")
+
+        return y, nxt_angle_state, state_out, nxt_k_state, nxt_v_state
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, device=None, dtype=None, inplace_state=None, **kwargs):
+        device = self.in_proj.weight.device if device is None else device
+        dtype = self.in_proj.weight.dtype if dtype is None else dtype
+
+        # RoPE State
+        angle_dt_state = torch.zeros(
+            (batch_size, self.nheads, self.num_rope_angles),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # SSM State
+        ssm_state = torch.zeros(
+            (batch_size, self.nheads, self.headdim, self.d_state),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # K (=B) State
+        k_state = torch.zeros(
+            (batch_size, self.mimo_dim, self.nheads, self.d_state),
+            device=device,
+            dtype=dtype,
+        )
+
+        # V (=x) State
+        v_state = torch.zeros(
+            (batch_size, self.nheads, self.headdim),
+            device=device,
+            dtype=dtype,
+        )
+
+        return (angle_dt_state, ssm_state, k_state, v_state)
 
 class DragonMLP(nn.Module):
     def __init__(self, config: DragonConfig, intermediate_size: Optional[int] = None):
@@ -3703,7 +3952,7 @@ class DragonMoE(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        self.moe_gate = DragonLinear(config, config.hidden_size, config.moe_num_routed_experts, bias=False)
+        self.moe_gate = DragonLinear(config, config.hidden_size, config.moe_num_routed_experts, bias=False, cosnet=False)
         if self.config.moe_routed_input_dim:
             self.down_proj = DragonLinear(config, config.hidden_size, config.moe_routed_input_dim, bias=False)
             self.up_proj = DragonLinear(config, config.moe_routed_input_dim, config.hidden_size, bias=False)
@@ -4229,13 +4478,14 @@ class DragonNgramEmbedding(nn.Module):
         x = x / (1 + self.k * (self.n - 1))
         
         return x
-    
+
 class DragonGeodesicNorm(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int):
         super().__init__()
 
         self.scale = nn.Parameter(torch.tensor(1.))
         self.bias = nn.Parameter(torch.tensor(0.))
+        self.register_buffer("prosres_scalar", torch.tensor(1.0))
         self.clamp = torch.pi/4
         self.layer_idx = layer_idx
 
