@@ -86,14 +86,6 @@ except ImportError:
                 "For better performance, consider installing flash-attention (https://github.com/Dao-AILab/flash-attention)."
             )
 
-# differential attention backend selection
-DIFF_ATTN_IMPL = None
-try:
-    import flex_head_fa
-    DIFF_ATTN_IMPL = "flex_head"
-except ImportError:
-    DIFF_ATTN_IMPL = ATTN_IMPL # if we don't have flex_head_fa, fallback to the best attention impl we have
-
 # Gated DeltaNet backend selection
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
@@ -109,10 +101,8 @@ except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
 print(f"Using attention implementation: {ATTN_IMPL}")
-print(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 
 logger.info(f"Using attention implementation: {ATTN_IMPL}")
-logger.info(f"Using differential attention implementation: {DIFF_ATTN_IMPL}")
 logger.info(f"Using Gated DeltaNet implementation: {'fla' if chunk_gated_delta_rule is not None else 'torch'}")
 logger.info(f"Using short convolution implementation: {'causal-conv1d' if causal_conv1d_fn is not None else 'torch'}")
 
@@ -133,17 +123,6 @@ class DragonNorm(nn.Module):
         super().__init__()
         if config.normalization_type == "rmsnorm":
             self.norm = DragonRMSNorm(hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
-        elif config.normalization_type == "seednorm":
-            if config.seednorm_type == 1:
-                self.norm = DragonSeeDNorm(config, hidden_size, eps=config.norm_epsilon)
-            elif config.seednorm_type == 2:
-                self.norm = DragonSeeDNormType2(config, hidden_size, eps=config.norm_epsilon)
-            elif config.seednorm_type == 3:
-                self.norm = DragonSeeDNormType3(config, hidden_size, eps=config.norm_epsilon)
-            elif config.seednorm_type == 4:
-                self.norm = DragonSeeDNormType4(config, hidden_size, eps=config.norm_epsilon)
-            else:
-                raise ValueError(f"Unknown seednorm_type: {config.seednorm_type}")
         else:
             raise ValueError(f"Unknown normalization_type: {config.normalization_type}")
 
@@ -161,112 +140,8 @@ class DragonRMSNorm(nn.Module):
         y = self.rms(hidden_states) * (1.0 + self.weight) if self.zero_centered_gamma else self.rms(hidden_states) * self.weight
         return y
 
-class DragonSeeDNorm(nn.Module):
-    def __init__(self, config: DragonConfig, hidden_size, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        self.alpha = nn.Parameter(torch.ones(hidden_size) * 1.)
-        self.beta = nn.Parameter(torch.zeros(hidden_size))
-        if config.seednorm_wd:
-            self.alpha.requires_weight_decay = True
-            self.beta.requires_weight_decay = True
-        self.gamma = nn.Parameter(torch.ones(hidden_size))
-        self.rms = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
-
-    def forward(self, hidden_states):
-        rescale = F.tanh(hidden_states @ self.beta) # (B, L) 
-        dynamic_scale = rescale.unsqueeze(-1) * self.alpha # (B, L, D)
-        return (dynamic_scale + self.gamma) * self.rms(hidden_states)
-
-class DragonSeeDNormType2(nn.Module):
-    def __init__(self, config: DragonConfig, hidden_size, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        self.beta = DragonLinear(config, hidden_size, 1, bias=False)
-        self.alpha = nn.Parameter(torch.ones(hidden_size) * 1.)
-        if config.seednorm_wd:
-            self.alpha.requires_weight_decay = True
-        self.gamma = nn.Parameter(torch.ones(hidden_size))
-        self.rms = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
-
-    def forward(self, hidden_states):
-        rescale = F.tanh(self.beta(hidden_states)) # (B, L, 1)
-        dynamic_scale = rescale * self.alpha # (B, L, D)
-        return (dynamic_scale + self.gamma) * self.rms(hidden_states)
-
-class DragonSeeDNormType3(nn.Module):
-    def __init__(self, config: DragonConfig, hidden_size, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        self.beta = nn.Sequential(
-            DragonLinear(config, hidden_size, config.seednorm_rank, bias=False),
-            DragonLinear(config, config.seednorm_rank, hidden_size, bias=False),
-        )
-        self.gamma = nn.Parameter(torch.ones(hidden_size))
-        self.rms = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
-
-    def forward(self, hidden_states):
-        dynamic_rescale = F.tanh(self.beta(hidden_states)) # (B, L, D)
-        return (dynamic_rescale + self.gamma) * self.rms(hidden_states)
-
-class DragonSeeDNormType4(nn.Module):
-    def __init__(self, config: DragonConfig, hidden_size, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-
-        self.beta = nn.Sequential(
-            DragonLinear(config, hidden_size, config.seednorm_rank, bias=False),
-            DragonLinear(config, config.seednorm_rank, hidden_size, bias=False),
-        )
-        self.rms = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
-
-    def forward(self, hidden_states):
-        dynamic_rescale = F.silu(self.beta(hidden_states) + 1.15) # (B, L, D)
-        return dynamic_rescale * self.rms(hidden_states)
-
-class DragonLayerNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6): # TODO: ZCG ?
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        return F.layer_norm(x.float(), (self.hidden_size,), self.weight, self.bias, self.eps).type_as(x)
-
-class DragonDeRF(nn.Module):
-    def __init__(self, config: DragonConfig, normalized_shape, alpha_init_value=0.5, shift_init_value=0.0):
-        super().__init__()
-        self.config = config
-        self.normalized_shape = normalized_shape
-        self.alpha_init_value = alpha_init_value
-        self.shift_init_value = shift_init_value
-
-        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
-        self.shift = nn.Parameter(torch.ones(1) * shift_init_value)
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-
-    def forward(self, x):
-        return self.weight * torch.erf(self.alpha * x + self.shift) + self.bias
-
-class ScaledGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, forward_scale, backward_scale):
-        ctx.backward_scale = backward_scale
-        return x * forward_scale
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output * ctx.backward_scale, None, None
-
 class DragonLinear(nn.Linear):
-    """Linear layer with different forward/backward scalings."""
-    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, alpha_fwd=None, alpha_bwd=None, cosnet=True, **kwargs):
+    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, cosnet=True, **kwargs):
         super().__init__(in_features, out_features, bias, **kwargs)
         self.config = config
 
@@ -277,20 +152,11 @@ class DragonLinear(nn.Linear):
                 rank=config.cosnet_rank,
             )
 
-        if alpha_fwd is None:
-            alpha_fwd = 1.0 / math.sqrt(in_features)
-
-        if not config.use_uscaling:
-            alpha_fwd, alpha_bwd = 1, None
-
-        self.alpha_fwd = float(alpha_fwd)
-        self.alpha_bwd = float(alpha_bwd if alpha_bwd is not None else alpha_fwd)
-
     def forward(self, x):
         out = super().forward(x)
         if self.config.cosnet:
             out = out + self.cosnet_branch(x)
-        return ScaledGrad.apply(out, self.alpha_fwd, self.alpha_bwd)
+        return out
 
 class DragonCosNetBranch(nn.Module):
     def __init__(
@@ -325,13 +191,6 @@ class DragonCosNetBranch(nn.Module):
         h = torch.cos(h * self.omega2 + self.phi2)
         return self.up(h)
 
-class DragonScale(nn.Module):
-    def __init__(self, s: float):
-        super().__init__()
-        self.s = s
-    def forward(self, x):
-        return x * self.s
-
 class HybridDragonDynamicCache(DynamicCache):
     """
     A dynamic cache that handle both the attention cache (which has a seq_len dimension) and the GDN cache
@@ -359,15 +218,7 @@ class HybridDragonDynamicCache(DynamicCache):
         # gdn
         self.conv_caches = []
         self.ssm_caches = []
-        # kda
-        self.q_conv_caches = []
-        self.k_conv_caches = []
-        self.v_conv_caches = []
-        # cca v2
-        self.conv_states = []
-        self.prev_hs = []
-        self.has_previous_state = False
-        # mamba3 (naive prefix replay cache): stores (B, T_seen, D) per layer
+        # mamba3
         self.mamba3_hs = [None for _ in range(len(config.layers_config))]
         self.mamba3_angle_states = [None for _ in range(len(config.layers_config))]
         self.mamba3_ssm_states = [None for _ in range(len(config.layers_config))]
@@ -646,7 +497,7 @@ class DragonAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.hidden_size = config.hidden_size
-        self.head_dim = config.head_dim # if config.head_dim else config.hidden_size * config.expand_factor // self.num_attention_heads
+        self.head_dim = config.head_dim
         self.qk_norm = config.qk_norm
         self.window_size = config.sliding_window_size
         self.reuse_kv = reuse_kv
@@ -759,7 +610,7 @@ class DragonAttention(nn.Module):
             causal=True,
             wsize=wsize,
             softcap=self.config.softcap_attn,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
+            softmax_scale=None if not self.config.use_completed_p else 1/self.head_dim,
         )
         if len(attn_output.shape) == 3:
             attn_output = attn_output.view(query_states.size(0), query_states.size(1), attn_output.size(-2), attn_output.size(-1)) # keep (B, L, H, D)
@@ -788,7 +639,7 @@ class DragonTensorProductAttention(nn.Module):
             )
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
-        self.head_dim = config.head_dim #if config.head_dim else config.hidden_size * config.expand_factor // self.num_attention_heads
+        self.head_dim = config.head_dim
         self.rank = config.tpa_rank
         self.qk_norm = config.qk_norm
         self.window_size = config.sliding_window_size
@@ -801,12 +652,9 @@ class DragonTensorProductAttention(nn.Module):
         self.W_B_v = DragonLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
 
         if self.config.token_shift_attn:
+            self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
+            self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
             if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
                 self.shift_proj_k.is_scalar_weight = True
                 self.shift_proj_v.is_scalar_weight = True
 
@@ -982,7 +830,7 @@ class DragonTensorProductAttention(nn.Module):
             causal=True,
             wsize=wsize,
             softcap=self.config.softcap_attn,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
+            softmax_scale=None if not self.config.use_completed_p else 1/self.head_dim,
         )
         if len(attn_output.shape) == 3:
             attn_output = attn_output.view(query_states.size(0), query_states.size(1), attn_output.size(-2), attn_output.size(-1)) # keep (B, L, H, D)
@@ -991,331 +839,6 @@ class DragonTensorProductAttention(nn.Module):
         #    cache_params.trim(self.layer_idx)
 
         return attn_output, last_key_states, last_value_states
-
-class DragonDifferentialAttention(nn.Module):
-    """
-    Multi-headed differential attention (https://arxiv.org/abs/2410.05258)
-    """
-
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_signal_heads = config.num_signal_heads_diff if config.num_signal_heads_diff else self.num_attention_heads//2
-        self.num_noise_heads = self.num_attention_heads - self.num_signal_heads
-        self.hidden_size = config.hidden_size
-        assert config.head_dim
-        self.head_dim = config.head_dim #if config.head_dim else 2 * config.hidden_size * config.expand_factor // self.num_attention_heads
-        self.head_v_dim = self.head_dim # typically 256
-        self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
-        self.qk_norm = config.qk_norm
-        self.softcap = config.softcap_attn
-        self.scalable_softmax = config.scalable_softmax
-
-        projection_dim = self.head_qk_dim * self.num_attention_heads + self.head_qk_dim * self.num_key_value_heads + (self.head_v_dim * self.num_noise_heads//2)
-        self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
-
-        if self.config.token_shift_attn:
-            if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_noise_heads//2, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_noise_heads//2, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_k.is_scalar_weight = True
-                self.shift_proj_v.is_scalar_weight = True
-
-        if self.config.token_conv1d_attn:
-            self.conv_size = config.conv_kernel
-            self.conv_dim = self.num_attention_heads * self.head_qk_dim + self.num_key_value_heads * self.head_qk_dim + (self.num_noise_heads//2) * self.head_v_dim
-            self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
-            self.causal_conv1d_fn = causal_conv1d_fn
-            self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-
-        if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_qk_dim)
-            self.k_norm = DragonNorm(config, self.head_qk_dim)
-
-        if self.scalable_softmax:
-            self.softmax_scaler = nn.Parameter(torch.ones(self.num_attention_heads, dtype=torch.float32))
-
-        self.register_buffer("lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * (layer_idx+1))), persistent=False)
-        self.lambda_q1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-
-        if ATTN_IMPL == "flex":
-            # score mod (for softcap)
-            def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_attn > 0.:
-                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
-                return score
-            self.score_mod = score_mod
-            # block mask (for causal & sliding window)
-            def build_mask(wsize):
-                if wsize == -1:
-                    wsize = self.config.max_position_embeddings
-                def sliding_window(b, h, q_idx, kv_idx):
-                    return q_idx - kv_idx <= wsize
-                def causal_mask(b, h, q_idx, kv_idx):
-                    return q_idx >= kv_idx
-                self.attn_mask = and_masks(causal_mask, sliding_window)
-                return wsize
-            self.build_mask = build_mask
-            self.last_wsize = self.build_mask(self.config.slw_wsize)
-
-        if self.config.rope_theta > 0.0 and self.config.rope_type != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
-        else:
-            self.rotary_emb = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        **kwargs,
-    ):
-        _, q_len, _ = hidden_states.shape
-        use_precomputed_states = (cache_params is not None and q_len == 1)
-
-        # Q, K, V projections.
-        #query_states, key_states, value_states = get_query_key_value_tensors(self, hidden_states)
-        mixed_qkv = self.linear_qkv(hidden_states)
-        query_states, key_states, value_states = torch.split(
-            mixed_qkv,
-            [self.num_attention_heads * self.head_qk_dim,
-             self.num_key_value_heads * self.head_qk_dim,
-             self.num_noise_heads//2 * self.head_v_dim],
-            dim=-1,
-        ) # WARNING: not TP aware
-        query_states = rearrange(query_states, "b l (h d) -> b l h d", h=self.num_attention_heads)
-        key_states   = rearrange(key_states, "b l (h d) -> b l h d", h=self.num_key_value_heads)
-        value_states = rearrange(value_states, "b l (h d) -> b l h d", h=self.num_noise_heads//2)
-        assert query_states.size(3) == self.head_qk_dim
-        assert key_states.size(3) == self.head_qk_dim
-        assert value_states.size(3) == self.head_v_dim
-
-        # token-shift.
-        if self.config.token_shift_attn:
-            alpha_k = torch.sigmoid(self.shift_proj_k(hidden_states).float()).float().to(key_states.dtype).unsqueeze(-1) # (B, L, Hkv, 1)
-            alpha_v = torch.sigmoid(self.shift_proj_v(hidden_states).float()).float().to(value_states.dtype).unsqueeze(-1) # (B, L, Hkv//2, 1)
-
-            if cache_params is not None:
-                k_last, v_last = cache_params.get_last_kv(self.layer_idx)
-                B, L = key_states.shape[:2]
-
-                if L == 1:
-                    # decode step
-                    if k_last is None:
-                        k_prev = torch.zeros_like(key_states)      # (B, 1, H, D)
-                        v_prev = torch.zeros_like(value_states)    # (B, 1, H, D)
-                    else:
-                        k_prev, v_prev = k_last, v_last            # (B, 1, H, D)
-                else:
-                    # prefill step: first token uses cached last, rest shift within the chunk
-                    first_k = k_last if k_last is not None else torch.zeros_like(key_states[:, :1])
-                    first_v = v_last if v_last is not None else torch.zeros_like(value_states[:, :1])
-                    k_prev = torch.cat([first_k, key_states[:, :-1]], dim=1)   # (B, L, H, D)
-                    v_prev = torch.cat([first_v, value_states[:, :-1]], dim=1) # (B, L, H, D)
-
-                # keep caching the *raw* last KV from this chunk (matches the no-cache path)
-                cache_params.set_last_kv(self.layer_idx, key_states[:, -1:], value_states[:, -1:])
-            else:
-                k_prev = F.pad(key_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-                v_prev = F.pad(value_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-
-            if position_ids is not None:
-                # first token of each doc has pos==0
-                doc_start = (position_ids == 0) # (B, L) bool
-                m = doc_start.unsqueeze(-1).unsqueeze(-1) # (B, L, 1, 1) bool
-
-                # zero the previous contribution at boundaries
-                k_prev  = k_prev.masked_fill(m, 0)
-                v_prev  = v_prev.masked_fill(m, 0)
-                alpha_k = alpha_k.masked_fill(m, 0)
-                alpha_v = alpha_v.masked_fill(m, 0)
-
-            key_states = alpha_k * k_prev + (1 - alpha_k) * key_states
-            value_states = alpha_v * v_prev + (1 - alpha_v) * value_states
-
-        # conv.
-        if self.config.token_conv1d_attn:
-            # --- pack for conv ---
-            q_proj = rearrange(query_states, "b l h d -> b l (h d)")
-            k_proj = rearrange(key_states, "b l g d -> b l (g d)")
-            v_proj = rearrange(value_states, "b l g d -> b l (g d)")
-            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)
-
-            if cache_params is not None:
-                conv_cache = cache_params.conv_caches[self.layer_idx]
-
-            if use_precomputed_states:
-                mixed_qkv = self.causal_conv1d_update(
-                    mixed_qkv,
-                    conv_cache,
-                    self.qkv_conv1d.weight.squeeze(1),
-                    self.qkv_conv1d.bias,
-                    'silu',
-                ) # conv_cache is updated in-place here
-            else:
-                if cache_params is not None:
-                    conv_cache = F.pad(mixed_qkv, (self.conv_size - mixed_qkv.shape[-1], 0))
-                    cache_params.conv_caches[self.layer_idx] = conv_cache
-                if self.causal_conv1d_fn is not None:
-                    mixed_qkv = self.causal_conv1d_fn(
-                        x=mixed_qkv,
-                        weight=self.qkv_conv1d.weight.squeeze(1),
-                        bias=self.qkv_conv1d.bias,
-                        activation='silu',
-                        seq_idx=None,
-                    )
-                else:
-                    mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :q_len])
-
-            # split back
-            mixed_qkv = mixed_qkv.transpose(1, 2)
-            q_proj, k_proj, v_proj = torch.split(
-                mixed_qkv,
-                [self.num_attention_heads*self.head_qk_dim, self.num_key_value_heads*self.head_qk_dim, (self.num_noise_heads//2)*self.head_v_dim],
-                dim=-1,
-            )
-            query_states = rearrange(q_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
-            key_states = rearrange(k_proj, "b l (g d) -> b l g d", g=self.num_key_value_heads)
-            value_states = rearrange(v_proj, "b l (g d) -> b l g d", g=self.num_noise_heads//2)
-
-        # QK-norm.
-        if self.qk_norm:
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        wsize = self.config.slw_wsize
-
-        #rope
-        if self.rotary_emb is not None:
-            cos, sin = self.rotary_emb(hidden_states, position_ids)
-            if self.config.rope_type == "rope":
-                query_states = apply_rotary_emb(query_states, cos, sin)
-                key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type == "p-rope":
-                query_states = apply_p_rotary_emb(query_states, cos, sin)
-                key_states = apply_p_rotary_emb(key_states, cos, sin)
-            else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
-        # scalable softmax.
-        if self.scalable_softmax:
-            # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            T = query_states.size(1)
-            pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
-            log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
-            query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
-            # TODO: caching mechanism for log_pos
-
-        # KV-cache.
-        if cache_params is not None:
-            key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
-
-        # attention computation.
-        # split q,k heads into two groups
-        #query1_states, query2_states = query_states[:, :, torch.arange(0, self.num_attention_heads, 2)].contiguous(), query_states[:, :, torch.arange(1, self.num_attention_heads, 2)].contiguous()
-        #key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
-
-        # at this point :
-        # query_states : (B, L, num_heads, D) -> q1: (B, L, num_signal_heads), q2: (B, L, num_noise_heads, D)
-        # key_states : (B, L, num_kv_heads, D) -> k1: (B, L, num_signal_heads//2), k2: (B, L, num_noise_heads//2, D) # todo: 2 is hardcoded here, but it's the GQA factor!!
-        # value_states : (B, L, num_noise_heads//2, 2*D) -> value_states, value_sig_states: (B, L, num_signal_heads//2, 2*D)
-        query1_states, query2_states = query_states[:, :, :self.num_signal_heads, :], query_states[:, :, self.num_signal_heads:, :] # WARNING: not TP aware
-        key1_states, key2_states = key_states[:, :, :self.num_signal_heads//2, :], key_states[:, :, self.num_signal_heads//2:, :]
-        # expand v for signal attn
-
-        assert value_states.size(3) == self.head_v_dim
-
-        value_sig_states = value_states.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        if DIFF_ATTN_IMPL == "flex_head":
-            diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-        elif DIFF_ATTN_IMPL == "fa2":
-            def diff_attention_interface(q, k, v, wsize, **kw):
-                if self.head_qk_dim == self.head_v_dim:
-                    if not self.config.intra_doc_masking:
-                        return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-                    else:
-                        return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]
-                v2 = v[:, :, :, D//2:]
-                if not self.config.intra_doc_masking:
-                    o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
-                    o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
-                else:
-                    o1 = flash_attn_varlen_func(q[0], k[0], v1[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
-                    o2 = flash_attn_varlen_func(q[0], k[0], v2[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
-                o = torch.cat([o1, o2], dim=-1)
-                return o
-        elif DIFF_ATTN_IMPL == "fa3":
-            def diff_attention_interface(q, k, v, wsize, **kw):
-                if self.head_qk_dim == self.head_v_dim:
-                    if not self.config.intra_doc_masking:
-                        return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
-                    else:
-                        return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]
-                v2 = v[:, :, :, D//2:]
-                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)[0]
-                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)[0]
-                o = torch.cat([o1, o2], dim=-1)
-                return o
-        elif DIFF_ATTN_IMPL == "flex":
-            if wsize != self.last_wsize:
-                self.last_wsize = self.build_mask(wsize)
-            diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
-        elif DIFF_ATTN_IMPL == "eager":
-            diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
-
-        y1 = diff_attention_interface(
-            query1_states.bfloat16(),
-            key1_states.bfloat16(),
-            value_sig_states.bfloat16(),
-            causal=True,
-            wsize=wsize,
-            softcap=self.softcap,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_qk_dim,
-        )
-        y2 = diff_attention_interface(
-            query2_states.bfloat16(),
-            key2_states.bfloat16(),
-            value_states.bfloat16(),
-            causal=True,
-            wsize=wsize,
-            softcap=self.softcap,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_qk_dim,
-        )
-        if len(y1.shape) == 3:
-            y1 = y1.view(query1_states.size(0), query1_states.size(1), y1.size(-2), y1.size(-1)) # keep (B, L, H/2, D)
-            y2 = y2.view(query1_states.size(0), query1_states.size(1), y2.size(-2), y2.size(-1))
-        y2 = y2.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H/2)
-        lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
-        lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
-        attn_output = (y1 - lambda_full * y2).contiguous() # (B, L, num_signal_heads, D)
-
-        #if cache_params is not None:
-        #    cache_params.trim(self.layer_idx)
-
-        return attn_output, None, None
 
 class DragonDifferentialAttentionV2(nn.Module):
     """
@@ -1499,7 +1022,7 @@ class DragonDifferentialAttentionV2(nn.Module):
             causal=True,
             wsize=wsize,
             softcap=self.config.softcap_attn,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
+            softmax_scale=None if self.config.use_completed_p else 1/self.head_dim,
         ) # (B, L, H, D)
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.head_dim) # (B, L, num_noise_heads, snr+1, D)
         attn_sig = attn_output[:, :, :, :self.snr, :] # (B, L, num_noise_heads, snr, D)
@@ -1508,685 +1031,6 @@ class DragonDifferentialAttentionV2(nn.Module):
         lambda_val = self.lambda_proj(hidden_states).unsqueeze(-1).unsqueeze(-1) # (B, L, H, 1, 1)
         attn_output = attn_sig - torch.sigmoid(lambda_val) * attn_noi # (B, L, num_noise_heads, snr, D) (each noise head is broadcasted/repeated SNR times)
         attn_output = attn_output.view(attn_output.size(0), attn_output.size(1), -1, self.head_dim) # (B, L, num_signal_heads, D)
-
-        return attn_output, None, None
-
-class DragonDifferentialMultiLatentAttention(nn.Module):
-    FIRST_ATTENTION = None
-    """
-    Multi-headed differential attention (https://arxiv.org/abs/2410.05258)
-    """
-
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-        self.num_attention_heads = config.num_attention_heads
-        self.num_signal_heads = config.num_signal_heads_diff if config.num_signal_heads_diff else self.num_attention_heads//2
-        self.num_noise_heads = self.num_attention_heads - self.num_signal_heads
-        self.hidden_size = config.hidden_size
-        assert config.head_dim
-        self.head_dim = config.head_dim #if config.head_dim else 2 * config.hidden_size * config.expand_factor // self.num_attention_heads
-        self.head_v_dim = self.head_dim # typically 256
-        self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
-        self.kv_rank = config.mla_kv_rank
-        self.qk_norm = config.qk_norm
-        self.softcap = config.softcap_attn
-        self.scalable_softmax = config.scalable_softmax
-
-        self.linear_q = DragonLinear(config, config.hidden_size, self.head_qk_dim * self.num_attention_heads, bias=False)
-        self.linear_kv_down = DragonLinear(config, config.hidden_size, self.kv_rank, bias=False)
-        self.kv_latent_norm = DragonNorm(config, self.kv_rank)
-        self.linear_kv_up = DragonLinear(config, self.kv_rank, self.num_attention_heads * self.head_qk_dim + self.num_noise_heads * self.head_v_dim, bias=False)
-
-        if self.config.token_shift_attn:
-            if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_noise_heads, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_noise_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_k.is_scalar_weight = True
-                self.shift_proj_v.is_scalar_weight = True
-
-        if self.config.token_conv1d_attn:
-            self.conv_size = config.conv_kernel
-            self.conv_dim = self.num_attention_heads * self.head_qk_dim + self.num_attention_heads * self.head_qk_dim + self.num_noise_heads * self.head_v_dim
-            self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
-            self.causal_conv1d_fn = causal_conv1d_fn
-            self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-
-        if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_qk_dim)
-            self.k_norm = DragonNorm(config, self.head_qk_dim)
-
-        if self.scalable_softmax:
-            self.softmax_scaler = nn.Parameter(torch.ones(self.num_attention_heads, dtype=torch.float32))
-        
-        self.first_attention = False
-        if config.resformer and DragonDifferentialMultiLatentAttention.FIRST_ATTENTION is None:
-            DragonDifferentialMultiLatentAttention.FIRST_ATTENTION = self
-            self.first_attention = True
-            self.last_values = None
-        
-        if config.resformer:
-            self.resformer_lambda = nn.Parameter(torch.full((2,), 0.5))
-
-        self.register_buffer("lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * (layer_idx+1))), persistent=False)
-        self.lambda_q1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-
-        if ATTN_IMPL == "flex":
-            # score mod (for softcap)
-            def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_attn > 0.:
-                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
-                return score
-            self.score_mod = score_mod
-            # block mask (for causal & sliding window)
-            def build_mask(wsize):
-                if wsize == -1:
-                    wsize = self.config.max_position_embeddings
-                def sliding_window(b, h, q_idx, kv_idx):
-                    return q_idx - kv_idx <= wsize
-                def causal_mask(b, h, q_idx, kv_idx):
-                    return q_idx >= kv_idx
-                self.attn_mask = and_masks(causal_mask, sliding_window)
-                return wsize
-            self.build_mask = build_mask
-            self.last_wsize = self.build_mask(self.config.slw_wsize)
-
-        if self.config.rope_theta > 0.0 and self.config.rope_type != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
-        else:
-            self.rotary_emb = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
-        **kwargs,
-    ):
-        _, q_len, _ = hidden_states.shape
-        use_precomputed_states = (cache_params is not None and q_len == 1)
-
-        # Q, K, V projections.
-        #query_states, key_states, value_states = get_query_key_value_tensors(self, hidden_states)
-        query_states = self.linear_q(hidden_states)
-        query_states = rearrange(query_states, "b l (h d) -> b l h d", h=self.num_attention_heads)
-        kv_latent = self.linear_kv_down(hidden_states) # (B, L, rank)
-        kv = self.linear_kv_up(self.kv_latent_norm(kv_latent)) # (B, L, num_heads*D + num_noise_heads*D)
-        key_states, value_states = torch.split(
-            kv,
-            [self.num_attention_heads * self.head_qk_dim,
-             self.num_noise_heads * self.head_v_dim],
-            dim=-1,
-        ) # WARNING: not TP aware
-        key_states   = rearrange(key_states, "b l (h d) -> b l h d", h=self.num_attention_heads)
-        value_states = rearrange(value_states, "b l (h d) -> b l h d", h=self.num_noise_heads)
-        assert query_states.size(3) == self.head_qk_dim
-        assert key_states.size(3) == self.head_qk_dim
-        assert value_states.size(3) == self.head_v_dim
-
-        # token-shift.
-        if self.config.token_shift_attn:
-            alpha_k = torch.sigmoid(self.shift_proj_k(hidden_states).float()).float().to(key_states.dtype).unsqueeze(-1) # (B, L, Hkv, 1)
-            alpha_v = torch.sigmoid(self.shift_proj_v(hidden_states).float()).float().to(value_states.dtype).unsqueeze(-1) # (B, L, Hkv//2, 1)
-
-            if cache_params is not None:
-                k_last, v_last = cache_params.get_last_kv(self.layer_idx)
-                B, L = key_states.shape[:2]
-
-                if L == 1:
-                    # decode step
-                    if k_last is None:
-                        k_prev = torch.zeros_like(key_states)      # (B, 1, H, D)
-                        v_prev = torch.zeros_like(value_states)    # (B, 1, H, D)
-                    else:
-                        k_prev, v_prev = k_last, v_last            # (B, 1, H, D)
-                else:
-                    # prefill step: first token uses cached last, rest shift within the chunk
-                    first_k = k_last if k_last is not None else torch.zeros_like(key_states[:, :1])
-                    first_v = v_last if v_last is not None else torch.zeros_like(value_states[:, :1])
-                    k_prev = torch.cat([first_k, key_states[:, :-1]], dim=1)   # (B, L, H, D)
-                    v_prev = torch.cat([first_v, value_states[:, :-1]], dim=1) # (B, L, H, D)
-
-                # keep caching the *raw* last KV from this chunk (matches the no-cache path)
-                cache_params.set_last_kv(self.layer_idx, key_states[:, -1:], value_states[:, -1:])
-            else:
-                k_prev = F.pad(key_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-                v_prev = F.pad(value_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-
-            key_states = alpha_k * k_prev + (1 - alpha_k) * key_states
-            value_states = alpha_v * v_prev + (1 - alpha_v) * value_states
-
-        # conv.
-        if self.config.token_conv1d_attn:
-            # --- pack for conv ---
-            q_proj = rearrange(query_states, "b l h d -> b l (h d)")
-            k_proj = rearrange(key_states, "b l g d -> b l (g d)")
-            v_proj = rearrange(value_states, "b l g d -> b l (g d)")
-            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)
-
-            if cache_params is not None:
-                conv_cache = cache_params.conv_caches[self.layer_idx]
-
-            if use_precomputed_states:
-                mixed_qkv = self.causal_conv1d_update(
-                    mixed_qkv,
-                    conv_cache,
-                    self.qkv_conv1d.weight.squeeze(1),
-                    self.qkv_conv1d.bias,
-                    'silu',
-                ) # conv_cache is updated in-place here
-            else:
-                if cache_params is not None:
-                    conv_cache = F.pad(mixed_qkv, (self.conv_size - mixed_qkv.shape[-1], 0))
-                    cache_params.conv_caches[self.layer_idx] = conv_cache
-                if self.causal_conv1d_fn is not None:
-                    mixed_qkv = self.causal_conv1d_fn(
-                        x=mixed_qkv,
-                        weight=self.qkv_conv1d.weight.squeeze(1),
-                        bias=self.qkv_conv1d.bias,
-                        activation='silu',
-                        seq_idx=None,
-                    )
-                else:
-                    mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :q_len])
-
-            # split back
-            mixed_qkv = mixed_qkv.transpose(1, 2)
-            q_proj, k_proj, v_proj = torch.split(
-                mixed_qkv,
-                [self.num_attention_heads*self.head_qk_dim, self.num_attention_heads*self.head_qk_dim, self.num_noise_heads*self.head_v_dim],
-                dim=-1,
-            )
-            query_states = rearrange(q_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
-            key_states = rearrange(k_proj, "b l (g d) -> b l g d", g=self.num_attention_heads)
-            value_states = rearrange(v_proj, "b l (g d) -> b l g d", g=self.num_noise_heads)
-
-        # QK-norm.
-        if self.qk_norm:
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        wsize = self.config.slw_wsize
-
-        #rope
-        if self.rotary_emb is not None:
-            cos, sin = self.rotary_emb(hidden_states, position_ids)
-            if self.config.rope_type == "rope":
-                query_states = apply_rotary_emb(query_states, cos, sin)
-                key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type == "p-rope":
-                query_states = apply_p_rotary_emb(query_states, cos, sin)
-                key_states = apply_p_rotary_emb(key_states, cos, sin)
-            else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
-        # scalable softmax.
-        if self.scalable_softmax:
-            # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            T = query_states.size(1)
-            pos = (position_ids.to(torch.float32).view(position_ids.size(0), T, 1, 1) + 1.)
-            log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
-            query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
-            # TODO: caching mechanism for log_pos
-
-        # KV-cache.
-        if cache_params is not None:
-            key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
-
-        # attention computation.
-        # split q,k heads into two groups
-        #query1_states, query2_states = query_states[:, :, torch.arange(0, self.num_attention_heads, 2)].contiguous(), query_states[:, :, torch.arange(1, self.num_attention_heads, 2)].contiguous()
-        #key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
-
-        # at this point :
-        # query_states : (B, L, num_heads, D) -> q1: (B, L, num_signal_heads), q2: (B, L, num_noise_heads, D)
-        # key_states : (B, L, num_kv_heads, D) -> k1: (B, L, num_signal_heads//2), k2: (B, L, num_noise_heads//2, D) # todo: 2 is hardcoded here, but it's the GQA factor!!
-        # value_states : (B, L, num_noise_heads//2, 2*D) -> value_states, value_sig_states: (B, L, num_signal_heads//2, 2*D)
-        query1_states, query2_states = query_states[:, :, :self.num_signal_heads, :], query_states[:, :, self.num_signal_heads:, :] # WARNING: not TP aware
-        key1_states, key2_states = key_states[:, :, :self.num_signal_heads, :], key_states[:, :, self.num_signal_heads:, :]
-        # expand v for signal attn
-
-        assert value_states.size(3) == self.head_v_dim
-
-        if self.config.resformer and self.first_attention:
-            self.last_values = value_states
-        elif self.config.resformer:
-            value_states = self.resformer_lambda[0] * DragonDifferentialAttention.FIRST_ATTENTION.last_values + self.resformer_lambda[1] * value_states
-        
-        assert value_states.size(3) == self.head_v_dim
-
-        value_sig_states = value_states.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        assert value_states.size(3) == self.head_v_dim
-        assert value_sig_states.size(3) == self.head_v_dim
-
-        if DIFF_ATTN_IMPL == "flex_head":
-            diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-        elif DIFF_ATTN_IMPL == "fa2":
-            def diff_attention_interface(q, k, v, wsize, **kw):
-                if self.head_qk_dim == self.head_v_dim:
-                    return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]
-                v2 = v[:, :, :, D//2:]
-                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
-                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
-                o = torch.cat([o1, o2], dim=-1)
-                return o
-        elif DIFF_ATTN_IMPL == "fa3":
-            def diff_attention_interface(q, k, v, wsize, **kw):
-                if self.head_qk_dim == self.head_v_dim:
-                    return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]
-                v2 = v[:, :, :, D//2:]
-                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)[0]
-                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)[0]
-                o = torch.cat([o1, o2], dim=-1)
-                return o
-        elif DIFF_ATTN_IMPL == "flex":
-            if wsize != self.last_wsize:
-                self.last_wsize = self.build_mask(wsize)
-            diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=False).transpose(1, 2)
-        elif DIFF_ATTN_IMPL == "eager":
-            diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
-
-        # attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(q, k, v, window_size=(window_size, 0), **kw)
-        y1 = diff_attention_interface(
-            query1_states.bfloat16(),
-            key1_states.bfloat16(),
-            value_sig_states.bfloat16(),
-            causal=True,
-            wsize=wsize,
-            softcap=self.softcap,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_qk_dim,
-        )
-        y2 = diff_attention_interface(
-            query2_states.bfloat16(),
-            key2_states.bfloat16(),
-            value_states.bfloat16(),
-            causal=True,
-            wsize=wsize,
-            softcap=self.softcap,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_qk_dim,
-        )
-        if len(y1.shape) == 3:
-            y1 = y1.view(query1_states.size(0), query1_states.size(1), y1.size(-2), y1.size(-1)) # keep (B, L, H/2, D)
-            y2 = y2.view(query1_states.size(0), query1_states.size(1), y2.size(-2), y2.size(-1))
-        y2 = y2.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H/2)
-        lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
-        lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
-        attn_output = (y1 - lambda_full * y2).contiguous() # (B, L, num_signal_heads, D)
-
-        #if cache_params is not None:
-        #    cache_params.trim(self.layer_idx)
-
-        return attn_output, None, None
-
-class DragonDifferentialTensorProductAttention(nn.Module):
-    FIRST_ATTENTION = None
-    """
-    Multi-headed differential attention (https://arxiv.org/abs/2410.05258)
-    """
-
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-        self.num_attention_heads = config.num_attention_heads
-        self.num_signal_heads = config.num_signal_heads_diff if config.num_signal_heads_diff else self.num_attention_heads//2
-        self.num_noise_heads = self.num_attention_heads - self.num_signal_heads
-        self.hidden_size = config.hidden_size
-        assert config.head_dim
-        self.head_dim = config.head_dim #if config.head_dim else 2 * config.hidden_size * config.expand_factor // self.num_attention_heads
-        self.head_v_dim = self.head_dim # typically 256
-        self.head_qk_dim = self.head_dim//config.shrink_qk_da # typically 128
-        self.rank = config.tpa_rank
-        self.qk_norm = config.qk_norm
-        self.softcap = config.softcap_attn
-        self.scalable_softmax = config.scalable_softmax
-
-        self.c_q = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.head_qk_dim, bias=False)
-        self.W_A_k = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.rank, bias=False)
-        self.W_A_v = DragonLinear(config, self.hidden_size, self.num_noise_heads * self.rank, bias=False)
-        self.W_B_k = DragonLinear(config, self.hidden_size, self.rank * self.head_qk_dim, bias=False)
-        self.W_B_v = DragonLinear(config, self.hidden_size, self.rank * self.head_v_dim, bias=False)
-
-        if use_ve:
-            self.ve_scalars = nn.Parameter(torch.zeros(self.num_noise_heads, self.head_v_dim, dtype=torch.float32))
-
-        if self.config.token_shift_attn:
-            if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_noise_heads, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_noise_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_k.is_scalar_weight = True
-                self.shift_proj_v.is_scalar_weight = True
-
-        if self.config.token_conv1d_attn:
-            self.conv_size = config.conv_kernel
-            self.conv_dim = self.num_attention_heads * self.head_qk_dim + self.num_attention_heads * self.head_qk_dim + self.num_noise_heads * self.head_v_dim
-            self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
-            self.causal_conv1d_fn = causal_conv1d_fn
-            self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-
-        if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_qk_dim)
-            self.k_norm = DragonNorm(config, self.head_qk_dim)
-
-        if self.scalable_softmax:
-            self.softmax_scaler = nn.Parameter(torch.ones(self.num_attention_heads, dtype=torch.float32))
-
-        self.register_buffer("lambda_init", torch.tensor(0.8 - 0.6 * math.exp(-0.3 * (layer_idx+1))), persistent=False)
-        self.lambda_q1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = torch.nn.Parameter(torch.zeros(self.head_qk_dim//2, dtype=torch.float32).normal_(mean=0,std=0.1))
-
-        if ATTN_IMPL == "flex":
-            # score mod (for softcap)
-            def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-                if self.config.softcap_attn > 0.:
-                    score = self.config.softcap_attn * torch.tanh(score / self.config.softcap_attn)
-                return score
-            self.score_mod = score_mod
-            # block mask (for causal & sliding window)
-            def build_mask(wsize):
-                if wsize == -1:
-                    wsize = self.config.max_position_embeddings
-                def sliding_window(b, h, q_idx, kv_idx):
-                    return q_idx - kv_idx <= wsize
-                def causal_mask(b, h, q_idx, kv_idx):
-                    return q_idx >= kv_idx
-                self.attn_mask = and_masks(causal_mask, sliding_window)
-                return wsize
-            self.build_mask = build_mask
-            self.last_wsize = self.build_mask(self.config.slw_wsize)
-
-        if self.config.rope_theta > 0.0 and self.config.rope_type != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_qk_dim, theta=config.rope_theta)
-        else:
-            self.rotary_emb = None
-
-    def _signal_noise_local_indices(self, tp_rank: int, tp_size: int, device):
-        H_tot = self.num_attention_heads
-        H_local = H_tot // tp_size
-        S_tot = self.num_signal_heads
-        N_tot = H_tot - S_tot
-        g = math.gcd(S_tot, N_tot)
-        s_block = S_tot // g
-        n_block = N_tot // g
-        cycle = s_block + n_block
-
-        base = tp_rank * H_local                               # global head offset for this TP rank
-        h_global = torch.arange(H_local, device=device) + base # [H_local]
-        pos = h_global % cycle
-        is_signal = pos < s_block
-        sig_idx = torch.nonzero(is_signal, as_tuple=False).squeeze(-1) # local indices
-        noi_idx = torch.nonzero(~is_signal, as_tuple=False).squeeze(-1)
-        return sig_idx, noi_idx
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        max_seqlen: Optional[int] = None,
-        ve=None,
-        **kwargs,
-    ):
-        b, q_len, _ = hidden_states.shape
-        use_precomputed_states = (cache_params is not None and q_len == 1)
-
-        # Q, K, V projections.
-        query_states = self.c_q(hidden_states).view(b, q_len, self.num_attention_heads, self.head_qk_dim)
-        A_k = self.W_A_k(hidden_states).view(b, q_len, self.num_attention_heads, self.rank)
-        A_v = self.W_A_v(hidden_states).view(b, q_len, self.num_noise_heads, self.rank)
-        B_k = self.W_B_k(hidden_states).view(b, q_len, self.rank, self.head_qk_dim)
-        B_v = self.W_B_v(hidden_states).view(b, q_len, self.rank, self.head_v_dim)
-        # (rope done on query_states and B_k)
-        A_k = A_k.view(b * q_len, self.num_attention_heads, self.rank)
-        A_v = A_v.view(b * q_len, self.num_noise_heads, self.rank)
-        B_k = B_k.view(b * q_len, self.rank, self.head_qk_dim)
-        B_v = B_v.view(b * q_len, self.rank, self.head_v_dim)
-        key_states = torch.bmm(A_k, B_k).div_(self.rank).view(b, q_len, self.num_attention_heads, self.head_qk_dim)
-        value_states = torch.bmm(A_v, B_v).div_(self.rank).view(b, q_len, self.num_noise_heads, self.head_v_dim)
-
-        # value embeddings
-        if ve is not None:
-            value_states = value_states + self.ve_scalars * ve.view_as(value_states)
-
-        # token-shift.
-        if self.config.token_shift_attn:
-            alpha_k = torch.sigmoid(self.shift_proj_k(hidden_states).float()).float().to(key_states.dtype).unsqueeze(-1) # (B, L, Hkv, 1)
-            alpha_v = torch.sigmoid(self.shift_proj_v(hidden_states).float()).float().to(value_states.dtype).unsqueeze(-1) # (B, L, Hkv//2, 1)
-
-            if cache_params is not None:
-                assert position_ids is not None, "position_ids required for token-shift with caching!"
-                k_last, v_last = cache_params.get_last_kv(self.layer_idx)
-                B, L = key_states.shape[:2]
-
-                if L == 1:
-                    # decode step
-                    if k_last is None:
-                        k_prev = torch.zeros_like(key_states)      # (B, 1, H, D)
-                        v_prev = torch.zeros_like(value_states)    # (B, 1, H, D)
-                    else:
-                        k_prev, v_prev = k_last, v_last            # (B, 1, H, D)
-                else:
-                    # prefill step: first token uses cached last, rest shift within the chunk
-                    first_k = k_last if k_last is not None else torch.zeros_like(key_states[:, :1])
-                    first_v = v_last if v_last is not None else torch.zeros_like(value_states[:, :1])
-                    k_prev = torch.cat([first_k, key_states[:, :-1]], dim=1)   # (B, L, H, D)
-                    v_prev = torch.cat([first_v, value_states[:, :-1]], dim=1) # (B, L, H, D)
-
-                # keep caching the *raw* last KV from this chunk (matches the no-cache path)
-                cache_params.set_last_kv(self.layer_idx, key_states[:, -1:], value_states[:, -1:])
-            else:
-                k_prev = F.pad(key_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-                v_prev = F.pad(value_states, (0, 0, 0, 0, 1, 0))[:, :-1] # (B, L, H, D)
-
-            if position_ids is not None:
-                # first token of each doc has pos==0
-                doc_start = (position_ids == 0) # (B, L) bool
-            else:
-                B, L = hidden_states.shape[:2]
-                doc_start = torch.zeros(B, L, dtype=torch.bool, device=hidden_states.device)
-                doc_start[:, 0] = True
-            m = doc_start.unsqueeze(-1).unsqueeze(-1) # (B, L, 1, 1) bool
-
-            # zero the previous contribution at boundaries
-            k_prev  = k_prev.masked_fill(m, 0)
-            v_prev  = v_prev.masked_fill(m, 0)
-            alpha_k = alpha_k.masked_fill(m, 0)
-            alpha_v = alpha_v.masked_fill(m, 0)
-
-            key_states = alpha_k * k_prev + (1 - alpha_k) * key_states
-            value_states = alpha_v * v_prev + (1 - alpha_v) * value_states
-
-        # conv.
-        if self.config.token_conv1d_attn:
-            # --- pack for conv ---
-            q_proj = rearrange(query_states, "b l h d -> b l (h d)")
-            k_proj = rearrange(key_states, "b l g d -> b l (g d)")
-            v_proj = rearrange(value_states, "b l g d -> b l (g d)")
-            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)
-
-            if cache_params is not None:
-                conv_cache = cache_params.conv_caches[self.layer_idx]
-
-            if use_precomputed_states:
-                mixed_qkv = self.causal_conv1d_update(
-                    mixed_qkv,
-                    conv_cache,
-                    self.qkv_conv1d.weight.squeeze(1),
-                    self.qkv_conv1d.bias,
-                    'silu',
-                ) # conv_cache is updated in-place here
-            else:
-                if cache_params is not None:
-                    conv_cache = F.pad(mixed_qkv, (self.conv_size - mixed_qkv.shape[-1], 0))
-                    cache_params.conv_caches[self.layer_idx] = conv_cache
-                if self.causal_conv1d_fn is not None:
-                    mixed_qkv = self.causal_conv1d_fn(
-                        x=mixed_qkv,
-                        weight=self.qkv_conv1d.weight.squeeze(1),
-                        bias=self.qkv_conv1d.bias,
-                        activation='silu',
-                        seq_idx=None,
-                    )
-                else:
-                    mixed_qkv = F.silu(self.qkv_conv1d(mixed_qkv)[:, :, :q_len])
-
-            # split back
-            mixed_qkv = mixed_qkv.transpose(1, 2)
-            q_proj, k_proj, v_proj = torch.split(
-                mixed_qkv,
-                [self.num_attention_heads*self.head_qk_dim, self.num_attention_heads*self.head_qk_dim, self.num_noise_heads*self.head_v_dim],
-                dim=-1,
-            )
-            query_states = rearrange(q_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
-            key_states = rearrange(k_proj, "b l (g d) -> b l g d", g=self.num_attention_heads)
-            value_states = rearrange(v_proj, "b l (g d) -> b l g d", g=self.num_noise_heads)
-
-        # QK-norm.
-        if self.qk_norm:
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        wsize = self.config.slw_wsize
-
-        #rope
-        if self.rotary_emb is not None:
-            cos, sin = self.rotary_emb(hidden_states, position_ids)
-            if self.config.rope_type == "rope":
-                query_states = apply_rotary_emb(query_states, cos, sin)
-                key_states = apply_rotary_emb(key_states, cos, sin)
-            elif self.config.rope_type == "p-rope":
-                query_states = apply_p_rotary_emb(query_states, cos, sin)
-                key_states = apply_p_rotary_emb(key_states, cos, sin)
-            else:
-                raise ValueError(f"Unknow rope type : {self.config.rope_type}")
-        # scalable softmax.
-        if self.scalable_softmax:
-            # scalable-softmax (https://arxiv.org/abs/2501.19399): multiply q by s*log(n)
-            pos = (position_ids.to(torch.float32).view(1, query_states.size(1), 1, 1) + 1.)
-            log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
-            query_states = (self.softmax_scaler.view(1, 1, -1, 1) * log_pos) * query_states
-            # TODO: caching mechanism for log_pos
-
-        # KV-cache.
-        if cache_params is not None:
-            key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
-
-        # attention computation.
-        # split q,k heads into two groups
-        #query1_states, query2_states = query_states[:, :, torch.arange(0, self.num_attention_heads, 2)].contiguous(), query_states[:, :, torch.arange(1, self.num_attention_heads, 2)].contiguous()
-        #key1_states, key2_states = key_states[:, :, torch.arange(0, self.num_key_value_heads, 2)].contiguous(), key_states[:, :, torch.arange(1, self.num_key_value_heads, 2)].contiguous()
-
-        # at this point :
-        # query_states : (B, L, num_heads, D) -> q1: (B, L, num_signal_heads), q2: (B, L, num_noise_heads, D)
-        # key_states : (B, L, num_kv_heads, D) -> k1: (B, L, num_signal_heads//2), k2: (B, L, num_noise_heads//2, D) # todo: 2 is hardcoded here, but it's the GQA factor!!
-        # value_states : (B, L, num_noise_heads//2, 2*D) -> value_states, value_sig_states: (B, L, num_signal_heads//2, 2*D)
-        #query1_states, query2_states = query_states[:, :, :self.num_signal_heads, :], query_states[:, :, self.num_signal_heads:, :] # WARNING: not TP aware
-        #key1_states, key2_states = key_states[:, :, :self.num_signal_heads, :], key_states[:, :, self.num_signal_heads:, :]
-
-        sig_idx, noi_idx = self._signal_noise_local_indices(tp_rank=0, tp_size=1, device=query_states.device)
-        query1_states, query2_states = query_states.index_select(2, sig_idx), query_states.index_select(2, noi_idx)
-        key1_states, key2_states = key_states.index_select(2, sig_idx), key_states.index_select(2, noi_idx)
-        value_sig_states = value_states.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1) # expand v for signal attn
-
-        if DIFF_ATTN_IMPL == "flex_head":
-            diff_attention_interface = lambda q, k, v, wsize, **kw: flex_head_fa.flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-        elif DIFF_ATTN_IMPL == "fa2":
-            def diff_attention_interface(q, k, v, wsize, **kw):
-                if self.head_qk_dim == self.head_v_dim:
-                    if not self.config.intra_doc_masking:
-                        return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-                    else:
-                        return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]
-                v2 = v[:, :, :, D//2:]
-                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
-                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
-                o = torch.cat([o1, o2], dim=-1)
-                return o
-        elif DIFF_ATTN_IMPL == "fa3":
-            def diff_attention_interface(q, k, v, wsize, **kw):
-                if self.head_qk_dim == self.head_v_dim:
-                    if not self.config.intra_doc_masking:
-                        return flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
-                    else:
-                        return flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
-                D = v.size(3)
-                v1 = v[:, :, :, :D//2]
-                v2 = v[:, :, :, D//2:]
-                o1 = flash_attn_func(q, k, v1, window_size=(wsize, 0), **kw)
-                o2 = flash_attn_func(q, k, v2, window_size=(wsize, 0), **kw)
-                o = torch.cat([o1, o2], dim=-1)
-                return o
-        elif DIFF_ATTN_IMPL == "flex":
-            if wsize != self.last_wsize:
-                self.last_wsize = self.build_mask(wsize)
-            diff_attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=False).transpose(1, 2)
-        elif DIFF_ATTN_IMPL == "eager":
-            diff_attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
-
-        # attention_interface = lambda q, k, v, window_size, **kw: eager_attention_forward(q, k, v, window_size=(window_size, 0), **kw)
-        y1 = diff_attention_interface(
-            query1_states.bfloat16(),
-            key1_states.bfloat16(),
-            value_sig_states.bfloat16(),
-            causal=True,
-            wsize=wsize,
-            softcap=self.softcap,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_qk_dim,
-        )
-        y2 = diff_attention_interface(
-            query2_states.bfloat16(),
-            key2_states.bfloat16(),
-            value_states.bfloat16(),
-            causal=True,
-            wsize=wsize,
-            softcap=self.softcap,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_qk_dim,
-        )
-        if len(y1.shape) == 3:
-            y1 = y1.view(query1_states.size(0), query1_states.size(1), y1.size(-2), y1.size(-1)) # keep (B, L, H/2, D)
-            y2 = y2.view(query1_states.size(0), query1_states.size(1), y2.size(-2), y2.size(-1))
-        y2 = y2.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        lambda_1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(-1).float()) # (H/2)
-        lambda_2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(-1).float()) # (H/2)
-        lambda_full = (lambda_1 - lambda_2 + self.lambda_init).view(1, 1, -1, 1).type_as(y1)
-        attn_output = (y1 - lambda_full * y2).contiguous() # (B, L, num_signal_heads, D)
-
-        #if cache_params is not None:
-        #    cache_params.trim(self.layer_idx)
 
         return attn_output, None, None
 
@@ -2229,12 +1073,9 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             self.ve_scalars = nn.Parameter(torch.zeros(self.num_noise_heads, self.head_dim, dtype=torch.float32))
 
         if self.config.token_shift_attn:
-            if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
+            self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
+            self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
+            if self.config.scalar_proj_as_hidden_matrix:    
                 self.shift_proj_k.is_scalar_weight = True
                 self.shift_proj_v.is_scalar_weight = True
 
@@ -2473,7 +1314,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             causal=True,
             wsize=wsize,
             softcap=self.config.softcap_attn,
-            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.head_dim,
+            softmax_scale=None if self.config.use_completed_p else 1/self.head_dim,
         ) # (B, L, H, D)
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.head_dim) # (B, L, num_noise_heads, snr+1, D)
         attn_sig = attn_output[:, :, :, :self.snr, :] # (B, L, num_noise_heads, snr, D)
@@ -2632,24 +1473,6 @@ def torch_recurrent_gated_delta_rule(
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
 
-# works with tensors >2**31 elements
-def safe_conv1d(x, w, b=None, stride=1, padding=0, dilation=1, groups=1):
-    x = x.contiguous(); w = w.contiguous()
-    N, C, L = x.shape
-    k = w.shape[-1]; Cout = w.shape[0]
-    Lout = (L + 2*padding - dilation*(k-1) - 1)//stride + 1
-    per_sample_in  = C*L
-    per_sample_out = Cout*Lout
-    per_sample_max = max(per_sample_in, per_sample_out)
-    INT32_MAX = 2_147_483_647
-    bs = max(1, min(N, INT32_MAX // max(1, per_sample_max)))
-    if bs >= N:
-        return F.conv1d(x, w, b, stride, padding, dilation, groups)
-    outs = []
-    for i in range(0, N, bs):
-        outs.append(F.conv1d(x[i:i+bs], w, b, stride, padding, dilation, groups))
-    return torch.cat(outs, dim=0)
-
 def get_qkv_tensors_gdn(module: nn.Module, hidden_states: torch.Tensor):
     H, G, dk, dv = module.num_attention_heads, module.n_kv_heads, module.dk, module.dv
     mixed = module.linear_qkv(hidden_states) # (B, L, H*dk + G*dk + G*dv)
@@ -2681,12 +1504,12 @@ class DragonGatedDeltaNet(nn.Module):
                 "when creating this class."
             )
 
-        self.num_attention_heads = config.num_attention_heads_gdn if config.num_attention_heads_gdn > 0 else config.num_attention_heads
+        self.num_attention_heads = config.num_attention_heads_gdn
         self.n_kv_heads = config.num_key_value_heads_gdn if config.num_key_value_heads_gdn > 0 else self.num_attention_heads
         assert self.num_attention_heads % self.n_kv_heads == 0
         self.groups = self.num_attention_heads // self.n_kv_heads
 
-        self.head_dim = config.head_dim_gdn # if config.head_dim_gdn else int(config.hidden_size * config.expand_factor) // self.num_attention_heads
+        self.head_dim = config.head_dim_gdn
         self.dk = self.head_dim//config.shrink_qk_gdn
         self.dv = self.head_dim
         self.key_dim = self.n_kv_heads * self.dk
@@ -2696,16 +1519,6 @@ class DragonGatedDeltaNet(nn.Module):
         self.key_dim_local = self.n_heads_local * self.dk
         self.value_dim_local = self.n_heads_local * self.dv
 
-        """self.linear_qkv = DragonLinear(
-            config, config.hidden_size,
-            self.num_attention_heads*self.dk + self.n_kv_heads*self.dk + self.n_kv_heads*self.dv,
-            bias=False
-        )
-        self.linear_ba = DragonLinear(
-            config, config.hidden_size,
-            self.num_attention_heads + self.num_attention_heads, #+ self.num_attention_heads*self.dv, # b(H), a(H), g(H*dv)
-            bias=False
-        )"""
         self.in_proj = DragonLinear(
             config,
             config.hidden_size,
@@ -2738,21 +1551,15 @@ class DragonGatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
 
-        if self.config.rope_gdn == "rope":
-            self.rope_proj = DragonLinear(config, config.hidden_size, self.dk//4, bias=False)
-
         if self.config.token_conv1d_gdn:
             self.conv_size = config.conv_kernel
             self.conv_dim  = self.num_attention_heads*self.dk + self.n_kv_heads*self.dk + self.n_kv_heads*self.dv
             self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
 
         if self.config.token_shift_gdn:
+            self.shift_proj_k = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
+            self.shift_proj_v = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
             if self.config.scalar_proj_as_hidden_matrix:
-                self.shift_proj_k = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
-                self.shift_proj_v = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
-            else:
-                self.shift_proj_k = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
-                self.shift_proj_v = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False, alpha_bwd=1., alpha_fwd=1.)
                 self.shift_proj_k.is_scalar_weight = True
                 self.shift_proj_v.is_scalar_weight = True
 
@@ -2780,11 +1587,6 @@ class DragonGatedDeltaNet(nn.Module):
         )
 
         # --- projections ---
-        """q, k, v = get_qkv_tensors_gdn(self, hidden_states)     # q:(B,L,H,dk), k/v:(B,L,Ng,dk/dv)
-        bag = self.linear_ba(hidden_states)                          # (B,L,2H + H*dv)
-        #b_proj, a_proj, g_proj = torch.split(bag, [self.num_attention_heads, self.num_attention_heads, self.num_attention_heads*self.dv], dim=-1)
-        b_proj, a_proj = torch.split(bag, [self.num_attention_heads, self.num_attention_heads], dim=-1)"""
-
         qkvzba = self.in_proj(hidden_states)
         qkvzba = rearrange(qkvzba, "b l (h p) -> b l h p", h=self.n_heads_local)
         # split per head: [L, B, H_local, dk+dk+dv/dv/1/1] where dq=dk=do
@@ -2820,11 +1622,6 @@ class DragonGatedDeltaNet(nn.Module):
 
         # conv
         if self.config.token_conv1d_gdn:
-            # --- pack for conv ---
-            """q_proj = rearrange(q, "b l h d -> b l (h d)")
-            k_proj = rearrange(k, "b l g d -> b l (g d)")
-            v_proj = rearrange(v, "b l g d -> b l (g d)")
-            mixed_qkv = torch.cat([q_proj, k_proj, v_proj], dim=-1).transpose(1, 2) # (B,C,L)"""
             qkv = rearrange(qkv, 'b l h d -> b l (h d)')
             mixed_qkv = qkv.transpose(1, 2)
 
@@ -2859,14 +1656,6 @@ class DragonGatedDeltaNet(nn.Module):
 
             # split back
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            """q_proj, k_proj, v_proj = torch.split(
-                mixed_qkv,
-                [self.num_attention_heads*self.dk, self.n_kv_heads*self.dk, self.n_kv_heads*self.dv],
-                dim=-1,
-            )
-            q    = rearrange(q_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
-            k = rearrange(k_proj, "b l (g d) -> b l g d", g=self.n_kv_heads)
-            v = rearrange(v_proj, "b l (g d) -> b l g d", g=self.n_kv_heads)"""
             mixed_qkv = rearrange(mixed_qkv, "b l (h p) -> b l h p", h=self.n_heads_local)#.contiguous()
             q = mixed_qkv[..., :self.dk]; accum = self.dk
             k = mixed_qkv[..., accum:accum+self.dk]; accum += self.dk
@@ -2875,22 +1664,9 @@ class DragonGatedDeltaNet(nn.Module):
         k = k.repeat_interleave(self.groups, dim=2)
         v = v.repeat_interleave(self.groups, dim=2)
 
-        """b_proj = rearrange(b_proj, "b l (h) -> b l h", h=self.num_attention_heads)
-        a_proj = rearrange(a_proj, "b l (h) -> b l h", h=self.num_attention_heads)"""
-        #g_proj = rearrange(g_proj, "b l (h d) -> b l h d", h=self.num_attention_heads)
         beta = b_proj.sigmoid()
         dt = F.softplus(a_proj.float() + self.dt_bias)
         g = -self.A_log.float().exp() * dt
-
-        # RoPE.
-        if self.config.rope_gdn == "rope":
-            """cos, sin = position_embeddings
-            q = apply_rotary_emb(q, cos, sin)
-            k = apply_rotary_emb(k, cos, sin)"""
-            angle = self.rope_proj(hidden_states) # (B, L, dk)
-            angle = angle.unsqueeze(-2).expand(-1, -1, self.num_attention_heads, -1)
-            angle = angle_dt(angle, dt)
-            q, k, _ = rotary_qk(q=q, k=k, angle=angle, conjugate=False, inplace=False)
 
         # GDN main computation
         if not use_precomputed_states:
@@ -2900,7 +1676,7 @@ class DragonGatedDeltaNet(nn.Module):
                 v=v.bfloat16(),
                 g=g,
                 beta=beta,
-                scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.dk,
+                scale=None if not self.config.use_completed_p else 1/self.dk,
                 initial_state=None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
@@ -2913,7 +1689,7 @@ class DragonGatedDeltaNet(nn.Module):
                 v=v.bfloat16(),
                 g=g,
                 beta=beta,
-                scale=None if not (self.config.use_uscaling or self.config.use_completed_p) else 1/self.dk,
+                scale=None if not self.config.use_completed_p else 1/self.dk,
                 initial_state=ssm_cache,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True
@@ -2926,253 +1702,6 @@ class DragonGatedDeltaNet(nn.Module):
             cache_params.ssm_caches[self.layer_idx] = ssm_cache
 
         return o, None, None
-
-class DragonMamba3(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int]):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
-        self.d_model = config.hidden_size
-        self.d_state = config.mamba_d_state
-        self.conv_init = None
-        self.expand = 2
-        self.headdim = config.mamba_headdim
-        self.ngroups = config.mamba_ngroups
-        self.activation = "swish"
-        self.bias = False
-        self.chunk_size = 128
-        self.A_floor = 1e-4
-        self.rope_fraction = 0.5
-        self.dt_min = 0.001
-        self.dt_max = 0.1
-        self.dt_init_floor = 1e-4
-
-        self.d_inner = int(self.expand * self.d_model)
-        assert self.d_inner % self.headdim == 0
-        self.nheads = self.d_inner // self.headdim
-
-        self.split_tensor_size = int(self.d_state * self.rope_fraction)
-        if self.split_tensor_size % 2 != 0:
-            self.split_tensor_size -= 1
-        self.num_rope_angles = self.split_tensor_size // 2
-        if self.split_tensor_size == 0:
-            return
-
-        if config.mamba3_rope:
-            self.rope_proj = DragonLinear(config, self.d_model, self.num_rope_angles, bias=False)
-
-        # Order: [x, B, C, dt]
-        d_in_proj = self.d_inner + 2 * self.d_state * self.ngroups + self.nheads
-
-        if self.config.mamba3_is_A_dd:
-            self.A_proj = DragonLinear(config, self.d_model, self.nheads, bias=False, dtype=torch.float32)
-        else:
-            A_init_range = (1, 16)
-            assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-            A = torch.empty(self.nheads, dtype=torch.float32).uniform_(*A_init_range)
-            A_log = torch.log(A).to(dtype=torch.float32)
-            self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
-
-        if config.mamba3_add_trapezoid:
-            self.trapezoid_proj = DragonLinear(config, self.d_model, self.nheads, bias=False)
-
-        _dt = torch.exp(
-            torch.rand(self.nheads) * (math.log(self.dt_max) - math.log(self.dt_min))
-            + math.log(self.dt_min)
-        )
-        _dt = torch.clamp(_dt, min=self.dt_init_floor)
-        _dt_bias = _dt + torch.log(-torch.expm1(-_dt))
-        self.dt_bias = nn.Parameter(_dt_bias, requires_grad=True)
-        self.dt_bias._no_weight_decay = True
-
-        self.in_proj = DragonLinear(config, self.d_model, d_in_proj, bias=self.bias)
-
-        self.B_bias, self.C_bias = None, None
-        if not config.mamba3_remove_BC_bias:
-            self.B_bias = nn.Parameter(torch.ones((self.nheads, self.d_state)), requires_grad=True)
-            self.C_bias = nn.Parameter(torch.ones((self.nheads, self.d_state)), requires_grad=True)
-
-        if config.mamba3_is_id_rms:
-            self.B_norm = DragonNorm(config, self.d_state)
-            self.C_norm = DragonNorm(config, self.d_state)
-
-        if not config.mamba3_remove_conv:
-            conv_dim = self.d_inner + 2 * self.d_state * self.ngroups
-            self.conv1d = nn.Conv1d(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                bias=False,
-                kernel_size=4,
-                groups=conv_dim,
-            )
-            if self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
-
-        assert self.activation in ["silu", "swish"]
-        self.act = nn.SiLU()
-
-        # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads))
-        self.D._no_weight_decay = True
-
-        if config.legacy_gate:
-            self.linear_g = DragonLinear(
-                config, config.hidden_size,
-                self.d_inner,
-                bias=False,
-            )
-            if config.mamba3_postgate_norm:
-                self.output_norm = RMSNormGated(self.d_inner, eps=config.norm_epsilon, norm_before_gate=False)
-
-    def forward(
-        self, 
-        hidden_states: torch.Tensor,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        **kwargs
-    ):
-        cached_len = None
-        if cache_params is not None:
-            hidden_states_cached = cache_params.ssm_caches[self.layer_idx] # (B, L, D)
-            if hidden_states_cached is not None:
-                cached_len = hidden_states_cached.shape[1]
-                hidden_states = torch.cat([hidden_states_cached, hidden_states], dim=1) # (B, L+1, D)
-            cache_params.ssm_caches[self.layer_idx] = hidden_states
-
-        # Apply in_proj
-        xBCdt = self.in_proj(hidden_states) # (B, l, D), l=1 when decoding
-        xBC, dd_dt = torch.split(
-            xBCdt,
-            [
-                self.d_inner + 2 * self.d_state * self.ngroups,
-                self.nheads,
-            ],
-            dim=-1)
-
-        if self.config.mamba3_is_A_dd:
-            _A = -F.softplus((self.A_proj(hidden_states.to(torch.float32))).to(torch.float32)) # (B, L, N)
-            _A = torch.clamp(_A, max=-self.A_floor)
-        else:
-            _A = -torch.exp(self.A_log).unsqueeze(0).unsqueeze(0)
-        dt = F.softplus(dd_dt + self.dt_bias) # (B, L, N)
-
-        seq_idx = None
-        if cu_seqlens is not None:
-            seq_idx = prepare_sequence_ids(cu_seqlens).to(torch.int32).unsqueeze(0)
-
-        if not self.config.mamba3_remove_conv:
-            xBC = causal_conv1d_fn(
-                x=xBC.transpose(1, 2),
-                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            ).transpose(1, 2) # (B, L, self.d_inner + 2 * ngroups * d_state)
-
-        x, B, C = torch.split(
-            xBC,
-            [
-                self.d_inner, 
-                self.d_state * self.ngroups, 
-                self.d_state * self.ngroups
-            ], dim=-1)
-        B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
-        C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
-
-        if self.config.mamba3_is_id_rms:
-            B = self.B_norm(B)
-            C = self.C_norm(C)
-
-        if self.ngroups != self.nheads:
-            B = B.expand(-1, -1, self.nheads, -1) # (B, L, N, S)
-            C = C.expand(-1, -1, self.nheads, -1) # (B, L, N, S)
-
-        if self.config.mamba3_rope:
-            angle = self.rope_proj(hidden_states) # (B, L, S)
-            angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads, -1) # (B, L, G, S)
-            angle = angle_dt(angle, dt)
-
-            C, B, CB_sum = rotary_qk(q=C, k=B, angle=angle, bias_q=self.C_bias, bias_k=self.B_bias, conjugate=False, inplace=False)
-        else:
-            if not self.config.mamba3_remove_BC_bias:
-                og_dtpe = B.dtype
-                B = (B + self.B_bias).to(og_dtpe)
-                C = (C + self.C_bias).to(og_dtpe)
-
-            CB_sum = torch.sum(
-                B.to(torch.float32)*C.to(torch.float32),
-                dim=-1,
-                keepdim=False
-            )
-
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
-
-        A = _A * dt
-        gating_factor = dt # B, L, N
-
-        if self.config.mamba3_add_trapezoid:
-            trap = F.sigmoid(self.trapezoid_proj(hidden_states)) # (B, L, N)
-
-            alpha_arr = torch.exp(A)
-            beta_arr = (1-trap)*gating_factor*alpha_arr
-            gamma_arr = trap*gating_factor
-
-            # roll alpha and beta to the left by 1
-            _alpha_arr = torch.roll(alpha_arr, shifts=-1, dims=1)
-            _beta_arr = torch.roll(beta_arr, shifts=-1, dims=1)
-
-            x_scalar = (gamma_arr*_alpha_arr + _beta_arr).to(torch.bfloat16)
-        else:
-            alpha_arr = torch.exp(A)
-            beta_arr = torch.zeros_like(alpha_arr)
-            gamma_arr = gating_factor
-
-            # roll alpha to the left by 1
-            _alpha_arr = torch.roll(alpha_arr, shifts=-1, dims=1)
-
-            x_scalar = (gamma_arr*_alpha_arr).to(torch.bfloat16)
-
-        out = mamba_chunk_scan_discretized_combined(
-            x=x.bfloat16(),
-            A=A,
-            B=B.bfloat16(),
-            C=C.bfloat16(),
-            chunk_size=self.chunk_size,
-            x_scalar=x_scalar,
-            gamma=gamma_arr,
-            CB_sum=CB_sum,
-            D=self.D,
-            z=None,
-            initial_states=None, # ssm_cache,
-            return_final_states=False, # cache_params is not None,
-            seq_idx=seq_idx,
-        )
-        y = out
-
-        if self.config.legacy_gate:
-            if not self.config.mamba3_postgate_norm:
-                g = self.linear_g(hidden_states) # (B, L, d_inner)
-                y = rearrange(y, "b l h p -> b l (h p)")
-                y = y * F.silu(g)
-                y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads)
-            else:
-                g = self.linear_g(hidden_states) # (B, L, d_inner)
-                y = rearrange(y, "b l h p -> b l (h p)")
-                y = self.output_norm(y, g)
-                y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads)
-
-        if cached_len and cached_len > 0:
-            y = y[:, cached_len:, :] # keep only the new Ln steps
-
-        return y, None, None
 
 class DragonMamba2(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: Optional[int]):
@@ -3289,246 +1818,6 @@ class DragonMamba2(nn.Module):
             y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads)
 
         return y, None, None
- 
-class DragonMamba3Mimo(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], use_ve=False):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
-        assert not self.config.gate_gdn, "gate must be done inside the mimo mamba3 block."
-
-        self.d_model = config.hidden_size
-        self.d_state = config.mamba_d_state
-        self.conv_init = None
-        self.expand = 2
-        self.headdim = config.mamba_headdim
-        self.ngroups = config.mamba_ngroups
-        self.activation = "swish"
-        self.bias = False
-        self.conv_bias = True
-        self.chunk_size = 128
-        self.A_floor = 1e-4
-        self.rope_fraction = 0.5
-        self.remove_conv = True
-        self.add_conv_activation = False
-        self.dt_min = 0.001
-        self.dt_max = 0.1
-        self.dt_init_floor = 1e-4
-        self.mimo_dim = config.mamba_mimo_dim
-        self.mimo_proj_block_order = 1
-
-        self.d_inner = int(self.expand * self.d_model)
-        assert self.d_inner % self.headdim == 0
-        self.nheads = self.d_inner // self.headdim
-        self.dr_out_dim = self.d_inner // self.mimo_proj_block_order
-
-        self.split_tensor_size = int(self.d_state * self.rope_fraction)
-        if self.split_tensor_size % 2 != 0:
-            self.split_tensor_size -= 1
-        self.num_rope_angles = self.split_tensor_size // 2
-        if self.split_tensor_size == 0:
-            return
-
-        self.rope_proj = DragonLinear(config, self.d_model, self.num_rope_angles, bias=False)
-
-        # Order: [z, x, B, C, dt]
-        d_in_proj = 2 * self.d_inner + 2 * self.d_state * self.ngroups * self.mimo_dim + 3 * self.nheads
-
-        _dt = torch.exp(
-            torch.rand(self.nheads) * (math.log(self.dt_max) - math.log(self.dt_min))
-            + math.log(self.dt_min)
-        )
-        _dt = torch.clamp(_dt, min=self.dt_init_floor)
-        _dt_bias = _dt + torch.log(-torch.expm1(-_dt))
-        self.dt_bias = nn.Parameter(_dt_bias, requires_grad=True)
-        self.dt_bias._no_weight_decay = True
-
-        self.in_proj = DragonLinear(config, self.d_model, d_in_proj, bias=self.bias)
-
-        if use_ve:
-            self.ve_scalars = nn.Parameter(torch.zeros(self.d_inner, dtype=torch.float32))
-
-        self.B_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads, self.d_state)), requires_grad=True)
-        self.C_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads, self.d_state)), requires_grad=True)
-        
-        self.B_norm = DragonNorm(config, self.d_state)
-        self.C_norm = DragonNorm(config, self.d_state)
-
-        if not self.remove_conv:
-            conv_dim = self.d_inner + 2 * self.d_state * self.ngroups
-            self.conv1d = nn.Conv1d(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                bias=self.conv_bias,
-                kernel_size=4,
-                groups=conv_dim,
-            )
-            if self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
-
-        assert self.activation in ["silu", "swish"]
-        self.act = nn.SiLU()
-
-        # Initialize up/down MIMO projection (for x and z)
-        in_proj_mimo_x_init_weights = torch.ones(self.dr_out_dim, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)/self.mimo_dim
-        in_proj_mimo_z_init_weights = torch.ones(self.dr_out_dim, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)
-        out_proj_mimo_init_weights = torch.ones(self.dr_out_dim, self.mimo_proj_block_order, self.mimo_dim*self.mimo_proj_block_order)/self.mimo_dim
-
-        self.in_proj_mimo_x = nn.Parameter(in_proj_mimo_x_init_weights, requires_grad=True)
-        self.in_proj_mimo_z = nn.Parameter(in_proj_mimo_z_init_weights, requires_grad=True)
-        self.out_proj_mimo = nn.Parameter(out_proj_mimo_init_weights, requires_grad=True)
-
-        # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads))
-        self.D._no_weight_decay = True
-
-        if config.legacy_gate:
-            if config.mamba3_postgate_norm:
-                self.output_norm = RMSNormGated(self.d_inner, group_size=self.d_inner//self.ngroups, eps=config.norm_epsilon, norm_before_gate=False)
-
-    def forward(self, hidden_states, ve=None, cache_params: Optional[HybridDragonDynamicCache] = None, **kwargs):
-        cached_len = None
-        if cache_params is not None:
-            hidden_states_cached = cache_params.ssm_caches[self.layer_idx] # (B, L, D)
-            if hidden_states_cached is not None:
-                cached_len = hidden_states_cached.shape[1]
-                hidden_states = torch.cat([hidden_states_cached, hidden_states], dim=1) # (B, L+1, D)
-            cache_params.ssm_caches[self.layer_idx] = hidden_states
-
-        # Apply in_proj
-        zxBCdtAtrap = self.in_proj(hidden_states)
-        zxBCdtAtrap = rearrange(zxBCdtAtrap, "b l (G D) -> b l G D", G=self.ngroups)#.contiguous()
-        # split per group: [B, L, G_local, D_group]
-        d_inner_per_group = self.d_inner//self.ngroups
-        nheads_per_group = self.nheads//self.ngroups
-        z = zxBCdtAtrap[..., 0:d_inner_per_group]; accum = d_inner_per_group
-        x = zxBCdtAtrap[..., accum:accum+d_inner_per_group]; accum += d_inner_per_group
-        B = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
-        C = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
-        dt = zxBCdtAtrap[..., accum:accum+nheads_per_group]; accum += nheads_per_group
-        A = zxBCdtAtrap[..., accum:accum+nheads_per_group]; accum += nheads_per_group
-        trap = zxBCdtAtrap[..., accum:accum+2*nheads_per_group]
-
-        z = rearrange(z, "b l G d -> b l (G d)")
-        x = rearrange(x, "b l G d -> b l (G d)")
-        B = rearrange(B, "b l G d -> b l (G d)")
-        C = rearrange(C, "b l G d -> b l (G d)")
-        dt = rearrange(dt, "b l G n -> b l (G n)")
-        A = rearrange(A, "b l G n -> b l (G n)")
-        trap = rearrange(trap, "b l G n -> b l (G n)")
-
-        _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
-        _A = torch.clamp(_A, max=-self.A_floor)
-        
-        dt = F.softplus(dt + self.dt_bias) # (B, L, N)
-
-        # value embeddings
-        if ve is not None:
-            x = x + ve * self.ve_scalars[None, None, :].to(x.dtype)
-
-        # Perform MIMO x and z up projection (d_inner -> mimo_rank*d_inner)
-        x = rearrange(x, "b l (d g) -> b l d g", g=self.mimo_proj_block_order)
-        x = torch.einsum("bldg,drg->blrd", x, self.in_proj_mimo_x)
-
-        z = rearrange(z, "b l (d g) -> b l d g", g=self.mimo_proj_block_order)
-        z = torch.einsum("bldg,drg->blrd", z, self.in_proj_mimo_z)
-
-        if self.mimo_proj_block_order > 1:
-            x = rearrange(x, "b l g d -> b l (g d)")
-            x = rearrange(x, "b l (r d) -> b l r d", r=self.mimo_dim)
-            z = rearrange(z, "b l g d -> b l (g d)")
-            z = rearrange(z, "b l (r d) -> b l r d", r=self.mimo_dim)
-
-        if not self.remove_conv:
-            x = rearrange(x, "b l r d -> b l (r d)")
-            xBC = torch.cat((x, B, C), dim=-1)
-            xBC = causal_conv1d_fn(
-                x=xBC.transpose(1, 2),
-                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                bias=self.conv1d.bias,
-                activation=self.activation if self.add_conv_activation else None,
-            ).transpose(1, 2)
-            x, B, C = torch.split(
-                xBC, 
-                [
-                    self.d_inner * self.mimo_dim, 
-                    self.d_state * self.ngroups * self.mimo_dim, 
-                    self.d_state * self.ngroups * self.mimo_dim,
-                ], dim=-1)
-
-            x = rearrange(x, "b l (r d) -> b l r d", r=self.mimo_dim)
-
-        B = rearrange(B, "b l (g r n) -> b l r g n", g=self.ngroups, r=self.mimo_dim) 
-        C = rearrange(C, "b l (g r n) -> b l r g n", g=self.ngroups, r=self.mimo_dim)
-
-        B = self.B_norm(B)
-        C = self.C_norm(C)
-
-        if self.ngroups != self.nheads:
-            n_repeat = self.nheads // self.ngroups
-            B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
-            C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
-
-        angle = self.rope_proj(hidden_states) # (B, L, S)
-        angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads, -1) # (B, L, G, S)
-        angle = angle_dt(angle, dt)
-
-        C, B, CB_sum = mimo_rotary_qk(q=C, k=B, angle=angle, bias_q=self.C_bias, bias_k=self.B_bias, conjugate=False, inplace=False)
-
-        x = rearrange(x, "b l r (h p) -> b l r h p", p=self.headdim)
-        
-        A = _A * dt
-        gating_factor = dt # B, L, N
-
-        trap = F.sigmoid(trap) # (B, L, N)
-
-        alpha_arr = torch.exp(A)
-        beta_arr = (1-trap)*gating_factor*alpha_arr
-        gamma_arr = trap*gating_factor
-
-        # roll alpha and beta to the left by 1
-        _alpha_arr = torch.roll(alpha_arr, shifts=-1, dims=1)
-        _beta_arr = torch.roll(beta_arr, shifts=-1, dims=1)
-
-        x_scalar = (gamma_arr*_alpha_arr + _beta_arr).to(torch.bfloat16)
-
-        y = mamba_mimo_chunk_scan_discretized_fused_combined(
-            x=x.bfloat16(),
-            A=A.bfloat16(),
-            B=B.bfloat16(),
-            C=C.bfloat16(),
-            chunk_size=self.chunk_size,
-            x_scalar=x_scalar,
-            gamma=gamma_arr,
-            CB_sum=CB_sum,
-            D=self.D,
-            z=None,
-        )
-
-        y = rearrange(y, "b l r h p -> b l r (h p)")
-        y = self.output_norm(y, z)
-
-        #if seqlen_og is not None:
-        #    y = rearrange(y, "b l r d -> (b l) r d")
-
-        # Perform MIMO down projection (mimo_rank*d_inner -> d_inner)
-        y = rearrange(y, "b l r d -> b l (r d)")
-        y = rearrange(y, "b l (g d) -> b l g d", g=self.mimo_dim*self.mimo_proj_block_order)
-        y = torch.einsum("blgd,drg->bldr", y, self.out_proj_mimo.to(y.dtype))
-        y = rearrange(y, "b l d r -> b l (d r)")
-        y = rearrange(y, "b l (h d) -> b l h d", d=self.headdim)
-
-        if cached_len and cached_len > 0:
-            y = y[:, cached_len:, :] # keep only the new Ln steps
-
-        return y, None, None
     
 class DragonMamba3MimoFast(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int, use_ve: bool = False):
@@ -3639,10 +1928,7 @@ class DragonMamba3MimoFast(nn.Module):
         self.D._no_weight_decay = True # useless flag
 
         if self.config.mamba3_postgate_norm:
-            if not self.config.mamba3_derf:
-                self.output_norm = DragonNorm(config, self.d_inner_local_tp)
-            else:
-                self.output_norm = DragonDeRF(config, self.d_inner_local_tp)
+            self.output_norm = DragonNorm(config, self.d_inner_local_tp)
 
         self.previous_window_size = 0
 
@@ -3703,26 +1989,25 @@ class DragonMamba3MimoFast(nn.Module):
 
         # Input projection
         zxdtAtrap = self.in_proj(hidden_states)
-        offset = 0
-        z = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
-        x = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
-        dt = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
-        A = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
-        trap = zxdtAtrap[..., offset : offset + 2 * self.nheads_local_tp] # Trap might need 2x? check dim
+        per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
+        off = 0
+        z    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
+        x    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
+        dt   = per_head[..., off];                        off += 1 # (L, B, H)
+        A    = per_head[..., off];                        off += 1 # (L, B, H)
+        trap = per_head[..., off];                        off += 1 # (L, B, H)
+        z = rearrange(z, "b l H p -> b l H p") # (B, L, H_local, p)
+        x = rearrange(x, "b l H p -> b l H p") # (B, L, H_local, p)
+        dt   = rearrange(dt,   "b l n -> b l n").to(torch.float32) # (B, L, H_local)
+        A    = rearrange(A,    "b l n -> b l n") # (B, L, H_local)
+        trap = rearrange(trap, "b l n -> b n l") # (B, H_local, L)
 
         BCangle = self.in_proj_dyn(hidden_states)
         B = BCangle[..., 0:self.ngroups*self.mimo_dim*self.d_state]
         C = BCangle[..., self.ngroups*self.mimo_dim*self.d_state:2*self.ngroups*self.mimo_dim*self.d_state]
         angle = BCangle[..., 2*self.ngroups*self.mimo_dim*self.d_state:] # (L, B, S)
-
-        z = rearrange(z, "b l (G h p) -> b l (G h) p",G=self.ngroups, p=self.headdim)
-        x = rearrange(x, "b l (G h p) -> b l (G h) p", G=self.ngroups, p=self.headdim)
         B = rearrange(B, "b l (G r n) -> b l r G n", G=self.ngroups, r=self.mimo_dim)
         C = rearrange(C, "b l (G r n) -> b l r G n", G=self.ngroups, r=self.mimo_dim)
-        dt = rearrange(dt, "b l n -> b l n").to(torch.float32)
-        dt = dt.to(torch.float32)
-        A = rearrange(A, "b l n -> b l n")
-        trap = rearrange(trap, "b l n -> b n l")
 
         _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)
@@ -3731,9 +2016,6 @@ class DragonMamba3MimoFast(nn.Module):
 
         B = self.B_norm(B)
         C = self.C_norm(C)
-        if self.ngroups != self.nheads:
-            B = B.repeat(1, 1, 1, self.n_repeat, 1) # (B, L, R, N, S)
-            C = C.repeat(1, 1, 1, self.n_repeat, 1) # (B, L, R, N, S)
         B = rearrange(B, "b l r G n -> b l r G n").contiguous()
         C = rearrange(C, "b l r G n -> b l r G n").contiguous()
         a, b, c, d, e = C.size()
@@ -3926,25 +2208,12 @@ class DragonMLP(nn.Module):
         intermediate_size = intermediate_size or config.intermediate_size
         self.fc_1 = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
         self.fc_2 = DragonLinear(config, intermediate_size, config.hidden_size, bias=False)
-        self._2_sqrt_5 = 2/math.sqrt(5) if config.use_uscaling else 1.0
 
-    def forward(self, hidden_states, router_prev=None, stem_emb=None):
+    def forward(self, hidden_states):
         hidden_states = self.fc_1(hidden_states)
-        hidden_states = self._2_sqrt_5 * F.relu(hidden_states).square()
+        hidden_states = F.relu(hidden_states).square()
         hidden_states = self.fc_2(hidden_states)
         return hidden_states
-
-class DragonSTEMMLP(nn.Module):
-    def __init__(self, config: DragonConfig, intermediate_size: Optional[int] = None):
-        super().__init__()
-        self.config = config
-        intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = DragonLinear(config, intermediate_size, config.hidden_size, bias=False)
-
-    def forward(self, hidden_states, router_prev=None, stem_emb=None):
-        assert stem_emb is not None, "stem_emb must be provided for DragonSTEMMLP"
-        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * stem_emb)
 
 class DragonMoE(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int):
@@ -3961,8 +2230,7 @@ class DragonMoE(nn.Module):
             hidden_size=config.moe_routed_intermediate_size,
             num_experts=config.moe_num_routed_experts,
             top_k=config.moe_num_active_experts,
-            alpha=1.0/math.sqrt(config.moe_routed_input_dim or config.hidden_size) if config.use_uscaling else 1.0,
-            activation=lambda x: F.relu(x).square() * (2 / math.sqrt(5)) if config.use_uscaling else F.relu(x).square()
+            activation=lambda x: F.relu(x).square(),
         )
         if self.config.moe_shared_expert_gate:
             self.shared_gate = DragonLinear(config, config.hidden_size, 1, bias=False)
@@ -3987,7 +2255,7 @@ class DragonMoE(nn.Module):
             self.experts.experts.weight.normal_(mean=0.0, std=self.config.initializer_range)
             self.experts.output_experts.weight.normal_(mean=0.0, std=self.config.initializer_range)
 
-    def forward(self, x: torch.Tensor, x_non_lns: torch.Tensor, router_prev=None, stem_emb=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         bs, slen, dim = x.shape
         input_dtype = x.dtype
         x = x.view(-1, dim)
@@ -4022,462 +2290,12 @@ class DragonMoE(nn.Module):
         if self.shared_experts is not None:
             out = self.shared_experts(x)
             if self.config.moe_shared_expert_gate:
-                x_non_lns = x_non_lns.view(-1, dim)
-                logits = self.shared_gate(x_non_lns)
+                logits = self.shared_gate(x)
                 scores = torch.sigmoid(logits.float()).type_as(logits)
                 out = out * scores
         if out is None:
             return out_experts.reshape(bs, slen, dim)
         return (out + out_experts).reshape(bs, slen, dim)#, top_indices, scores_orig
-
-def _logit(p: float) -> float:
-    p = min(max(float(p), 1e-6), 1.0 - 1e-6)
-    return math.log(p) - math.log(1.0 - p)
-
-class DeepDeltaResidualVdim1(nn.Module):
-    def __init__(self, config: DragonConfig):
-        super().__init__()
-        self.config = config
-
-        self.k_eps = 1e-6
-        self.v_sigmoid = True
-        self.v_sigmoid_scale = 4.
-
-        self.beta = DragonLinear(config, config.hidden_size, 1, bias=True)
-        self.v_proj = DragonLinear(config, config.hidden_size, 1, bias=True)
-
-        with torch.no_grad():
-            self.beta.bias.fill_(_logit(0.))
-
-    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C), k_in: (B, T, C), context: (B, T, C)
-
-        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
-        k_dim = int(k_in.size(-1))
-        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
-        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
-        k_scale = 1.0 / math.sqrt(k_dim)
-
-        # beta(X) in [0, 2]
-        beta_logits = self.beta(context).float()
-        beta = 2.0 * torch.sigmoid(beta_logits) # fp32
-
-        # k^T x, scalar projection (B, T, 1)
-        proj_rms = torch.sum(k_rms * x, dim=-1, keepdim=True, dtype=torch.float32) # fp32
-        proj = proj_rms * k_scale
-
-        # v(X) is scalar for d_v=1.
-        v = self.v_proj(x)
-        v = torch.sigmoid(v) * self.v_sigmoid_scale
-
-        # x <- x + beta * k * (v - k^T x)
-        delta_scaled = ((beta * (v - proj)) * k_scale).to(dtype=x.dtype) # (B, T, 1)
-        update = delta_scaled * k_rms
-        return x + update
-
-class DeepDeltaResidualExpanded(nn.Module):
-    def __init__(self, config: DragonConfig):
-        super().__init__()
-        
-        hidden_size = config.hidden_size
-        self.value_channels = 4
-        self.k_eps = 1e-5
-        self.v_sigmoid = True
-        self.v_sigmoid_scale = 4.
-        self.v_constant = False
-        self.v_constant_value = 2.0
-
-        self.beta_single_linear = True
-        self.beta = DragonLinear(config, hidden_size, 1, bias=True)
-        
-        # v is a vector in R^{d_v} in the expanded-state regime.
-        self.v_proj = DragonLinear(config, hidden_size, self.value_channels, bias=True)
-
-        beta_init = 0.
-        beta_init = min(max(beta_init, 0.0), 2.0)
-        beta_init_p = beta_init / 2.0
-        with torch.no_grad():
-            if self.beta_single_linear:
-                self.beta.bias.fill_(_logit(beta_init_p))
-            else:
-                self.beta_out.bias.fill_(_logit(beta_init_p))
-
-    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, v_in: torch.Tensor, context: torch.Tensor, scalar: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
-        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
-        k_dim = int(k_in.size(-1))
-        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
-        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
-        k_scale = 1.0 / math.sqrt(k_dim)
-
-        # beta(X) in [0, 2]
-        beta_logits = self.beta(context).float()
-        beta = 2.0 * torch.sigmoid(beta_logits)  # fp32
-
-        if x.ndim != 4:
-            raise ValueError(f"Expected x with shape (B, T, d, d_v), got {tuple(x.shape)}")
-        if int(x.size(-2)) != k_dim:
-            raise ValueError(f"Expected x feature dim {k_dim}, got {int(x.size(-2))}.")
-        if int(x.size(-1)) != self.value_channels:
-            raise ValueError(f"Expected x value channels {self.value_channels}, got {int(x.size(-1))}.")
-
-        # k^T X, row vector projection (B, T, d_v)
-        proj_rms = torch.sum(k_rms.unsqueeze(-1) * x, dim=-2, dtype=torch.float32)  # fp32
-        proj = proj_rms * k_scale
-
-        v = self.v_proj(v_in)
-        v = torch.sigmoid(v) * self.v_sigmoid_scale
-
-        # X <- X + beta * k * (v^T - k^T X)
-        delta_row = (beta * (v - proj)) * k_scale  # fp32 (B, T, d_v)
-        update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2)  # (B, T, d, d_v)
-        return x + scalar * update
-    
-ActivationName = Literal["silu", "relu", "elu+1", "identity"]
-_ACTIVATION_NAMES: set[str] = {"silu", "relu", "elu+1", "identity"}
-def apply_activation(x: torch.Tensor, activation: str | None) -> torch.Tensor:
-    if activation is None or activation == "identity":
-        return x
-    if activation == "silu":
-        return F.silu(x)
-    if activation == "relu":
-        return F.relu(x)
-    if activation == "elu+1":
-        return (F.elu(x, 1.0, False) + 1.0).to(dtype=x.dtype)
-    raise ValueError(f"Unsupported activation {activation!r}. Expected one of: {sorted(_ACTIVATION_NAMES)!r}.")
-
-class DepthwiseShortConv1d(nn.Module):
-    def __init__(self, hidden_size: int, *, kernel_size: int, activation: ActivationName | None = None, shift_right1: bool = False) -> None:
-        super().__init__()
-        self.kernel_size = int(kernel_size)
-        if self.kernel_size <= 0:
-            raise ValueError(f"kernel_size must be positive, got {self.kernel_size}.")
-        self.activation = activation
-        self.shift_right1 = bool(shift_right1)
-        self.weight = nn.Parameter(torch.empty(hidden_size, self.kernel_size))
-        bound = 1 / math.sqrt(self.kernel_size) 
-        nn.init.uniform_(self.weight, -bound, bound)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2).contiguous()  # (B, C, T)
-        # pad_left = self.kernel_size - 1 + (1 if self.shift_right1 else 0)
-        if self.shift_right1:
-            # x = F.pad(x, (self.kernel_size, 0)).contiguous()
-            x = F.pad(x, (1, 0)).contiguous()
-            x = causal_conv1d_fn(x, weight=self.weight)[:, :, :-1]
-        else:
-            x = causal_conv1d_fn(x, weight=self.weight)
-        if x.device.type == "mps":
-            x = _Transpose12Contiguous.apply(x)
-        else:
-            x = x.transpose(1, 2).contiguous()  # (B, T, C)
-        return apply_activation(x, self.activation)
-
-class InputEmbedShortConvExpander(nn.Module):
-    def __init__(self, config: DragonConfig) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.value_channels = 4
-        if self.value_channels <= 1:
-            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
-
-        kernel_size = 4
-        if kernel_size <= 0:
-            raise ValueError(f"input_embed_shortconv_kernel_size must be positive, got {kernel_size}.")
-        self.kernel_size = kernel_size
-
-        self.conv = nn.Conv1d(
-            self.hidden_size,
-            self.hidden_size * self.value_channels,
-            kernel_size=self.kernel_size,
-            padding=0,
-            groups=self.hidden_size,
-            bias=False,
-        )
-
-    def reset_parameters_identity(self) -> None:
-        with torch.no_grad():
-            self.conv.weight.zero_()
-            self.conv.weight[:, 0, self.kernel_size - 1] = 1.0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, d) -> (B, T, d, d_v)
-        if x.ndim != 3:
-            raise ValueError(f"Expected x with shape (B, T, d), got {tuple(x.shape)}")
-        B, T, d = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected x feature dim {self.hidden_size}, got {d}.")
-
-        x_t = x.transpose(1, 2).contiguous()  # (B, d, T)
-        pad_left = self.kernel_size - 1
-        x_t = F.pad(x_t, (pad_left, 0)).contiguous()
-        y = self.conv(x_t)  # (B, d*d_v, T)
-        y = y.transpose(1, 2).contiguous()  # (B, T, d*d_v)
-        return y.reshape(B, T, d, self.value_channels)
-
-    def forward_with_past(
-        self, x: torch.Tensor, *, past: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.ndim != 3:
-            raise ValueError(f"Expected x with shape (B, T, d), got {tuple(x.shape)}")
-        B, T, d = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected x feature dim {self.hidden_size}, got {d}.")
-
-        x_t = x.transpose(1, 2).contiguous()  # (B, d, T)
-        past_len = self.kernel_size - 1
-        if past_len <= 0:
-            expanded = self.forward(x)
-            empty = x_t[:, :, :0].contiguous()
-            return expanded, empty
-
-        if past is None:
-            past = torch.zeros((B, d, past_len), device=x.device, dtype=x.dtype)
-        if past.ndim != 3 or int(past.shape[0]) != B or int(past.shape[1]) != d or int(past.shape[2]) != past_len:
-            raise ValueError(f"Expected past with shape (B, d, {past_len}), got {tuple(past.shape)}")
-
-        x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, d, past_len+T)
-        y = self.conv(x_cat)  # (B, d*d_v, T)
-        y = y.transpose(1, 2).contiguous()  # (B, T, d*d_v)
-        expanded = y.reshape(B, T, d, self.value_channels)
-        past_out = x_cat[:, :, -past_len:].contiguous()
-        return expanded, past_out
-
-class ResidualShortConvCompressor(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = int(config.hidden_size)
-        self.value_channels = int(getattr(config, "ddl_value_channels", 4))
-        if self.value_channels <= 1:
-            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
-        self.residual_size = self.hidden_size * self.value_channels
-
-        kernel_size = int(getattr(config, "ddl_state_shortconv_kernel_size", 4))
-        self.shortconv = DepthwiseShortConv1d(self.residual_size, kernel_size=kernel_size)
-
-        read_init_raw = getattr(config, "ddl_state_read_init", None)
-        if read_init_raw is None:
-            read_init = 1.0 / float(self.value_channels)
-        else:
-            read_init = float(read_init_raw)
-        self.read = nn.Parameter(torch.full((self.value_channels,), read_init))
-
-    def forward(self, x: torch.Tensor, return_past: bool = False) -> torch.Tensor:
-        # x: (B, T, d, d_v)
-        B, T, d, dv = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
-        if dv != self.value_channels:
-            raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
-
-        x_flat = x.reshape(B, T, self.residual_size)
-        x_conv = self.shortconv(x_flat).reshape(B, T, d, dv)
-        if return_past:
-            past = x_flat.transpose(1, 2)[:, :, -(self.shortconv.kernel_size - 1):].contiguous()
-            return torch.sum(x_conv * self.read, dim=-1), past
-        else:
-            return torch.sum(x_conv * self.read, dim=-1)
-
-    def forward_with_past(
-        self, x: torch.Tensor, *, past: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # past: (B, C, k-1) where C = hidden_size * value_channels
-        if past is None:
-            return self.forward(x, return_past=True)
-        B, T, d, dv = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
-        if dv != self.value_channels:
-            raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
-
-        kernel_size = int(getattr(self.shortconv, "kernel_size", 0))
-        if kernel_size <= 1:
-            return self.forward(x), None
-
-        if bool(getattr(self.shortconv, "shift_right1", False)):
-            raise NotImplementedError("shift_right1 shortconv is not supported in DDL kv-cache mode.")
-
-        x_flat = x.reshape(B, T, self.residual_size)
-        x_t = x_flat.transpose(1, 2).contiguous()  # (B, C, T)
-        past_len = kernel_size - 1
-
-        if past is None:
-            past = torch.zeros((B, self.residual_size, past_len), device=x.device, dtype=x.dtype)
-        if (
-            past.ndim != 3
-            or int(past.shape[0]) != B
-            or int(past.shape[1]) != self.residual_size
-            or int(past.shape[2]) != past_len
-        ):
-            raise ValueError(f"Expected past with shape (B, C, {past_len}), got {tuple(past.shape)}")
-
-        x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, C, past_len+T)
-        weight = self.shortconv.weight.unsqueeze(1)
-        y = F.conv1d(x_cat, weight, bias=None, stride=1, padding=0, groups=self.residual_size)  # (B, C, T)
-        y_bt = y.transpose(1, 2).contiguous()  # (B, T, C)
-        y_bt = apply_activation(y_bt, getattr(self.shortconv, "activation", None))
-        y = y_bt.reshape(B, T, d, dv)
-        out = torch.sum(y * self.read, dim=-1)
-        past_out = x_cat[:, :, -past_len:].contiguous()
-        return out, past_out
-
-class DragonNgramEmbedding(nn.Module):
-    """
-    Computes embeddings enriched with N-gram features without maintaining internal state.
-    """
-    def __init__(self, config: DragonConfig, base_embeddings):
-        super().__init__()
-        self.config = config
-
-        self.word_embeddings = base_embeddings
-        
-        self.m = config.ngram_embeddings_ratio * config.vocab_size
-        self.k = config.ngram_embeddings_channels
-        self.n = config.ngram_embeddings_neighbor
-        
-        self._init_ngram_embeddings()
-        self._vocab_mods_cache = None
-        
-    def _init_ngram_embeddings(self) -> None:
-        """Initialize N-gram embedding and projection layers."""
-        num_embedders = self.k * (self.n - 1)
-        emb_dim = self.config.hidden_size // num_embedders
-        
-        embedders = []
-        post_projs = []
-
-        if num_embedders == 6:
-            primes = [754573, 754627, 754703, 754771, 754829, 754891]
-            print("Using fixed prime vocab sizes for N-gram embedders.")
-        
-        for i in range(num_embedders):
-            if num_embedders == 6:
-                vocab_size = primes[i]
-            else:
-                vocab_size = int(self.m + i * 2 + 1)
-            emb = nn.Embedding(vocab_size, emb_dim, padding_idx=self.config.pad_token_id)
-            proj = DragonLinear(self.config, emb_dim, self.config.hidden_size, bias=False)
-            embedders.append(emb)
-            post_projs.append(proj)
-        
-        self.embedders = nn.ModuleList(embedders)
-        self.post_projs = nn.ModuleList(post_projs)
-    
-    def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int, eos_token_id: int = 2) -> torch.Tensor:
-        """Shift tensor right by n positions, resetting at EOS tokens."""
-        batch_size, seq_len = tensor.shape
-        result = torch.zeros_like(tensor)
-        eos_mask = (tensor == eos_token_id)
-        
-        for i in range(batch_size):
-            eos_positions = eos_mask[i].nonzero(as_tuple=True)[0]
-            prev_idx = 0
-            
-            for eos_idx in eos_positions:
-                end_idx = eos_idx.item() + 1
-                if end_idx - prev_idx > n:
-                    result[i, prev_idx+n:end_idx] = tensor[i, prev_idx:end_idx-n]
-                prev_idx = end_idx
-            
-            if prev_idx < seq_len and seq_len - prev_idx > n:
-                result[i, prev_idx+n:seq_len] = tensor[i, prev_idx:seq_len-n]
-        
-        return result
-    
-    def _precompute_vocab_mods(self) -> Dict[Tuple[int, int], List[int]]:
-        """Precompute modular arithmetic values for vocabulary."""
-        if self._vocab_mods_cache is not None:
-            return self._vocab_mods_cache
-        
-        vocab_mods = {}
-        vocab_size = self.config.vocab_size
-        
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
-                
-                mods = []
-                power_mod = 1
-                for _ in range(i - 1):
-                    power_mod = (power_mod * vocab_size) % emb_vocab_dim
-                    mods.append(power_mod)
-                
-                vocab_mods[(i, j)] = mods
-        
-        self._vocab_mods_cache = vocab_mods
-        return vocab_mods
-    
-    def _get_ngram_ids(
-        self, 
-        input_ids: torch.Tensor, 
-        shifted_ids: Dict[int, torch.Tensor], 
-        vocab_mods: List[int], 
-        ngram: int
-    ) -> torch.Tensor:
-        """Compute N-gram hash IDs using polynomial rolling hash."""
-        ngram_ids = input_ids.clone()
-        for k in range(2, ngram + 1):
-            ngram_ids = ngram_ids + shifted_ids[k] * vocab_mods[k - 2]
-        return ngram_ids
-    
-    def forward(
-        self, 
-        input_ids: torch.Tensor, 
-        ngram_context: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Stateless forward pass.
-        
-        Args:
-            input_ids: Current input token IDs of shape (batch_size, seq_len)
-            ngram_context: Optional historical context of shape (batch_size, context_len)
-            
-        Returns:
-            Embedding tensor of shape (batch_size, seq_len, hidden_size)
-        """
-        seq_len = input_ids.size(-1)
-        
-        # Determine complete context
-        if ngram_context is not None:
-            context = torch.cat([ngram_context[..., -(self.n-1):], input_ids], dim=-1)
-        else:
-            context = input_ids
-        
-        # Base word embeddings
-        device = self.word_embeddings.weight.device
-        x = self.word_embeddings(input_ids.to(device)).clone()
-        
-        # Precompute modular values
-        vocab_mods = self._precompute_vocab_mods()
-        
-        # Compute shifted IDs
-        shifted_ids = {}
-        for i in range(2, self.n + 1):
-            shifted_ids[i] = self._shift_right_ignore_eos(
-                context, i - 1, eos_token_id=50256
-            )
-        
-        # Add N-gram embeddings
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
-                
-                ngram_ids = self._get_ngram_ids(context, shifted_ids, vocab_mods[(i, j)], ngram=i)
-                new_ids = (ngram_ids % emb_vocab_dim)[..., -seq_len:]
-                
-                embedder_device = self.embedders[index].weight.device
-                x_ngram = self.embedders[index](new_ids.to(embedder_device))
-                
-                proj_device = self.post_projs[index].weight.device
-                x_proj = self.post_projs[index](x_ngram.to(proj_device))
-                x = x + x_proj.to(x.device)
-        
-        # Normalize
-        x = x / (1 + self.k * (self.n - 1))
-        
-        return x
 
 class DragonGeodesicNorm(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int):
@@ -4507,11 +2325,10 @@ class DragonGeodesicNorm(nn.Module):
         return output
 
 class DragonMonoBlock(GradientCheckpointingLayer):
-    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd', use_stem=False):
+    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.expand_factor = config.expand_factor
 
         if use_ve:
             assert layer_type in ['g', 'T', 'M'], "VE is only supported for 'g', 'T' and 'M' layer types."
@@ -4520,12 +2337,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.mixer = DragonGatedDeltaNet(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
-            use_gate = False # config.gate_gdn
-        elif layer_type == 'f':
-            self.mixer = DragonDifferentialAttention(config, layer_idx=layer_idx)
-            head_dim = self.mixer.head_dim
-            num_attention_heads = self.mixer.num_signal_heads
-            use_gate = config.gate_attn
+            use_gate = False
         elif layer_type == 'v':
             self.mixer = DragonDifferentialAttentionV2(config, layer_idx=layer_idx)
             head_dim = self.mixer.head_dim
@@ -4541,41 +2353,21 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
             use_gate = config.gate_attn
-        elif layer_type == 'T':
-            self.mixer = DragonDifferentialTensorProductAttention(config, layer_idx=layer_idx, use_ve=use_ve)
-            head_dim = self.mixer.head_dim
-            num_attention_heads = self.mixer.num_signal_heads
-            use_gate = config.gate_attn
         elif layer_type == 'V':
             self.mixer = DragonDifferentialTensorProductAttentionV2(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_signal_heads
             use_gate = config.gate_attn
-        elif layer_type == 'A':
-            self.mixer = DragonDifferentialMultiLatentAttention(config, layer_idx=layer_idx)
-            head_dim = self.mixer.head_dim
-            num_attention_heads = self.mixer.num_signal_heads
-            use_gate = config.gate_attn
-        elif layer_type == '3':
-            self.mixer = DragonMamba3(config, layer_idx=layer_idx)
-            head_dim = self.mixer.headdim
-            num_attention_heads = self.mixer.nheads
-            use_gate = config.gate_gdn
         elif layer_type == '2':
             self.mixer = DragonMamba2(config, layer_idx=layer_idx)
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
             use_gate = config.gate_gdn
-        elif layer_type == '_':
-            self.mixer = DragonMamba3Mimo(config, layer_idx=layer_idx, use_ve=use_ve)
-            head_dim = self.mixer.headdim
-            num_attention_heads = self.mixer.nheads
-            use_gate = False # inside Mamba3Mimo
         elif layer_type == 'M':
             self.mixer = DragonMamba3MimoFast(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
-            use_gate = False # inside Mamba3Mimo
+            use_gate = False # inside Mamba3MimoFast
         else:
             raise ValueError(f"Unknown layer type: {layer_type}")
 
@@ -4588,10 +2380,8 @@ class DragonMonoBlock(GradientCheckpointingLayer):
                     DragonLinear(config, head_dim, num_attention_heads*head_dim, bias=True),
                 )
             elif self.config.gate_type == "headwise":
+                self.gate_proj = DragonLinear(self.config, config.hidden_size, num_attention_heads, bias=False)
                 if self.config.scalar_proj_as_hidden_matrix:
-                    self.gate_proj = DragonLinear(self.config, config.hidden_size, num_attention_heads, bias=False)
-                else:
-                    self.gate_proj = DragonLinear(self.config, config.hidden_size, num_attention_heads, bias=False, alpha_fwd=1., alpha_bwd=1.)
                     self.gate_proj.is_scalar_weight = True
             else:
                 raise ValueError(f"Unknown gate_type: {self.config.gate_type}")
@@ -4617,49 +2407,28 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.input_norm = DragonNorm(config, config.hidden_size)
             self.postmixer_norm = DragonNorm(config, config.hidden_size)
         else:
-            assert self.config.ddl_type == ""
             self.input_norm = torch.nn.Identity()
             self.postmixer_norm = torch.nn.Identity()
             self.geodesic_mixer = DragonGeodesicNorm(config, self.layer_idx)
             self.geodesic_mlp = DragonGeodesicNorm(config, self.layer_idx)
 
-        if self.config.ddl_type == 'vdim1':
-            self.ddl_attn = DeepDeltaResidualVdim1(config)
-            self.ddl_mlp = DeepDeltaResidualVdim1(config)
-        elif self.config.ddl_type == 'expanded':
-            self.ddl_attn = DeepDeltaResidualExpanded(config)
-            self.ddl_mlp = DeepDeltaResidualExpanded(config)
-        elif self.config.ddl_type == 'ec':
-            self.compress = ResidualShortConvCompressor(config)
-            self.ddl_attn = DeepDeltaResidualExpanded(config)
-            self.ddl_mlp = DeepDeltaResidualExpanded(config)
-
         if not config.moe or mlp_type == 'd':
-            if not use_stem:
-                if config.mlp_type == "simple":
-                    self.mlp = DragonMLP(config)
-                elif config.mlp_type == "gated":
-                    self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
-            else:
-                self.mlp = DragonSTEMMLP(config)
+            if config.mlp_type == "simple":
+                self.mlp = DragonMLP(config)
+            elif config.mlp_type == "gated":
+                self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
         elif mlp_type == 'm':
             self.mlp = DragonMoE(config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Unknown mlp_type: {mlp_type}")
-        global PREVIOUS_MLP
-        PREVIOUS_MLP = self.mlp
 
         lns = 1.
         if config.layer_norm_scaling:
-            lns = 1. / math.sqrt(layer_idx + (2 if config.old_lns else 1))
+            lns = 1. / math.sqrt(layer_idx + 1)
         self.lns = float(lns)
 
-        a = 1.
-        b = 1.
-        if self.config.use_uscaling:
-            a = math.sqrt(self.config.uscaling_tau)
-            b = math.sqrt(1.0 - self.config.uscaling_tau)
-        elif self.config.use_completed_p:
+        a, b = 1., 1.
+        if self.config.use_completed_p:
             a = (len(self.config.layers_config)/self.config.base_depth) ** (-self.config.completed_p_alpha)
         self.a = float(a)
         self.b = float(b)
@@ -4674,16 +2443,12 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
-        router_prev=None,
-        stem_emb=None,
         ve=None,
         **kwargs,
     ):
         # MIXER.
         residual = hidden_states
         x_in = hidden_states
-        if self.config.ddl_type == 'ec':
-            x_in = self.compress(residual)
         hidden_states = self.lns * self.input_norm(x_in) # (B, L, D)
         y_mixer, last_key_states, last_value_states = self.mixer(
             hidden_states=hidden_states,
@@ -4710,9 +2475,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
         y_mixer = self.mixer_proj(y_mixer)
 
-        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
-            hidden_states = self.ddl_attn(residual, k_in=y_mixer, v_in=x_in, context=hidden_states, scalar=self.a)
-        elif self.config.geodesic_update:
+        if self.config.geodesic_update:
             hidden_states = self.geodesic_mixer(residual, y_mixer)
         else:
             hidden_states = self.b * residual + self.a * y_mixer
@@ -4720,22 +2483,15 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         # MLP.
         residual = hidden_states
         x_in = residual
-        if self.config.ddl_type == 'ec':
-            x_in = self.compress(residual)
         hidden_states = self.lns * self.postmixer_norm(x_in)
-        if isinstance(self.mlp, DragonMoE):
-            y_mlp = self.mlp(hidden_states, self.postmixer_norm(x_in), router_prev, stem_emb=stem_emb) # (B, L, D)
-        else:
-            y_mlp = self.mlp(hidden_states, router_prev, stem_emb=stem_emb) # (B, L, D)
+        y_mlp = self.mlp(hidden_states) # (B, L, D)
 
-        if self.config.ddl_type == 'vdim1' or self.config.ddl_type == 'expanded' or self.config.ddl_type == 'ec':
-            hidden_states = self.ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states, scalar=self.a)
-        elif self.config.geodesic_update:
+        if self.config.geodesic_update:
             hidden_states = self.geodesic_mlp(residual, y_mlp)
         else:
             hidden_states = self.b * residual + self.a * y_mlp
 
-        return hidden_states, last_key_states, last_value_states, router_prev
+        return hidden_states, last_key_states, last_value_states
 
 class DragonPreTrainedModel(PreTrainedModel):
     config: DragonConfig
@@ -4806,18 +2562,6 @@ class DragonModel(DragonPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        if self.config.ngram_embeddings:
-            self.embedding = DragonNgramEmbedding(config, self.embedding)
-            
-        if self.config.ddl_type == 'ec':
-            self.input_conv = InputEmbedShortConvExpander(config)
-            self.readout = ResidualShortConvCompressor(config)
-            
-            self.input_conv.reset_parameters_identity()
-
-        if self.config.vwn:
-            self.hidden_size_expanded = int(config.vwn_n/config.vwn_m * config.hidden_size)
-            self.expand_embedding = DragonLinear(config, config.hidden_size, self.hidden_size_expanded, bias=False)
 
         if config.use_value_embedding:
             layers_ve_flags = [c == "1" for c in config.layers_ve_config]
@@ -4839,20 +2583,6 @@ class DragonModel(DragonPreTrainedModel):
                 self.value_embedding_map.append(len(self.value_embedding))
                 self.value_embedding.append(nn.Embedding(config.vocab_size, out_dim, self.padding_idx))
 
-        self.use_stem = False
-        if "1" in config.layers_stem_config:
-            self.use_stem = True
-            layers_stem_flags = [c == "1" for c in config.layers_stem_config]
-            assert len(layers_stem_flags) == len(config.layers_config)
-            self.stem_embedding = nn.ModuleList()
-            self.stem_embedding_map = []
-            for use_stem, layer_type in zip(layers_stem_flags, config.layers_config):
-                if not use_stem:
-                    self.stem_embedding_map.append(-1)
-                    continue
-                self.stem_embedding_map.append(len(self.stem_embedding))
-                self.stem_embedding.append(nn.Embedding(config.vocab_size, config.intermediate_size, self.padding_idx))
-
         layers_mlp_config = config.layers_mlp_config
         if self.config.layers_mlp_config == '':
             if self.config.moe:
@@ -4861,25 +2591,15 @@ class DragonModel(DragonPreTrainedModel):
                 layers_mlp_config = 'd' * len(config.layers_config)
         assert len(layers_mlp_config) == len(config.layers_config)
 
-        layers_stem_config = config.layers_stem_config
-        if self.config.layers_stem_config == '':
-            layers_stem_config = '0' * len(config.layers_config)
-
-        if not self.config.vwn:
-            if not self.config.use_value_embedding:
-                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, use_stem=int(use_stem)) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, use_stem=int(use_stem)) for i, (layer, mlp_type, use_stem) in enumerate(zip(config.layers_config, layers_mlp_config, layers_stem_config))])
-            else:
-                assert len(config.layers_ve_config) == len(config.layers_config)
-                self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, use_stem=int(use_stem)) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type, use_stem=int(use_stem)) for i, (layer, ve, mlp_type, use_stem) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config, layers_stem_config))])
+        if not self.config.use_value_embedding:
+            self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, ) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) for i, (layer, mlp_type) in enumerate(zip(config.layers_config, layers_mlp_config))])
+        else:
+            assert len(config.layers_ve_config) == len(config.layers_config)
+            self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
 
         self.rotary_emb = None
         if self.config.rope_type != '' and self.config.rope_theta > 0.:
             self.rotary_emb = DragonRotaryEmbedding(config, head_dim=config.head_dim, theta=config.rope_theta)
-
-        if self.config.vwn:
-            if int(self.config.vwn_n/self.config.vwn_m) == 8:
-                self.gn = torch.nn.GroupNorm(num_groups=self.hidden_size_expanded//config.hidden_size, num_channels=self.hidden_size_expanded, eps=config.norm_epsilon, affine=False) # todo : zcg ?
-            self.reduce_h = DragonLinear(config, self.hidden_size_expanded, config.hidden_size, bias=False)
 
         if self.config.final_norm:
             self.final_norm = DragonNorm(config, config.hidden_size)
@@ -4914,15 +2634,7 @@ class DragonModel(DragonPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            if not self.config.ngram_embeddings:
-                inputs_embeds = self.embedding(input_ids)
-            else:
-                inputs_embeds = self.embedding(input_ids, ngram_context=None)
-        if self.config.vwn:
-            inputs_embeds = self.expand_embedding(inputs_embeds) # (B, L, D')
-            
-        if self.config.ddl_type == 'ec':
-            inputs_embeds, embed_state_out = self.input_conv.forward_with_past(inputs_embeds, past=None)
+            inputs_embeds = self.embedding(input_ids)
 
         if self.config.patch_level_training:
             # (B, KL, D) => (B, L, D) OR (B, L, D) ==> (B, L//K, D)
@@ -4962,24 +2674,17 @@ class DragonModel(DragonPreTrainedModel):
             position_embeddings = None
 
         shared_kv = (None, None)
-        router_prev = None
         for i, block in enumerate(self.layers):
             ve_i = None
             if self.config.use_value_embedding:
                 j = self.value_embedding_map[i]
                 if j != -1:
                     ve_i = self.value_embedding[j](input_ids)
-            
-            stem_emb = None
-            if self.use_stem:
-                j = self.stem_embedding_map[i]
-                if j != -1:
-                    stem_emb = self.stem_embedding[j](input_ids)
 
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            hidden_states, last_k, last_v, router_prev = block(
+            hidden_states, last_k, last_v = block(
                 hidden_states,
                 position_ids=position_ids,
                 cache_params=past_key_values,
@@ -4988,21 +2693,10 @@ class DragonModel(DragonPreTrainedModel):
                 key_value_last_layer=shared_kv,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                router_prev=router_prev,
-                stem_emb=stem_emb,
                 ve=ve_i,
                 **kwargs,
             )
             shared_kv = (last_k, last_v)
-
-        if self.config.vwn:
-            if int(self.config.vwn_n/self.config.vwn_m) == 8:
-                B, L, D = hidden_states.shape
-                hidden_states = self.gn(hidden_states.reshape(-1, D)).view(B, L, D)
-            hidden_states = self.reduce_h(hidden_states) # back to (B, L, D)
-            
-        if self.config.ddl_type == 'ec':
-            hidden_states, _ = self.readout.forward_with_past(hidden_states, past=None)
 
         if self.config.final_norm:
             hidden_states = self.final_norm(hidden_states)
@@ -5026,12 +2720,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         self.config = config
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
-        bwd = 1/math.sqrt(config.hidden_size)
-        if config.reduce_lm_head == 0:
-            self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=bwd)
-        else:
-            self.lm_head1 = DragonLinear(config, config.hidden_size, config.reduce_lm_head, bias=False, alpha_fwd=1./math.sqrt(config.reduce_lm_head)) 
-            self.lm_head2 = DragonLinear(config, config.reduce_lm_head, config.vocab_size, bias=False, alpha_fwd=1/config.hidden_size, alpha_bwd=bwd)
+        self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
         if config.tie_lm_head:
             self.lm_head.weight = self.model.embedding.weight
@@ -5081,10 +2770,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
             labels = labels.to(hidden_states.device)
 
             if linear_cross_entropy is None or not self.config.fused_loss_computation:
-                if not self.config.reduce_lm_head:
-                    logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
-                else:
-                    logits = self.lm_head2(self.lm_head1(hidden_states.to(self.lm_head1.weight.dtype)[:, slice_indices, :])).float()
+                logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
                 if not self.config.patch_level_training:
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
@@ -5098,14 +2784,11 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
                         loss = loss + F.nll_loss(log_probs, shift_labels[:, i])
                     loss = loss / self.config.patch_level_training_size
             else:
-                assert not self.config.reduce_lm_head
                 assert not self.config.patch_level_training, "Fused loss computation is not supported with patch-level training."
                 loss = linear_cross_entropy(
                     hidden_states[:, slice_indices, :].view(-1, hidden_states.size(-1)),
                     self.lm_head.weight,
                     labels.view(-1),
-                    alpha_fwd=1/self.config.hidden_size if self.config.use_uscaling else 1.,
-                    alpha_bwd=1/math.sqrt(self.config.hidden_size) if self.config.use_uscaling else 1.,
                     impl="cce_exact",
                     shift=1,
                 )

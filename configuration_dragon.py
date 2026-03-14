@@ -95,38 +95,21 @@ class DragonConfig(PretrainedConfig):
         cosnet_rank: int = 64,
         cosnet: bool = False,
         geodesic_update: bool = False,
-        ngram_embeddings: bool = False,
-        ngram_embeddings_neighbor: int = 4,
-        ngram_embeddings_channels: int = 4,
-        ngram_embeddings_ratio: int = 15,
-        ddl_type: str = "",
         base_depth: int = 0,
         completed_p_alpha: float = 0.5,
         use_completed_p: bool = False,
-        layers_stem_config: str = "",
         layers_mlp_config: str = "",
         layers_ve_config: str = "",
         use_value_embedding: bool = False,
-        reduce_lm_head: int = 0,
-        vwn: bool = False,
-        vwn_m: int = 2,
-        vwn_n: int = 3,
-        vwn_wd_alpha_beta: bool = False,
-        vwn_dynamic: bool = True,
         legacy_gate: bool = False,
-        tie_lm_head: bool = False,
         mlp_type: str = "simple",
         layer_norm_scaling: bool = False,
         mamba_d_state: int = 128,
         mamba_headdim: int = 64,
-        mamba3_rope: bool = True,
-        mamba3_remove_BC_bias: bool = False,
-        mamba3_is_id_rms: bool = True,
+        mamba_mimo_dim : int = 4,
+        mamba_ngroups : int = 1,
         mamba3_remove_conv: bool = True,
-        mamba3_is_A_dd: bool = True,
-        mamba3_add_trapezoid: bool = True,
         mamba3_postgate_norm: bool = False,
-        mamba3_derf: bool = False,
         moe: bool = False,
         moe_num_routed_experts: int = 2,
         moe_num_active_experts: int = 1,
@@ -136,17 +119,10 @@ class DragonConfig(PretrainedConfig):
         moe_routed_input_dim: int = 384,
         moe_shared_expert_gate: bool = False,
         intra_doc_masking: bool = False,
-        seednorm_rank: int = 1,
-        seednorm_type: int = 1,
         final_norm: bool = True,
-        mla_kv_rank: int = 128,
-        shrink_qk_da: int = 2,
         shrink_qk_gdn: int = 2,
         mixer_gn: bool = True,
         gate_before_norm: bool = True,
-        kda_allow_neg_eigval: bool = False,
-        kda_num_v_heads: Optional[int] = None,
-        seednorm_wd: bool = True,
         normalization_type: str = "rmsnorm",
         tpa_rank: int = 2,
         num_signal_heads_diff: Optional[int] = None,
@@ -157,49 +133,30 @@ class DragonConfig(PretrainedConfig):
         token_conv1d_gdn: bool = True,
         patch_level_training: bool = False,
         patch_level_training_size: int = 4,
-        nsa_topk: int = 16,
-        nsa_block_size: int = 64,
-        nsa_window_size: int = 512,
-        cca_seq_kernel_size: int = 4,
-        rope_gdn: str = None,
+        zero_centered_gamma=False,
         zero_centered_gate: bool = False,
         scalable_softmax: bool = True,
-        resformer: bool = False,
-        mamba_mimo_dim : int = 4,
-        mamba_ngroups : int = 1,
+        qk_norm=True,
         gate_type: str = "elementwise",
         gate_act: str = "silu",
         gate_attn: bool = False,
         gate_gdn: bool = True,
-        head_dim_gdn: Optional[int] = None,
+        head_dim_gdn: int = None,
         num_attention_heads_gdn: int = 32,
         num_key_value_heads_gdn: int = None,
         fused_loss_computation=False,
-        qk_norm=True,
-        num_attention_heads_indexer=8,
-        head_dim_indexer=32,
-        dsa_q_lora_rank=128,
-        dsa_topk=512,
-        zero_centered_gamma=False,
         vocab_size=151936,
-        tie_word_embeddings=False,
+        tie_lm_head: bool = False,
         max_position_embeddings=8192,
-        use_uscaling=False,
         hidden_size=2048,
         intermediate_size=8192,
-        expand_factor=2,
         layers_config=4*"lrdlr",
         head_dim=128,
         num_attention_heads=32,
         num_key_value_heads=8,
-        mlp_hidden_act="relu2",
-        attention_bias=False,
-        mlp_bias=False,
-        use_bias=False,
         initializer_range=0.006,
         softcap_attn=0.0,
         norm_epsilon=1e-6,
-        residual_in_fp32=False,
         use_cache=True,
         num_logits_to_keep=1,
         pad_token_id=0,
@@ -210,53 +167,30 @@ class DragonConfig(PretrainedConfig):
         complete_slw=False,
         rope_type="",
         rope_theta=0.,
-        uscaling_tau=0.2,
-        attention_dropout=0.,
-        hidden_dropout=0.,
         gdn_d_conv=4,
         gdn_dt_min=0.001,
         gdn_dt_max=0.1,
         gdn_dt_init_floor=1e-4,
         gdn_A_init_range=(1, 16),
-        old_lns=False,
-        mlp_linking=False,
         **kwargs,
     ):
         self.cosnet_rank = cosnet_rank
         self.cosnet = cosnet
         self.geodesic_update=geodesic_update
-        self.ngram_embeddings = ngram_embeddings
-        self.ngram_embeddings_neighbor = ngram_embeddings_neighbor
-        self.ngram_embeddings_channels = ngram_embeddings_channels
-        self.ngram_embeddings_ratio = ngram_embeddings_ratio
-        self.ddl_type = ddl_type
         self.base_depth = base_depth
         self.completed_p_alpha = completed_p_alpha
         self.use_completed_p = use_completed_p
-        self.layers_stem_config = layers_stem_config
         self.layers_mlp_config = layers_mlp_config
         self.layers_ve_config = layers_ve_config
         self.use_value_embedding = use_value_embedding
-        self.reduce_lm_head = reduce_lm_head
-        self.vwn = vwn
-        self.vwn_m = vwn_m
-        self.vwn_n = vwn_n
-        self.vwn_wd_alpha_beta = vwn_wd_alpha_beta
-        self.vwn_dynamic = vwn_dynamic
         self.legacy_gate = legacy_gate
         self.tie_lm_head = tie_lm_head
         self.mlp_type = mlp_type
         self.layer_norm_scaling = layer_norm_scaling
         self.mamba_d_state = mamba_d_state
         self.mamba_headdim = mamba_headdim
-        self.mamba3_rope = mamba3_rope
-        self.mamba3_remove_BC_bias = mamba3_remove_BC_bias
-        self.mamba3_is_id_rms = mamba3_is_id_rms
         self.mamba3_remove_conv = mamba3_remove_conv
-        self.mamba3_is_A_dd = mamba3_is_A_dd
-        self.mamba3_add_trapezoid = mamba3_add_trapezoid
         self.mamba3_postgate_norm = mamba3_postgate_norm
-        self.mamba3_derf = mamba3_derf
         self.moe = moe
         self.moe_num_active_experts = moe_num_active_experts
         self.moe_num_routed_experts = moe_num_routed_experts
@@ -266,17 +200,10 @@ class DragonConfig(PretrainedConfig):
         self.moe_routed_input_dim = moe_routed_input_dim
         self.moe_shared_expert_gate = moe_shared_expert_gate
         self.intra_doc_masking = intra_doc_masking
-        self.seednorm_rank = seednorm_rank
-        self.seednorm_type = seednorm_type
         self.final_norm = final_norm
-        self.mla_kv_rank = mla_kv_rank
-        self.shrink_qk_da = shrink_qk_da
         self.shrink_qk_gdn = shrink_qk_gdn
         self.mixer_gn = mixer_gn
         self.gate_before_norm = gate_before_norm
-        self.kda_allow_neg_eigval = kda_allow_neg_eigval
-        self.kda_num_v_heads = kda_num_v_heads
-        self.seednorm_wd = seednorm_wd
         self.normalization_type = normalization_type
         self.tpa_rank = tpa_rank
         self.num_signal_heads_diff = num_signal_heads_diff
@@ -287,11 +214,6 @@ class DragonConfig(PretrainedConfig):
         self.token_conv1d_gdn = token_conv1d_gdn
         self.patch_level_training = patch_level_training
         self.patch_level_training_size = patch_level_training_size
-        self.nsa_topk = nsa_topk
-        self.nsa_block_size = nsa_block_size
-        self.nsa_window_size = nsa_window_size
-        self.cca_seq_kernel_size = cca_seq_kernel_size
-        self.rope_gdn = rope_gdn
         self.zero_centered_gate = zero_centered_gate
         self.gate_type = gate_type
         self.gate_act = gate_act
@@ -304,48 +226,32 @@ class DragonConfig(PretrainedConfig):
             num_key_value_heads_gdn = num_attention_heads_gdn
         self.num_key_value_heads_gdn = num_key_value_heads_gdn
         self.fused_loss_computation = fused_loss_computation
-        self.num_attention_heads_indexer = num_attention_heads_indexer
-        self.head_dim_indexer = head_dim_indexer
-        self.dsa_q_lora_rank = dsa_q_lora_rank
-        self.dsa_topk = dsa_topk
         self.zero_centered_gamma = zero_centered_gamma
         self.rope_type = rope_type
         self.rope_theta = rope_theta
         self.qk_norm = qk_norm
         self.softcap_attn = softcap_attn
-        self.use_uscaling = use_uscaling
-        self.uscaling_tau = uscaling_tau
         self.scalable_softmax = scalable_softmax
-        self.resformer = resformer
         self.mamba_mimo_dim = mamba_mimo_dim
         self.mamba_ngroups = mamba_ngroups
 
         self.vocab_size = vocab_size
-        self.tie_word_embeddings = tie_word_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.expand_factor = expand_factor
         self.layers_config = layers_config
         self.num_hidden_layers = len(layers_config)
         self.num_attention_heads = num_attention_heads
         self.sliding_window_size = sliding_window_size
         self.slw_wsize = slw_wsize
         self.complete_slw = complete_slw
-        self.attention_dropout = attention_dropout
-        self.hidden_dropout = hidden_dropout
         self.max_position_embeddings = max_position_embeddings
 
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
-        self.mlp_hidden_act = mlp_hidden_act
-        self.attention_bias = attention_bias
-        self.mlp_bias = mlp_bias
-        self.use_bias = use_bias
         self.initializer_range = initializer_range
         self.norm_epsilon = norm_epsilon
-        self.residual_in_fp32 = residual_in_fp32
 
         self.use_cache = use_cache
         self.num_logits_to_keep = num_logits_to_keep
@@ -355,15 +261,6 @@ class DragonConfig(PretrainedConfig):
         self.time_step_max = gdn_dt_max
         self.time_step_floor = gdn_dt_init_floor
         self.A_init_range = gdn_A_init_range
-
-        self.old_lns = old_lns
-        
-        self.mlp_linking = mlp_linking
-
-        #assert self.hidden_size % self.num_attention_heads == 0
-        #assert self.num_attention_heads % self.num_key_value_heads == 0
-        #assert self.num_attention_heads % 2 == 0, "Number of attention heads must be even for differential attention."
-        #assert self.num_key_value_heads % 2 == 0, "Number of kv heads must be even for differential attention."
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -380,4 +277,3 @@ class DragonConfig(PretrainedConfig):
 
 DragonConfig.register_for_auto_class("AutoConfig")
 __all__ = ["DragonConfig"]
-# todo : update docstrings, arg orders
