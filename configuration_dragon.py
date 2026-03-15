@@ -172,6 +172,7 @@ class DragonConfig(PretrainedConfig):
         gdn_dt_max=0.1,
         gdn_dt_init_floor=1e-4,
         gdn_A_init_range=(1, 16),
+        tie_word_embeddings=False,
         **kwargs,
     ):
         self.cosnet_rank = cosnet_rank
@@ -261,6 +262,8 @@ class DragonConfig(PretrainedConfig):
         self.time_step_max = gdn_dt_max
         self.time_step_floor = gdn_dt_init_floor
         self.A_init_range = gdn_A_init_range
+
+        self.tie_word_embeddings = tie_word_embeddings
 
         super().__init__(
             pad_token_id=pad_token_id,

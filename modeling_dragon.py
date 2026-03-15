@@ -235,11 +235,6 @@ class HybridDragonDynamicCache(DynamicCache):
             self.cca_prev_hidden.append(None)
             self.conv_caches.append(None)
             self.ssm_caches.append(None)
-            self.q_conv_caches.append(None)
-            self.k_conv_caches.append(None)
-            self.v_conv_caches.append(None)
-            self.conv_states.append(None)
-            self.prev_hs.append(None)
 
         self.window_size = config.sliding_window_size
         self.layers_config = config.layers_config
@@ -1939,9 +1934,12 @@ class DragonMamba3MimoFast(nn.Module):
         """
 
         layer_idx = self.layer_idx
-        batch, L_new, _ = hidden_states.shape
+        batch, q_len, _ = hidden_states.shape
 
-        if cache_params is not None:
+        use_precomputed_states = cache_params is not None and q_len == 1
+        is_prefill = cache_params is not None
+
+        if use_precomputed_states:
             state = (
                 cache_params.mamba3_angle_states[layer_idx],
                 cache_params.mamba3_ssm_states[layer_idx],
@@ -1949,18 +1947,7 @@ class DragonMamba3MimoFast(nn.Module):
                 cache_params.mamba3_v_states[layer_idx],
             )
 
-            if state[0] is None:
-                state = self.allocate_inference_cache(
-                    batch_size=batch,
-                    max_seqlen=1,
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-            
-            ys = []
-            for t in range(L_new):
-                y_t, *state = self.step(hidden_states[:, t, :], *state)
-                ys.append(y_t)
+            y_t, *state = self.step(hidden_states[:, 0, :], *state)
 
             (
                 cache_params.mamba3_angle_states[layer_idx],
@@ -1968,24 +1955,21 @@ class DragonMamba3MimoFast(nn.Module):
                 cache_params.mamba3_k_states[layer_idx],
                 cache_params.mamba3_v_states[layer_idx],
             ) = state
-            cache_params.past_length[layer_idx] += L_new
+            cache_params.past_length[layer_idx] += 1
 
-            y = torch.stack(ys, dim=1)  # (B, L_new, D)
-
+            y = y_t.unsqueeze(1)          # (B, 1, D)
             if self.config.mamba3_postgate_norm:
                 y = self.output_norm(y)
-            
             return y, None, None
 
         if self.config.complete_slw and self.config.slw_wsize > 128:
+            assert not is_prefill
             if self.previous_window_size != self.config.slw_wsize:
                 logger.info(f"Mamba3Mimo complete_slw: updating previous_window_size from {self.previous_window_size} to {self.config.slw_wsize}")
                 self.previous_window_size = self.config.slw_wsize
             batch, l, dim = hidden_states.shape
             assert batch == 1, "complete_slw only supports batch size of 1"
-            #print(f"Mamba3Mimo : hidden_states shape before reshape for complete_slw: {hidden_states.shape}, with config.slw_wsize={self.config.slw_wsize}")
             hidden_states = hidden_states.reshape(-1, self.config.slw_wsize, dim).contiguous()
-            #print(f"Mamba3Mimo : hidden_states reshaped to {hidden_states.shape} for complete_slw")
 
         # Input projection
         zxdtAtrap = self.in_proj(hidden_states)
@@ -2029,7 +2013,7 @@ class DragonMamba3MimoFast(nn.Module):
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
 
-        y = mamba3_tilelang(
+        y, kernel_state = mamba3_tilelang(
             Q=C.contiguous().bfloat16(),
             K=B.contiguous().bfloat16(),
             V=x.contiguous().bfloat16(),
@@ -2047,7 +2031,16 @@ class DragonMamba3MimoFast(nn.Module):
             chunk_size=self.chunk_size,
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
+            return_state=is_prefill,
         )
+
+        if is_prefill:
+            angle_state_out, ssm_state_out, k_state_out, v_state_out = kernel_state
+            cache_params.mamba3_angle_states[layer_idx] = angle_state_out
+            cache_params.mamba3_ssm_states[layer_idx]   = ssm_state_out
+            cache_params.mamba3_k_states[layer_idx]     = k_state_out
+            cache_params.mamba3_v_states[layer_idx]     = v_state_out
+            cache_params.past_length[layer_idx]         += q_len
 
         y = rearrange(y, "b l h p -> b l (h p)")
         if self.config.mamba3_postgate_norm:
@@ -2056,8 +2049,6 @@ class DragonMamba3MimoFast(nn.Module):
 
         if self.config.complete_slw and self.config.slw_wsize > 128:
             y = y.reshape(batch, l, -1).contiguous()
-        if cache_params is not None:
-            y = y[:, -L_new:, ...].contiguous()
 
         return y, None, None
     
@@ -2073,9 +2064,6 @@ class DragonMamba3MimoFast(nn.Module):
         C = self.C_norm(C)
         B = B.expand(-1, -1, self.nheads, -1) # (B, R, N, S)
         C = C.expand(-1, -1, self.nheads, -1) # (B, R, N, S)
-    
-        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-        z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
 
         angles = angle_proj.unsqueeze(-2).expand(-1, self.nheads, -1)
 
@@ -2103,12 +2091,18 @@ class DragonMamba3MimoFast(nn.Module):
         """
 
         zxdtAtrap = self.in_proj(u)
-        offset = 0
-        z = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
-        x = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
-        dt = zxdtAtrap[..., offset : offset + self.nheads_local_tp].float(); offset += self.nheads_local_tp
-        A = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
-        trap = zxdtAtrap[..., offset : offset + 2 * self.nheads_local_tp] # todo Trap might need 2x? check dim
+        per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
+        off = 0
+        z    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
+        x    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
+        dt   = per_head[..., off];                        off += 1 # (L, B, H)
+        A    = per_head[..., off];                        off += 1 # (L, B, H)
+        trap = per_head[..., off];                        off += 1 # (L, B, H)
+        z = z.flatten(-2) # TODO: better efficient way to do it ? (considering the op we do just after)
+        x = x.flatten(-2)
+
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
 
         BCangle = self.in_proj_dyn(u)
         B = BCangle[..., 0:self.ngroups*self.mimo_dim*self.d_state]
