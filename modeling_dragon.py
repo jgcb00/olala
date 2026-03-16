@@ -1017,7 +1017,7 @@ class DragonDifferentialAttentionV2(nn.Module):
             causal=True,
             wsize=wsize,
             softcap=self.config.softcap_attn,
-            softmax_scale=None if self.config.use_completed_p else 1/self.head_dim,
+            softmax_scale=None if not self.config.use_completed_p else 1/self.head_dim,
         ) # (B, L, H, D)
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.head_dim) # (B, L, num_noise_heads, snr+1, D)
         attn_sig = attn_output[:, :, :, :self.snr, :] # (B, L, num_noise_heads, snr, D)
@@ -1309,7 +1309,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             causal=True,
             wsize=wsize,
             softcap=self.config.softcap_attn,
-            softmax_scale=None if self.config.use_completed_p else 1/self.head_dim,
+            softmax_scale=None if not self.config.use_completed_p else 1/self.head_dim,
         ) # (B, L, H, D)
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.head_dim) # (B, L, num_noise_heads, snr+1, D)
         attn_sig = attn_output[:, :, :, :self.snr, :] # (B, L, num_noise_heads, snr, D)
@@ -2307,7 +2307,9 @@ class DragonGeodesicNorm(nn.Module):
         g: ffn(x) or attn(x);
         """
 
-        gradient = g - (x * g).sum(dim=-1,keepdim=True) / (torch.norm(x, p=2, dim=-1, keepdim=True) ** 2) * x
+        x_norm_sq = x.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        proj_coeff = (x * g).sum(dim=-1, keepdim=True) / x_norm_sq
+        gradient = g - proj_coeff * x
         tangent_norm = torch.norm(gradient, p=2, dim=-1, keepdim=True)
         safe_tangent_norm = torch.clamp(tangent_norm, min=1e-8)
         unit_tangent = gradient / safe_tangent_norm
