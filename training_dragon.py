@@ -71,7 +71,8 @@ class NanoArgs:
     mlp_linking : bool = False
     final_norm: bool = True
     layer_norm_scaling: bool = False # not read when using muP
-    mlp_type: str = "simple" # simple, gated
+    mlp_type: str = "simple" # simple, gated, fan
+    fan_periodic_ratio: float = 0.2
     tie_lm_head: bool = False
     legacy_gate: bool = False
     vwn: bool = False
@@ -89,6 +90,12 @@ class NanoArgs:
     ngram_embeddings_channels: int = 4
     ngram_embeddings_ratio: int = 15
     geodesic_update: bool = False
+    geo_loss_coeff: float = 0.0
+    geo_loss_warmup_iters: int = 0
+    geo_loss_offset_iters: int = 0  # delay before warmup starts
+    geo_loss_decay_iters: int = 0  # 0 = no decay; otherwise linear decay to 0 over last N iters
+    normalize_lm_head: bool = False
+    normalize_embeddings: bool = False
     cosnet: bool = False
     cosnet_rank: int = 64
     prores: bool = False
@@ -992,6 +999,9 @@ config_hf = DragonConfig(
     cosnet=args.cosnet,
     cosnet_rank=args.cosnet_rank,
     geodesic_update=args.geodesic_update,
+    geo_loss_coeff=args.geo_loss_coeff,
+    normalize_lm_head=args.normalize_lm_head,
+    normalize_embeddings=args.normalize_embeddings,
     ngram_embeddings=args.ngram_embeddings,
     ngram_embeddings_neighbor=args.ngram_embeddings_neighbor,
     ngram_embeddings_channels=args.ngram_embeddings_channels,
@@ -1013,6 +1023,7 @@ config_hf = DragonConfig(
     legacy_gate=args.legacy_gate,
     tie_lm_head=args.tie_lm_head,
     mlp_type=args.mlp_type,
+    fan_periodic_ratio=args.fan_periodic_ratio,
     layer_norm_scaling=args.layer_norm_scaling,
     mamba_d_state=args.mamba_d_state,
     mamba_headdim=args.mamba_headdim,
@@ -1571,6 +1582,21 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
 
         to_log['slw_window'] = window
 
+    # GEO LOSS SCHEDULE (offset -> warmup -> constant -> decay)
+    if args.geo_loss_coeff > 0:
+        offset = args.geo_loss_offset_iters
+        decay_start = args.total_iterations - args.geo_loss_decay_iters
+        if iter_ < offset:
+            coeff = 0.0
+        elif args.geo_loss_warmup_iters > 0 and iter_ < offset + args.geo_loss_warmup_iters:
+            coeff = args.geo_loss_coeff * ((iter_ - offset) / args.geo_loss_warmup_iters)
+        elif args.geo_loss_decay_iters > 0 and iter_ >= decay_start:
+            coeff = args.geo_loss_coeff * max(0.0, 1.0 - (iter_ - decay_start) / args.geo_loss_decay_iters)
+        else:
+            coeff = args.geo_loss_coeff
+        raw_model.config.geo_loss_coeff = coeff
+        to_log['geo_loss_coeff'] = coeff
+
     # PRORES SCALARS UPDATE
     if args.prores:
         for mod in raw_model.modules():
@@ -1587,21 +1613,44 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         # run validation batches.
         model.eval()
         val_loader.reset()
-        val_loss = torch.zeros((), device=device, dtype=torch.float32)
+        val_ce_loss = torch.zeros((), device=device, dtype=torch.float32)
+        val_geo_loss = torch.zeros((), device=device, dtype=torch.float32)
+        val_combined_loss = torch.zeros((), device=device, dtype=torch.float32)
+        has_geo = args.geo_loss_coeff > 0
         for _ in range(args.val_iterations):
             for _ in range(accumulation_steps):
                 inputs, targets, cu, maxlen, position_ids = val_loader.next_batch()
                 with ctx:
-                    val_loss += model(input_ids=inputs, labels=targets, just_loss=True, cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids).loss.detach()
-        val_loss /= args.val_iterations * accumulation_steps
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss = val_loss.item()
+                    output = model(input_ids=inputs, labels=targets, just_loss=True, cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids)
+                    if has_geo and output.ce_loss is not None:
+                        val_ce_loss += output.ce_loss.detach()
+                        val_geo_loss += output.geo_loss.detach()
+                        val_combined_loss += output.loss.detach()
+                    else:
+                        val_ce_loss += output.loss.detach()
+                    del output
+        n = args.val_iterations * accumulation_steps
+        val_ce_loss /= n
+        dist.all_reduce(val_ce_loss, op=dist.ReduceOp.AVG)
+        val_ce_loss = val_ce_loss.item()
+        if has_geo:
+            val_geo_loss /= n
+            val_combined_loss /= n
+            dist.all_reduce(val_geo_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_combined_loss, op=dist.ReduceOp.AVG)
+            val_geo_loss = val_geo_loss.item()
+            val_combined_loss = val_combined_loss.item()
         model.train()
 
         # log.
-        print0(f'iteration:{iter_:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms')
+        val_extra = f" val_geo_loss:{val_geo_loss:.4f} val_combined_loss:{val_combined_loss:.4f}" if has_geo else ""
+        print0(f'iteration:{iter_:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} val_ce_loss:{val_ce_loss:.4f}{val_extra} train_time:{training_time_ms:.0f}ms')
         if master_process:
-            wandb.log({"val_loss": val_loss}, step=iter_)
+            val_log = {"val_ce_loss": val_ce_loss}
+            if has_geo:
+                val_log["val_geo_loss"] = val_geo_loss
+                val_log["val_combined_loss"] = val_combined_loss
+            wandb.log(val_log, step=iter_)
 
         # start the clock again.
         torch.cuda.synchronize()
@@ -1649,8 +1698,12 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     for i in range(1, accumulation_steps+1):
         # forward pass.
         with ctx:
-            loss = model(input_ids=x, labels=y, just_loss=True, cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids).loss
+            output = model(input_ids=x, labels=y, just_loss=True, cu_seqlens=cu, max_seqlen=maxlen, position_ids=position_ids)
+            loss = output.loss
             train_loss = loss.detach()
+            if output.geo_loss is not None:
+                to_log['geo_loss'] = output.geo_loss.detach().item()
+                to_log['ce_loss'] = output.ce_loss.detach().item()
         # prepare next batch.
         x, y, cu, maxlen, position_ids = train_loader.next_batch()
         # backward pass.
@@ -1739,7 +1792,7 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
     # ----------- LOGGING SECTION -----------
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     avg_step_time = approx_training_time_ms / (iter_ + 1 - WARMUP_SKIP) if iter_ >= start_iter+WARMUP_SKIP else 0
-    extra = " ".join(f"{k}:{v}" for k, v in (to_log or {}).items())
+    extra = " ".join(f"{k}:{v:.4f}" if isinstance(v, float) else f"{k}:{v}" for k, v in (to_log or {}).items())
     print0(f"iteration:{iter_+1:0{len(str(start_iter+args.total_iterations))}d}/{args.total_iterations} train_loss:{train_loss.item():.4f} grad_norm:{grad_norm.item():.4f} lr: {schedulers[0].get_last_lr()[0]:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{avg_step_time:.2f}ms {extra}")
     if master_process:
         wandb.log({'train_loss': train_loss.item(), 'step_avg_time': avg_step_time, **{f'lr_{i}': sched.get_last_lr()[0] for i, sched in enumerate(schedulers)}, 'grad_norm': grad_norm.item(), **to_log, **individual_grad_norms, **param_norms, **param_mins, **param_maxs, **param_avgs}, step=iter_)

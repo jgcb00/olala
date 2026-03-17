@@ -95,6 +95,9 @@ class DragonConfig(PretrainedConfig):
         cosnet_rank: int = 64,
         cosnet: bool = False,
         geodesic_update: bool = False,
+        geo_loss_coeff: float = 0.0,
+        normalize_lm_head: bool = False,
+        normalize_embeddings: bool = False,
         base_depth: int = 0,
         completed_p_alpha: float = 0.5,
         use_completed_p: bool = False,
@@ -103,6 +106,7 @@ class DragonConfig(PretrainedConfig):
         use_value_embedding: bool = False,
         legacy_gate: bool = False,
         mlp_type: str = "simple",
+        fan_periodic_ratio: float = 0.2,
         layer_norm_scaling: bool = False,
         mamba_d_state: int = 128,
         mamba_headdim: int = 64,
@@ -178,6 +182,9 @@ class DragonConfig(PretrainedConfig):
         self.cosnet_rank = cosnet_rank
         self.cosnet = cosnet
         self.geodesic_update=geodesic_update
+        self.geo_loss_coeff = geo_loss_coeff
+        self.normalize_lm_head = normalize_lm_head
+        self.normalize_embeddings = normalize_embeddings
         self.base_depth = base_depth
         self.completed_p_alpha = completed_p_alpha
         self.use_completed_p = use_completed_p
@@ -187,6 +194,7 @@ class DragonConfig(PretrainedConfig):
         self.legacy_gate = legacy_gate
         self.tie_lm_head = tie_lm_head
         self.mlp_type = mlp_type
+        self.fan_periodic_ratio = fan_periodic_ratio
         self.layer_norm_scaling = layer_norm_scaling
         self.mamba_d_state = mamba_d_state
         self.mamba_headdim = mamba_headdim

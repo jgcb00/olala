@@ -2209,6 +2209,56 @@ class DragonMLP(nn.Module):
         hidden_states = self.fc_2(hidden_states)
         return hidden_states
 
+class DragonFANMLP(nn.Module):
+    """
+    FAN-style MLP. Splits the intermediate dimension into:
+      - periodic_dim: processed with cos/sin (2x because cos+sin)
+      - standard_dim: processed with relu²
+    
+    periodic_ratio controls the split (default 0.2 = 20% periodic, 80% standard).
+    
+    Parameter count is similar to original DragonMLP when periodic_ratio=0.5
+    because cos/sin don't need separate weights for real/imaginary parts -
+    they share W_p and just apply cos and sin respectively.
+    """
+ 
+    def __init__(self, config, intermediate_size: Optional[int] = None, periodic_ratio: float = 0.2):
+        super().__init__()
+        self.config = config
+        intermediate_size = intermediate_size or config.intermediate_size
+ 
+        # Split: periodic part uses half the intermediate dims (but produces 2x via cos+sin)
+        # Standard part uses the other half
+        self.periodic_dim = int(intermediate_size * periodic_ratio) // 2  # W_p output dim
+        self.standard_dim = intermediate_size - (self.periodic_dim * 2)   # relu² part
+ 
+        # Periodic branch: x → W_p·x → [cos(...), sin(...)]  (periodic_dim → 2*periodic_dim)
+        self.fc_periodic = nn.Linear(config.hidden_size, self.periodic_dim, bias=False)
+ 
+        # Standard branch: x → W_s·x → relu²(...)
+        if self.standard_dim > 0:
+            self.fc_standard = nn.Linear(config.hidden_size, self.standard_dim, bias=False)
+ 
+        # Down projection: [cos ‖ sin ‖ relu²] → hidden_size
+        total_intermediate = self.periodic_dim * 2 + self.standard_dim
+        self.fc_down = nn.Linear(total_intermediate, config.hidden_size, bias=False)
+ 
+    def forward(self, hidden_states):
+        # Periodic branch
+        p = self.fc_periodic(hidden_states)
+        periodic_out = torch.cat([torch.cos(p), torch.sin(p)], dim=-1)
+ 
+        # Standard branch
+        if self.standard_dim > 0:
+            s = self.fc_standard(hidden_states)
+            standard_out = F.relu(s).square()
+            combined = torch.cat([periodic_out, standard_out], dim=-1)
+        else:
+            combined = periodic_out
+ 
+        # Down projection
+        return self.fc_down(combined)
+
 class DragonMoE(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int):
         super().__init__()
@@ -2413,6 +2463,8 @@ class DragonMonoBlock(GradientCheckpointingLayer):
                 self.mlp = DragonMLP(config)
             elif config.mlp_type == "gated":
                 self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
+            elif config.mlp_type == "fan":
+                self.mlp = DragonFANMLP(config, periodic_ratio=config.fan_periodic_ratio)
         elif mlp_type == 'm':
             self.mlp = DragonMoE(config, layer_idx=layer_idx)
         else:
@@ -2546,6 +2598,8 @@ class DragonCausalLMOutput(ModelOutput):
     """
 
     loss: Optional[torch.FloatTensor] = None
+    geo_loss: Optional[torch.FloatTensor] = None
+    ce_loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[HybridDragonDynamicCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
@@ -2632,6 +2686,9 @@ class DragonModel(DragonPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
 
+        if self.config.normalize_embeddings:
+            inputs_embeds = F.normalize(inputs_embeds, dim=-1) * math.sqrt(self.config.hidden_size)
+
         if self.config.patch_level_training:
             # (B, KL, D) => (B, L, D) OR (B, L, D) ==> (B, L//K, D)
             inputs_embeds = inputs_embeds.reshape(B, L//self.config.patch_level_training_size, self.config.patch_level_training_size, inputs_embeds.size(2)).mean(dim=2)
@@ -2717,6 +2774,8 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         self.model = DragonModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False)
+        if config.normalize_lm_head:
+            self.temperature = nn.Parameter(torch.tensor(math.log(math.sqrt(config.hidden_size))))
         self.post_init()
         if config.tie_lm_head:
             self.lm_head.weight = self.model.embedding.weight
@@ -2761,12 +2820,25 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
 
         logits = None
         loss = None
+        geo_loss = None
+        ce_loss = None
+        cosine_sims = None
         if labels is not None:
-            # move labels to correct device
             labels = labels.to(hidden_states.device)
 
-            if linear_cross_entropy is None or not self.config.fused_loss_computation:
+            # --- Step 1: compute logits (3 paths) ---
+            if self.config.normalize_lm_head:
+                h = hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]
+                w_norm = F.normalize(self.lm_head.weight, dim=-1)
+                x_norm = F.normalize(h, dim=-1)
+                cosine_sims = x_norm @ w_norm.T  # (B, T, V)
+                #print(f"temperature: {self.temperature.exp().item():.4f}, log_temp: {self.temperature.item():.4f}")
+                logits = (self.temperature.clamp(min=-2.0, max=5.0).exp() * cosine_sims).float()
+            elif linear_cross_entropy is None or not self.config.fused_loss_computation:
                 logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
+
+            # --- Step 2: CE loss ---
+            if logits is not None:
                 if not self.config.patch_level_training:
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
@@ -2788,11 +2860,37 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
                     impl="cce_exact",
                     shift=1,
                 )
+
+            # --- Step 3: geodesic loss ---
+            if self.config.geo_loss_coeff > 0:
+                shift_targets = labels[..., 1:].contiguous()
+                mask = shift_targets != self.model.padding_idx
+                if cosine_sims is not None:
+                    # reuse cosine similarities from normalized path (no temperature)
+                    flat_cos = cosine_sims[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
+                    idx = torch.arange(shift_targets.numel(), device=shift_targets.device)
+                    cos_sim_target = flat_cos[idx, shift_targets.view(-1)].view_as(shift_targets)
+                else:
+                    shift_hidden = hidden_states[:, :-1, :].contiguous()
+                    target_embeds = self.model.embedding.weight[shift_targets]
+                    dot = (shift_hidden * target_embeds).sum(dim=-1)
+                    cos_sim_target = dot / (shift_hidden.norm(dim=-1).clamp(min=1e-8) * target_embeds.norm(dim=-1).clamp(min=1e-8))
+                geo_loss = (1 - cos_sim_target).masked_fill(~mask, 0.0).sum() / mask.sum().clamp(min=1)
+                ce_loss = loss.detach()
+                loss = loss + self.config.geo_loss_coeff * geo_loss
         else:
-            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
+            if self.config.normalize_lm_head:
+                h = hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]
+                w_norm = F.normalize(self.lm_head.weight, dim=-1)
+                x_norm = F.normalize(h, dim=-1)
+                logits = (self.temperature.exp() * (x_norm @ w_norm.T)).float()
+            else:
+                logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
 
         return DragonCausalLMOutput(
             loss=loss,
+            geo_loss=geo_loss,
+            ce_loss=ce_loss,
             logits=logits if not just_loss else None,
             past_key_values=outputs.past_key_values if not just_loss else None,
             hidden_states=outputs.hidden_states if not just_loss else None,
