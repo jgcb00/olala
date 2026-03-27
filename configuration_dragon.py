@@ -92,6 +92,9 @@ class DragonConfig(PretrainedConfig):
 
     def __init__(
         self,
+        xsa: bool = False,
+        normalize_embeddings_ngpt: bool = False,
+        logits_scaling_ngpt: bool = False,
         cosnet_rank: int = 64,
         cosnet: bool = False,
         geodesic_update: bool = False,
@@ -179,6 +182,9 @@ class DragonConfig(PretrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
+        self.xsa = xsa
+        self.normalize_embeddings_ngpt = normalize_embeddings_ngpt
+        self.logits_scaling_ngpt = logits_scaling_ngpt
         self.cosnet_rank = cosnet_rank
         self.cosnet = cosnet
         self.geodesic_update=geodesic_update

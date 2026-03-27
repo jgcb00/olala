@@ -100,6 +100,9 @@ class NanoArgs:
     cosnet_rank: int = 64
     prores: bool = False
     prores_warmup_iters: int = 1000
+    logits_scaling_ngpt: bool = False
+    normalize_embeddings_ngpt: bool = False
+    xsa: bool = False
 
     # MoE
     moe: bool = False
@@ -234,7 +237,7 @@ class NanoArgs:
     coord_check_steps: str = "1,2,5,10"
 
     start_from_dir: Optional[str] = None
-    load_arg_from_config: bool = True
+    load_arg_from_config: bool = False
     load_optim: bool = True
     load_sched: bool = True
     compile: bool = True
@@ -906,6 +909,7 @@ if args.resume_from:
             print(f"Auto-selected latest checkpoint dir: {resume_dir}")
     else:
         raise ValueError(f"resume_from must be a directory (got {cand})")
+    resume_dir = os.path.normpath(resume_dir) if resume_dir is not None else None
 
 if master_process:
     if resume_dir is not None:
@@ -996,6 +1000,9 @@ print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} 
 
 # load model.
 config_hf = DragonConfig(
+    xsa=args.xsa,
+    normalize_embeddings_ngpt=args.normalize_embeddings_ngpt,
+    logits_scaling_ngpt=args.logits_scaling_ngpt,
     cosnet=args.cosnet,
     cosnet_rank=args.cosnet_rank,
     geodesic_update=args.geodesic_update,
@@ -1124,7 +1131,7 @@ if resume_dir is None:
         ).cuda()
         config_hf = model.config
 else:
-    model = DragonForCausalLM.from_pretrained(resume_dir, config=config_hf, torch_dtype=torch.bfloat16)
+    model = DragonForCausalLM.from_pretrained(resume_dir, config=config_hf)
     model = model.cuda()
 print0(model)
 
@@ -1509,6 +1516,7 @@ else:
 # resume if necessary.
 start_iter = 0
 training_time_ms = 0
+train_state = None
 if resume_dir is not None:  
     train_state = torch.load(os.path.join(resume_dir, "train_state.pt"), map_location="cpu")
     if args.load_optim:
@@ -1517,10 +1525,8 @@ if resume_dir is not None:
     if args.load_sched:
         for sch, s in zip(schedulers, train_state.get("schedulers", [])):
             sch.load_state_dict(s)
-    torch.set_rng_state(train_state["rng_cpu"])
-    torch.cuda.set_rng_state_all(train_state["rng_cuda"])
     training_time_ms = train_state.get("training_time_ms", 0)
-    start_iter = train_state.get("iteration", 0) + 1
+    start_iter = train_state.get("iteration", 0)
 
 # setup recorder if necessary.
 record_steps = _parse_int_list(args.coord_check_steps) if args.coord_check_steps else None
@@ -1548,12 +1554,16 @@ t0 = time.perf_counter()
 WARMUP_SKIP = 10
 
 # begin training.
-train_loader.reset()
+if train_state is None:
+    train_loader.reset()
+else:
+    train_loader.reset(shard=train_state.get("data_shard", 0))
+    train_loader.current_position = train_state.get("data_position", 0) + ddp_rank * B * T
 x, y, cu, maxlen, position_ids = train_loader.next_batch()
 
-for iter_ in range(start_iter, start_iter+args.total_iterations+1):
-    last_iter = (iter_ == start_iter+args.total_iterations)
-    if iter_ == start_iter+WARMUP_SKIP:
+for iter_ in range(start_iter, args.total_iterations+1):
+    last_iter = (iter_ == args.total_iterations)
+    if iter_ == start_iter+WARMUP_SKIP and start_iter == 0:
         training_time_ms = 0
         t0 = time.perf_counter()
         torch.cuda.reset_peak_memory_stats()
@@ -1665,11 +1675,10 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
         os.makedirs(save_dir, exist_ok=True)
         # save model & tokenizer to make evaluation easier.
         tokenizer.save_pretrained(save_dir)
-        state_dict_bf16 = {k: v.detach().to(torch.bfloat16).cpu() for k, v in uncompiled_model.state_dict().items()}
         idm_og = uncompiled_model.config.intra_doc_masking
         uncompiled_model.config.intra_doc_masking = False
         uncompiled_model.config.torch_dtype = torch.bfloat16
-        uncompiled_model.save_pretrained(save_dir, safe_serialization=True, state_dict=state_dict_bf16)
+        uncompiled_model.save_pretrained(save_dir, safe_serialization=True)
         uncompiled_model.config.intra_doc_masking = idm_og
         # save training state.
         train_state = dict(
@@ -1678,11 +1687,11 @@ for iter_ in range(start_iter, start_iter+args.total_iterations+1):
             optimizers=[opt.state_dict() for opt in optimizers],
             schedulers=[sched.state_dict() for sched in schedulers],
             training_time_ms=training_time_ms,
-            rng_cpu=torch.get_rng_state(),
-            rng_cuda=torch.cuda.get_rng_state_all(),
+            data_shard=train_loader.current_shard,
+            data_position=train_loader.current_position - B * T * ddp_world_size,
         )
         torch.save(train_state, os.path.join(save_dir, "train_state.pt"))
-        del state_dict_bf16
+        #del state_dict_bf16
         gc.collect()
         # start the clock again.
         torch.cuda.synchronize()

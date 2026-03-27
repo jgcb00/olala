@@ -1294,8 +1294,8 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
 
         # num_heads = num_signal_heads + num_noise_heads
         # num_kv_heads = num_signal_heads // (snr * gqa)
-        # where snr = num_signal_heads // num_noise_heads
-        #       gqa = num_heads // num_kv_heads
+        # where snr = num_signal_heads // num_noise_heads (typically 3)
+        #       gqa = num_heads // num_kv_heads (typically 1)
         # identity : snr+1 = num_heads/num_noise_heads
 
         # query_states: (B, L, num_heads, D)
@@ -1311,6 +1311,11 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             softcap=self.config.softcap_attn,
             softmax_scale=None if not self.config.use_completed_p else 1/self.head_dim,
         ) # (B, L, H, D)
+        if self.config.xsa:
+            v_self = value_states.repeat_interleave(self.num_attention_heads // value_states.size(2), dim=2)
+            v_self = F.normalize(v_self.float(), dim=-1, eps=1e-6).to(attn_output.dtype)
+            attn_output = attn_output - (attn_output * v_self).sum(dim=-1, keepdim=True) * v_self
+
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.head_dim) # (B, L, num_noise_heads, snr+1, D)
         attn_sig = attn_output[:, :, :, :self.snr, :] # (B, L, num_noise_heads, snr, D)
         attn_noi = attn_output[:, :, :, self.snr:self.snr+1, :] # (B, L, num_noise_heads, 1, D)
@@ -1813,7 +1818,7 @@ class DragonMamba2(nn.Module):
             y = rearrange(y, "b l (h p) -> b l h p", h=self.nheads)
 
         return y, None, None
-    
+
 class DragonMamba3MimoFast(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int, use_ve: bool = False):
         super().__init__()
@@ -2000,12 +2005,6 @@ class DragonMamba3MimoFast(nn.Module):
 
         B = self.B_norm(B)
         C = self.C_norm(C)
-        B = rearrange(B, "b l r G n -> b l r G n").contiguous()
-        C = rearrange(C, "b l r G n -> b l r G n").contiguous()
-        a, b, c, d, e = C.size()
-        C = C.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
-        a, b, c, d, e = B.size()
-        B = B.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
 
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
         angle = angle_dt(angle, dt)
@@ -2689,6 +2688,9 @@ class DragonModel(DragonPreTrainedModel):
         if self.config.normalize_embeddings:
             inputs_embeds = F.normalize(inputs_embeds, dim=-1) * math.sqrt(self.config.hidden_size)
 
+        if self.config.normalize_embeddings_ngpt:
+            inputs_embeds = F.normalize(inputs_embeds, dim=-1)
+
         if self.config.patch_level_training:
             # (B, KL, D) => (B, L, D) OR (B, L, D) ==> (B, L//K, D)
             inputs_embeds = inputs_embeds.reshape(B, L//self.config.patch_level_training_size, self.config.patch_level_training_size, inputs_embeds.size(2)).mean(dim=2)
@@ -2776,6 +2778,8 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False)
         if config.normalize_lm_head:
             self.temperature = nn.Parameter(torch.tensor(math.log(math.sqrt(config.hidden_size))))
+        if config.logits_scaling_ngpt:
+            self.temperature_ngpt = nn.Parameter(torch.ones(config.vocab_size))
         self.post_init()
         if config.tie_lm_head:
             self.lm_head.weight = self.model.embedding.weight
@@ -2836,6 +2840,8 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
                 logits = (self.temperature.clamp(min=-2.0, max=5.0).exp() * cosine_sims).float()
             elif linear_cross_entropy is None or not self.config.fused_loss_computation:
                 logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
+                if self.config.logits_scaling_ngpt:
+                    logits = logits * self.temperature_ngpt
 
             # --- Step 2: CE loss ---
             if logits is not None:
