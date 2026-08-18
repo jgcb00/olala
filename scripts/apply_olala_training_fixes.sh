@@ -373,6 +373,45 @@ def fix_ckpt_modeling(text):
             + sl_anchor, 1)
     return "apply", text
 
+# ---------------------------------------------------------------- fix 5b
+# verl colocate weight-sync ZMQ socket: hardcoded shared /tmp + a Ray job id
+# that restarts at 01000000 every fresh cluster means a stale socket left by
+# ANOTHER user (sticky /tmp, not removable) permanently blocks new runs with
+# "ZMQError: Address already in use". Use the per-user temp dir (TMPDIR)
+# on BOTH the sender and receiver sides (they must agree).
+def _fix_zmq_tmpdir(text, old_line, new_lines):
+    if "rl-colocate-zmq" not in text:
+        return "SKIP", None
+    if "_tempfile.gettempdir()" in text:
+        return "ALREADY", None
+    if old_line not in text:
+        return "FAIL: zmq handle line not found", None
+    return "apply", text.replace(old_line, new_lines, 1)
+
+def fix_zmq_sender(text):
+    return _fix_zmq_tmpdir(
+        text,
+        '        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"',
+        "        import tempfile as _tempfile\n"
+        "        # OLALA fix: per-user temp dir (TMPDIR); see applier notes.\n"
+        '        self.zmq_handle = (\n'
+        '            f"ipc://{_tempfile.gettempdir()}/rl-colocate-zmq-{job_id}"\n'
+        '            f"-replica-{self.replica_rank}-rank-{local_rank}.sock"\n'
+        "        )",
+    )
+
+def fix_zmq_receiver(text):
+    return _fix_zmq_tmpdir(
+        text,
+        '        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"',
+        "        import tempfile as _tempfile\n"
+        "        # OLALA fix: per-user temp dir (TMPDIR); must match sender side.\n"
+        '        return (\n'
+        '            f"ipc://{_tempfile.gettempdir()}/rl-colocate-zmq-{job_id}"\n'
+        '            f"-replica-{replica_rank}-rank-{trainer_rank}.sock"\n'
+        "        )",
+    )
+
 # ---------------------------------------------------------------- fix 6
 def fix_transfer_queue(text):
     if "dropping malformed" in text:
@@ -416,6 +455,11 @@ patch("checkpoint modeling varlen + fallback",
       ckpt and Path(ckpt) / "modeling_dragon.py", fix_ckpt_modeling)
 patch("verl transfer_queue hardening",
       tq_dir and tq_dir / "storage/simple_storage.py", fix_transfer_queue)
+verl_dir = pkg_dir("verl")
+patch("verl zmq socket per-user tmpdir (sender)",
+      verl_dir and verl_dir / "workers/rollout/vllm_rollout/vllm_rollout.py", fix_zmq_sender)
+patch("verl zmq socket per-user tmpdir (receiver)",
+      verl_dir and verl_dir / "workers/rollout/vllm_rollout/utils.py", fix_zmq_receiver)
 
 width = max(len(n) for n, _, _ in results)
 fail = False
