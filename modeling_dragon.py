@@ -2051,20 +2051,42 @@ class DragonMamba3MimoFast(nn.Module):
                     device=hidden_states.device, dtype=torch.int32
                 )
 
-        # Dense-path ragged-length support: the dense mamba3 BACKWARD requires
-        # L % chunk_size == 0 (the forward tolerates ragged L), so padded
-        # (B, L) training batches with arbitrary max length die in
-        # loss.backward(). Pad each row up to the next chunk multiple and
-        # slice the output back: pads sit at the END of every row, the scan
-        # is causal so they cannot influence real positions, and the no-cache
-        # path never reads final states. No-op when L already divides.
         _mamba3_len = q_len
         _mamba3_pad = 0
+        _mamba3_flat_batch = 0
         if (
+            cache_params is None
+            and _mamba3_cu_seqlens is None
+            and angle_dt is None
+            and not (self.config.complete_slw and self.config.slw_wsize > 128)
+        ):
+            # Dense -> varlen flatten. The dense TileLang kernels are
+            # compiled per sequence length (no T.dynamic), so variable-length
+            # training batches trigger a fresh multi-second JIT compile for
+            # every new L — and the dense BACKWARD additionally requires
+            # L % chunk_size == 0. The varlen kernels declare S/NS as
+            # T.dynamic: one compilation serves every shape, forward and
+            # backward, with no divisibility constraint. Flatten (B, L) into
+            # a packed (1, B*L) batch whose row boundaries are cu_seqlens —
+            # numerically identical, each row stays an independent
+            # zero-start sequence. Measured on verl 1-GPU fsdp2 training:
+            # update_actor 842s -> 147s (step 1), 1300s -> 112s (step 2).
+            _mamba3_flat_batch = batch
+            _mamba3_cu_seqlens = torch.arange(
+                0, (batch + 1) * q_len, q_len,
+                device=hidden_states.device, dtype=torch.int32,
+            )
+            if batch > 1:
+                hidden_states = hidden_states.reshape(1, batch * q_len, -1)
+                batch, q_len, _ = hidden_states.shape
+        elif (
             cache_params is None
             and _mamba3_cu_seqlens is None
             and q_len % self.chunk_size != 0
         ):
+            # Private-kernel (angle_dt) fallback: it has no cu_seqlens
+            # support, so pad rows to the next chunk multiple instead (the
+            # dense backward requires it) and slice the output back below.
             _mamba3_pad = self.chunk_size - (q_len % self.chunk_size)
             hidden_states = F.pad(hidden_states, (0, 0, 0, _mamba3_pad))
             batch, q_len, _ = hidden_states.shape
@@ -2175,6 +2197,13 @@ class DragonMamba3MimoFast(nn.Module):
             cache_params.mamba3_k_states[layer_idx]     = k_state_out
             cache_params.mamba3_v_states[layer_idx]     = v_state_out
             cache_params.past_length[layer_idx]         += q_len
+
+        if _mamba3_flat_batch > 1:
+            # Undo the dense -> varlen flatten: (1, B*L, H, P) -> (B, L, H, P).
+            y = y.view(_mamba3_flat_batch, _mamba3_len, *y.shape[2:])
+        elif _mamba3_pad:
+            # Drop the chunk-alignment padding added above.
+            y = y[:, :_mamba3_len]
 
         y = rearrange(y, "b l h p -> b l (h p)")
         if self.config.mamba3_postgate_norm:

@@ -254,7 +254,7 @@ CU_SEQLENS = '''\
 
 def fix_ckpt_modeling(text):
     if all(m in text for m in (
-        "_mamba3_cu_seqlens", "angle_dt is not None", "_mamba3_pad",
+        "_mamba3_cu_seqlens", "angle_dt is not None", "_mamba3_flat_batch",
         "Phase-stable compute dtype", "return output.to(x.dtype)",
     )):
         return "ALREADY", None
@@ -327,42 +327,50 @@ def fix_ckpt_modeling(text):
             text = text.replace(a2, pin + a2, 1)
         else:
             return "FAIL: block forward start not found for dtype pin", None
-    # (g) dense-path chunk padding (dense backward needs L % chunk_size == 0)
-    if "_mamba3_pad" not in text:
+    # (g) dense -> varlen flatten. The dense TileLang kernels are compiled
+    # per sequence length (no T.dynamic) and their backward requires
+    # L % chunk_size == 0; the varlen kernels declare S/NS dynamic (one
+    # compile serves every shape, fwd+bwd, no divisibility constraint).
+    # Flatten (B, L) into a packed (1, B*L) batch with row boundaries as
+    # cu_seqlens — numerically identical, each row an independent zero-start
+    # sequence. Measured: update_actor 842s -> 147s / 1300s -> 112s.
+    # Coexists with any earlier pad-only fix (which becomes a dead branch on
+    # the public-kernel path and keeps covering the private-kernel path).
+    if "_mamba3_flat_batch" not in text:
         anchor = ("                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
                   "                    device=hidden_states.device, dtype=torch.int32\n"
-                  "                )\n\n"
-                  "        if use_precomputed_states:")
+                  "                )\n")
         if anchor not in text:
-            return "FAIL: padding insertion anchor not found", None
-        pad_block = (
-            "                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
-            "                    device=hidden_states.device, dtype=torch.int32\n"
-            "                )\n\n"
-            "        # OLALA fix: the dense mamba3 BACKWARD requires L % chunk_size\n"
-            "        # == 0 (forward tolerates ragged L). Pad rows to the next chunk\n"
-            "        # multiple and slice the output back; pads sit at the END of\n"
-            "        # each row and the scan is causal. No-op when L divides.\n"
-            "        _mamba3_len = q_len\n"
-            "        _mamba3_pad = 0\n"
+            return "FAIL: flatten insertion anchor not found", None
+        flat_block = (
+            "\n"
+            "        # OLALA fix: dense -> varlen flatten (see applier notes).\n"
+            "        _mamba3_flat_batch = 0\n"
+            "        _mamba3_flat_len = q_len\n"
             "        if (\n"
             "            cache_params is None\n"
             "            and _mamba3_cu_seqlens is None\n"
-            "            and q_len % self.chunk_size != 0\n"
+            "            and angle_dt is None\n"
+            "            and not (self.config.complete_slw and self.config.slw_wsize > 128)\n"
             "        ):\n"
-            "            _mamba3_pad = self.chunk_size - (q_len % self.chunk_size)\n"
-            "            hidden_states = F.pad(hidden_states, (0, 0, 0, _mamba3_pad))\n"
-            "            batch, q_len, _ = hidden_states.shape\n\n"
-            "        if use_precomputed_states:")
-        text = text.replace(anchor, pad_block, 1)
+            "            _mamba3_flat_batch = batch\n"
+            "            _mamba3_cu_seqlens = torch.arange(\n"
+            "                0, (batch + 1) * q_len, q_len,\n"
+            "                device=hidden_states.device, dtype=torch.int32,\n"
+            "            )\n"
+            "            if batch > 1:\n"
+            "                hidden_states = hidden_states.reshape(1, batch * q_len, -1)\n"
+            "                batch, q_len, _ = hidden_states.shape\n")
+        text = text.replace(anchor, anchor + flat_block, 1)
         sl_anchor = ('        y = rearrange(y, "b l h p -> b l (h p)")\n'
                      "        if self.config.mamba3_postgate_norm:")
         if sl_anchor not in text:
-            return "FAIL: output slice anchor not found", None
+            return "FAIL: unflatten anchor not found", None
         text = text.replace(sl_anchor,
-            "        if _mamba3_pad:\n"
-            "            # Drop the chunk-alignment padding added above.\n"
-            "            y = y[:, :_mamba3_len]\n\n" + sl_anchor, 1)
+            "        if _mamba3_flat_batch > 1:\n"
+            "            # Undo the dense -> varlen flatten.\n"
+            "            y = y.view(_mamba3_flat_batch, _mamba3_flat_len, *y.shape[2:])\n\n"
+            + sl_anchor, 1)
     return "apply", text
 
 # ---------------------------------------------------------------- fix 6
