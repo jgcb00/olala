@@ -2051,6 +2051,24 @@ class DragonMamba3MimoFast(nn.Module):
                     device=hidden_states.device, dtype=torch.int32
                 )
 
+        # Dense-path ragged-length support: the dense mamba3 BACKWARD requires
+        # L % chunk_size == 0 (the forward tolerates ragged L), so padded
+        # (B, L) training batches with arbitrary max length die in
+        # loss.backward(). Pad each row up to the next chunk multiple and
+        # slice the output back: pads sit at the END of every row, the scan
+        # is causal so they cannot influence real positions, and the no-cache
+        # path never reads final states. No-op when L already divides.
+        _mamba3_len = q_len
+        _mamba3_pad = 0
+        if (
+            cache_params is None
+            and _mamba3_cu_seqlens is None
+            and q_len % self.chunk_size != 0
+        ):
+            _mamba3_pad = self.chunk_size - (q_len % self.chunk_size)
+            hidden_states = F.pad(hidden_states, (0, 0, 0, _mamba3_pad))
+            batch, q_len, _ = hidden_states.shape
+
         if use_precomputed_states:
             state = (
                 cache_params.mamba3_angle_states[layer_idx],
@@ -2492,7 +2510,11 @@ class DragonGeodesicNorm(nn.Module):
         theta = torch.clamp(safe_tangent_norm / safe_R, max=self.clamp)
         theta = torch.clamp((theta * self.scale + self.bias) / (self.layer_idx + 1), max=self.clamp)
         output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
-        return output
+        # Dtype-stability: `theta * self.scale + self.bias` promotes theta —
+        # and through cos/sin the OUTPUT — to the params' dtype, which can
+        # differ from the residual dtype under mixed precision. Pin the
+        # output to the residual dtype; no-op when dtypes already agree.
+        return output.to(x.dtype)
 
 class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
@@ -2653,6 +2675,22 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         ve=None,
         **kwargs,
     ):
+        # Phase-stable compute dtype under FSDP2 mixed precision + HF
+        # gradient checkpointing. FSDP2's cast_forward_inputs runs inside
+        # this (checkpointed) __call__ during the original forward, casting
+        # the incoming fp32 residual to bf16 — but the checkpoint saves the
+        # PRE-CAST input and the hook does not re-run at the same point in
+        # the recompute, so every derived activation flips dtype and trips
+        # torch.utils.checkpoint's check_recomputed_tensors_match. Re-apply
+        # the autocast dtype explicitly: autocast state is replayed during
+        # recompute, so this is identical in both phases and a no-op when
+        # the input is already cast.
+        if (
+            torch.is_autocast_enabled()
+            and hidden_states.is_floating_point()
+            and hidden_states.dtype != torch.get_autocast_dtype("cuda")
+        ):
+            hidden_states = hidden_states.to(torch.get_autocast_dtype("cuda"))
         # Skip-mixer support: if this layer is in config.skip_mixer_layers,
         # the mixer phase is bypassed entirely — residual passes through and
         # no KV is produced (downstream layers receive None from this slot).

@@ -146,30 +146,65 @@ def fix_saved_tensors(text):
 
 # ---------------------------------------------------------------- fix 4
 SCATTER_CAST = '''\
-                gates=None, grouped_in=False, grouped_out=False):
         # OLALA fix: the triton kernels require activations, gates and expert
-        # weights to share a dtype. Under FSDP mixed precision (fp32 master
-        # weights, bf16 compute) the surrounding model can feed fp32
-        # activations into bf16 compute params. No-op when dtypes match.
-        w_dtype = self.weight.dtype
-        if inputs.dtype != w_dtype:
-            inputs = inputs.to(w_dtype)
-        if gates is not None and gates.dtype != w_dtype:
-            gates = gates.to(w_dtype)
+        # weights to share a dtype: the compute dtype follows the ACTIVATIONS.
+        # Keying it on self.weight.dtype instead is not phase-stable under
+        # FSDP mixed precision: the weight's visible dtype can differ between
+        # the original forward (bf16 unsharded views) and gradient-checkpoint
+        # recompute (fp32 master params), flipping downstream activation
+        # dtypes and tripping check_recomputed_tensors_match. Input dtype is
+        # set upstream and identical in both phases. No-op when dtypes agree.
+        weight = self.weight
+        if weight.dtype != inputs.dtype:
+            weight = weight.to(inputs.dtype)
+        if gates is not None and gates.dtype != inputs.dtype:
+            gates = gates.to(inputs.dtype)
+
 '''
 
 def fix_scattermoe(text):
-    if "w_dtype = self.weight.dtype" in text:
+    if "compute dtype follows the ACTIVATIONS" in text:
         return "ALREADY", None
-    anchor = ("    def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,\n"
-              "                expert_offsets,\n"
-              "                gates=None, grouped_in=False, grouped_out=False):\n")
-    if anchor not in text:
+    # Handles three states: pristine upstream, or either variant of the
+    # earlier weight-dtype cast (migrated by replacing everything between the
+    # forward signature and the parallel_linear call).
+    sig = ("    def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,\n"
+           "                expert_offsets,\n"
+           "                gates=None, grouped_in=False, grouped_out=False):\n")
+    call_old = "            inputs, self.weight.permute(0, 2, 1), k,"
+    call_new = "            inputs, weight.permute(0, 2, 1), k,"
+    if sig not in text:
         return "FAIL: ParallelExperts.forward signature not found", None
-    return "apply", text.replace(
-        anchor,
-        anchor.replace("                gates=None, grouped_in=False, grouped_out=False):\n",
-                       SCATTER_CAST), 1)
+    sig_end = text.index(sig) + len(sig)
+    call_anchor = "        results = parallel_linear("
+    call_idx = text.find(call_anchor, sig_end)
+    if call_idx < 0:
+        return "FAIL: parallel_linear call not found after signature", None
+    text = text[:sig_end] + SCATTER_CAST + text[call_idx:]
+    if call_old in text:
+        text = text.replace(call_old, call_new, 1)
+    elif call_new not in text:
+        return "FAIL: parallel_linear argument line not recognized", None
+    return "apply", text
+
+SCATTER_BWD_CAST = '''\
+             gates, output_expanded) = ctx.saved_tensors
+            # OLALA fix: the incoming gradient can arrive in a promoted dtype
+            # (e.g. fp32 leaking back from a mixed-precision shared-expert /
+            # gating path) while the saved forward tensors are bf16; the
+            # kernels and matmuls below need uniform dtypes. No-op when they
+            # already agree.
+            if grad_out.dtype != x.dtype:
+                grad_out = grad_out.to(x.dtype)
+'''
+
+def fix_scattermoe_bwd(text):
+    if "incoming gradient can arrive in a promoted dtype" in text:
+        return "ALREADY", None
+    anchor = "             gates, output_expanded) = ctx.saved_tensors\n"
+    if anchor not in text:
+        return "FAIL: backward saved_tensors unpack not found", None
+    return "apply", text.replace(anchor, SCATTER_BWD_CAST, 1)
 
 # ---------------------------------------------------------------- fix 5
 FALLBACK = '''\
@@ -218,7 +253,10 @@ CU_SEQLENS = '''\
                     device=hidden_states.device, dtype=torch.int32)'''
 
 def fix_ckpt_modeling(text):
-    if "_mamba3_cu_seqlens" in text and "angle_dt is not None" in text:
+    if all(m in text for m in (
+        "_mamba3_cu_seqlens", "angle_dt is not None", "_mamba3_pad",
+        "Phase-stable compute dtype", "return output.to(x.dtype)",
+    )):
         return "ALREADY", None
     # (a) public-kernel fallback, only if absent
     plain = 'except ImportError:\n    print("dragon_mamba3_fast_step not found")'
@@ -252,6 +290,79 @@ def fix_ckpt_modeling(text):
             '            **({"cu_seqlens": _mamba3_cu_seqlens}\n'
             "               if _mamba3_cu_seqlens is not None else {}),\n"
             "        )", 1)
+    # (e) geodesic norm: pin output dtype to the residual dtype
+    if "return output.to(x.dtype)" not in text:
+        anchor = ("        output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)\n"
+                  "        return output")
+        if anchor not in text:
+            return "FAIL: geodesic output/return not found", None
+        text = text.replace(anchor, anchor.replace(
+            "        return output",
+            "        # OLALA fix: theta inherits the scale/bias params' dtype via\n"
+            "        # promotion and can differ from the residual dtype under mixed\n"
+            "        # precision; pin the output. No-op when dtypes agree.\n"
+            "        return output.to(x.dtype)"), 1)
+    # (f) block-entry autocast dtype pin (fixes FSDP2 cast_forward_inputs vs
+    #     gradient-checkpoint recompute mismatch)
+    if "Phase-stable compute dtype" not in text:
+        pin = (
+            "        # OLALA fix: Phase-stable compute dtype under FSDP2 mixed\n"
+            "        # precision + HF gradient checkpointing. cast_forward_inputs\n"
+            "        # runs inside this (checkpointed) __call__ in the original\n"
+            "        # forward but not at the same point in the recompute, so the\n"
+            "        # block would recompute from the saved PRE-CAST fp32 input and\n"
+            "        # every derived activation dtype would mismatch. Autocast state\n"
+            "        # IS replayed in recompute, so keying on it is stable.\n"
+            "        if (\n"
+            "            torch.is_autocast_enabled()\n"
+            "            and hidden_states.is_floating_point()\n"
+            "            and hidden_states.dtype != torch.get_autocast_dtype(\"cuda\")\n"
+            "        ):\n"
+            "            hidden_states = hidden_states.to(torch.get_autocast_dtype(\"cuda\"))\n")
+        a1 = "        # Skip-mixer support: if this layer is in config.skip_mixer_layers,\n"
+        a2 = "        # MIXER.\n        residual = hidden_states\n"
+        if a1 in text:
+            text = text.replace(a1, pin + a1, 1)
+        elif a2 in text:
+            text = text.replace(a2, pin + a2, 1)
+        else:
+            return "FAIL: block forward start not found for dtype pin", None
+    # (g) dense-path chunk padding (dense backward needs L % chunk_size == 0)
+    if "_mamba3_pad" not in text:
+        anchor = ("                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
+                  "                    device=hidden_states.device, dtype=torch.int32\n"
+                  "                )\n\n"
+                  "        if use_precomputed_states:")
+        if anchor not in text:
+            return "FAIL: padding insertion anchor not found", None
+        pad_block = (
+            "                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
+            "                    device=hidden_states.device, dtype=torch.int32\n"
+            "                )\n\n"
+            "        # OLALA fix: the dense mamba3 BACKWARD requires L % chunk_size\n"
+            "        # == 0 (forward tolerates ragged L). Pad rows to the next chunk\n"
+            "        # multiple and slice the output back; pads sit at the END of\n"
+            "        # each row and the scan is causal. No-op when L divides.\n"
+            "        _mamba3_len = q_len\n"
+            "        _mamba3_pad = 0\n"
+            "        if (\n"
+            "            cache_params is None\n"
+            "            and _mamba3_cu_seqlens is None\n"
+            "            and q_len % self.chunk_size != 0\n"
+            "        ):\n"
+            "            _mamba3_pad = self.chunk_size - (q_len % self.chunk_size)\n"
+            "            hidden_states = F.pad(hidden_states, (0, 0, 0, _mamba3_pad))\n"
+            "            batch, q_len, _ = hidden_states.shape\n\n"
+            "        if use_precomputed_states:")
+        text = text.replace(anchor, pad_block, 1)
+        sl_anchor = ('        y = rearrange(y, "b l h p -> b l (h p)")\n'
+                     "        if self.config.mamba3_postgate_norm:")
+        if sl_anchor not in text:
+            return "FAIL: output slice anchor not found", None
+        text = text.replace(sl_anchor,
+            "        if _mamba3_pad:\n"
+            "            # Drop the chunk-alignment padding added above.\n"
+            "            y = y[:, :_mamba3_len]\n\n" + sl_anchor, 1)
     return "apply", text
 
 # ---------------------------------------------------------------- fix 6
@@ -291,6 +402,8 @@ patch("mamba saved_tensors (siso)",
       mamba and Path(mamba) / "mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py", fix_saved_tensors)
 patch("scattermoe dtype cast",
       scatter and Path(scatter) / "scattermoe/parallel_experts.py", fix_scattermoe)
+patch("scattermoe backward grad cast",
+      scatter and Path(scatter) / "scattermoe/parallel_experts.py", fix_scattermoe_bwd)
 patch("checkpoint modeling varlen + fallback",
       ckpt and Path(ckpt) / "modeling_dragon.py", fix_ckpt_modeling)
 patch("verl transfer_queue hardening",

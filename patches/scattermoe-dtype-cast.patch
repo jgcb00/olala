@@ -1,23 +1,42 @@
 diff --git a/scattermoe/parallel_experts.py b/scattermoe/parallel_experts.py
-index fe67f25..1e06cdc 100644
+index fe67f25..5a42436 100644
 --- a/scattermoe/parallel_experts.py
 +++ b/scattermoe/parallel_experts.py
-@@ -172,6 +172,18 @@ class ParallelExperts(nn.Module):
+@@ -68,6 +68,13 @@ class ParallelLinear(torch.autograd.Function):
+              sorted_scattered_idxs,
+              expert_offsets,
+              gates, output_expanded) = ctx.saved_tensors
++            # OLALA fix: the incoming gradient can arrive in a promoted dtype
++            # (e.g. fp32 leaking back from a mixed-precision shared-expert /
++            # gating path) while the saved forward tensors are bf16; the
++            # kernels and matmuls below need uniform dtypes. No-op when they
++            # already agree.
++            if grad_out.dtype != x.dtype:
++                grad_out = grad_out.to(x.dtype)
+             k = ctx.k
+             grouped_in = ctx.grouped_in
+             grouped_out = ctx.grouped_out
+@@ -172,9 +179,22 @@ class ParallelExperts(nn.Module):
      def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,
                  expert_offsets,
                  gates=None, grouped_in=False, grouped_out=False):
-+        # The triton kernels require activations, gates and expert weights to
-+        # share a dtype. Under FSDP mixed precision (fp32 master weights,
-+        # bf16 compute) the surrounding model can feed fp32 activations into
-+        # bf16 compute params — and the two ParallelExperts of one MLP can
-+        # even see different dtypes depending on how their params were
-+        # wrapped. Cast per-module to this module's own weight dtype; no-op
-+        # when everything already matches.
-+        w_dtype = self.weight.dtype
-+        if inputs.dtype != w_dtype:
-+            inputs = inputs.to(w_dtype)
-+        if gates is not None and gates.dtype != w_dtype:
-+            gates = gates.to(w_dtype)
++        # OLALA fix: the triton kernels require activations, gates and expert
++        # weights to share a dtype: the compute dtype follows the ACTIVATIONS.
++        # Keying it on self.weight.dtype instead is not phase-stable under
++        # FSDP mixed precision: the weight's visible dtype can differ between
++        # the original forward (bf16 unsharded views) and gradient-checkpoint
++        # recompute (fp32 master params), flipping downstream activation
++        # dtypes and tripping check_recomputed_tensors_match. Input dtype is
++        # set upstream and identical in both phases. No-op when dtypes agree.
++        weight = self.weight
++        if weight.dtype != inputs.dtype:
++            weight = weight.to(inputs.dtype)
++        if gates is not None and gates.dtype != inputs.dtype:
++            gates = gates.to(inputs.dtype)
  
          results = parallel_linear(
-             inputs, self.weight.permute(0, 2, 1), k,
+-            inputs, self.weight.permute(0, 2, 1), k,
++            inputs, weight.permute(0, 2, 1), k,
+             sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
+             expert_biases=self.bias,
+             gates=gates, grouped_in=grouped_in, grouped_out=grouped_out
