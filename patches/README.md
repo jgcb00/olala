@@ -14,9 +14,11 @@ bf16 mixed precision over fp32 master weights (verl's default with
 `model_dtype=fp32`), Dragon's modeling code feeds fp32 activations into bf16
 compute params — and the two `ParallelExperts` of one MLP can even see
 different compute dtypes depending on how their params were wrapped. The patch
-makes each `ParallelExperts.forward` cast its `inputs`/`gates` to its own
-`weight.dtype`; a no-op whenever dtypes already match (pure-bf16 inference is
-unaffected).
+makes each `ParallelExperts.forward` cast the weight and gates to the
+ACTIVATION dtype (phase-stable: keying on `self.weight.dtype` instead breaks
+gradient-checkpoint recompute under FSDP mixed precision, where the weight's
+visible dtype can differ between forward and recompute). A no-op whenever
+dtypes already match (pure-bf16 inference is unaffected).
 
 Auto-apply after cloning scattermoe (idempotent — skips if already applied):
 
