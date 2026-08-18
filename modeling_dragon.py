@@ -18,6 +18,21 @@ from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.utils import ModelOutput, logging
 
+# LOAD ORDER MATTERS, keep this above the mamba_ssm import below.
+# mamba_ssm pulls in tilelang, which ships libcudart_stub.so exporting the cudart
+# symbols itself. Any CUDA extension dlopened AFTER it binds its cudart calls to
+# that stub, whose own fallback resolution then fails -> "TileLang Error:
+# libcudart symbols not found globally" + abort() (kills the process at the first
+# flash-attn call, no Python traceback). Loading flash-attn's .so first makes it
+# bind to the real libcudart.
+try:
+    import flash_attn_interface  # noqa: F401  (FA3, imports flash_attn_3._C)
+except ImportError:
+    try:
+        import flash_attn  # noqa: F401  (FA2)
+    except ImportError:
+        pass
+
 try:
     from flash_attn.modules.mlp import GatedMlp
 except ImportError:
@@ -128,6 +143,28 @@ logger.info(f"Using attention implementation: {ATTN_IMPL}")
 logger.info(f"Using Gated DeltaNet implementation: {'fla' if chunk_gated_delta_rule is not None else 'torch'}")
 logger.info(f"Using short convolution implementation: {'causal-conv1d' if causal_conv1d_fn is not None else 'torch'}")
 
+# Parameter-free placeholders used for pruned/skipped MoE blocks.  When
+# config.skip_moe_layers includes a layer's index, DragonMonoBlock installs
+# these so the MLP phase becomes a no-op (residual passes through unchanged).
+# The analogous skip_mixer_layers config skips the *mixer* phase (Mamba/Attn)
+# entirely — the residual passes through unchanged on that phase.
+class _NullMlp(nn.Module):
+    def forward(self, x):
+        return torch.zeros_like(x)
+
+
+class _NullGeodesic(nn.Module):
+    def forward(self, residual, g):
+        return residual
+
+
+class _NullMixer(nn.Module):
+    """Stand-in for a DragonMonoBlock mixer when the layer is in
+    ``config.skip_mixer_layers``. Returns (zeros_like_input, None, None)."""
+    def forward(self, hidden_states, **kwargs):
+        return torch.zeros_like(hidden_states), None, None
+
+
 class DragonHeadWiseRMSNorm(nn.Module):
     def __init__(self, n_heads, d_head, eps=1e-6, zero_centered_gamma=False):
         super().__init__()
@@ -227,12 +264,18 @@ class HybridDragonDynamicCache(DynamicCache):
     def __init__(self, config: DragonConfig):
         super().__init__()
         self.config = config
+        # If layer_idx_map is set (pruned-block variant), blocks may index
+        # into these caches at their ORIGINAL layer_idx, which can exceed
+        # len(layers_config). Size the per-layer lists by the largest
+        # original index + 1 so writes don't go out of bounds.
+        _map = getattr(config, "layer_idx_map", None)
+        cache_n = max(_map) + 1 if _map else len(config.layers_config)
         # attention
         self._key_cache = {}
         self._value_cache = {}
         # attention - kv shift
-        self._kv_shift_last_k = [None for _ in range(len(config.layers_config))] # (B, H_kv, D)
-        self._kv_shift_last_v = [None for _ in range(len(config.layers_config))] # (B, H_kv, D)
+        self._kv_shift_last_k = [None for _ in range(cache_n)] # (B, H_kv, D)
+        self._kv_shift_last_v = [None for _ in range(cache_n)] # (B, H_kv, D)
         # cca
         self.cca_qk0_cache = []
         self.cca_qk1_cache = []
@@ -241,17 +284,26 @@ class HybridDragonDynamicCache(DynamicCache):
         self.conv_caches = []
         self.ssm_caches = []
         # mamba3
-        self.mamba3_hs = [None for _ in range(len(config.layers_config))]
-        self.mamba3_angle_states = [None for _ in range(len(config.layers_config))]
-        self.mamba3_ssm_states = [None for _ in range(len(config.layers_config))]
-        self.mamba3_k_states = [None for _ in range(len(config.layers_config))]
-        self.mamba3_v_states = [None for _ in range(len(config.layers_config))]
+        self.mamba3_hs = [None for _ in range(cache_n)]
+        self.mamba3_angle_states = [None for _ in range(cache_n)]
+        self.mamba3_ssm_states = [None for _ in range(cache_n)]
+        self.mamba3_k_states = [None for _ in range(cache_n)]
+        self.mamba3_v_states = [None for _ in range(cache_n)]
 
-        for idx, layer_type in enumerate(config.layers_config):
+        # Build per-position auxiliary caches keyed by ORIGINAL layer_idx
+        # when a layer_idx_map is present. Otherwise use the position
+        # sequence as before.
+        _origs = _map if _map else list(range(len(config.layers_config)))
+        # we still want the type info from layers_config; map position i ->
+        # layers_config[i] (i is also the new position), but cache lists
+        # below should be addressable up to cache_n.
+        for i, orig in enumerate(_origs):
+            layer_type = config.layers_config[i]
             if not layer_type == "r":
-                self._key_cache[idx] = None
-                self._value_cache[idx] = None
+                self._key_cache[orig] = None
+                self._value_cache[orig] = None
 
+        for _ in range(cache_n):
             self.cca_qk0_cache.append(None)
             self.cca_qk1_cache.append(None)
             self.cca_prev_hidden.append(None)
@@ -260,7 +312,7 @@ class HybridDragonDynamicCache(DynamicCache):
 
         self.window_size = config.sliding_window_size
         self.layers_config = config.layers_config
-        self.past_length = [0 for _ in range(len(config.layers_config))]
+        self.past_length = [0 for _ in range(cache_n)]
 
     def update(
         self,
@@ -2071,9 +2123,11 @@ class DragonMamba3MimoFast(nn.Module):
         dt = rearrange(dt, "b l n -> b n l")
 
         y, kernel_state = mamba3_tilelang(
-            Q=C.contiguous().bfloat16(),
-            K=B.contiguous().bfloat16(),
-            V=x.contiguous().bfloat16(),
+            # No forced .bfloat16(): keep the incoming compute dtype so fp32
+            # (or mixed-precision) training isn't silently downcast here.
+            Q=C.contiguous(),
+            K=B.contiguous(),
+            V=x.contiguous(),
             ADT=ADT.to(torch.float32).contiguous(),
             DT=dt.to(torch.float32).contiguous(),
             Trap=trap.contiguous(),
@@ -2444,6 +2498,16 @@ class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
         super().__init__()
         self.config = config
+        # When blocks have been pruned out (config.layer_idx_map present),
+        # the surviving block at *position* `layer_idx` originally had a
+        # different index. We preserve that original index so that
+        # DragonGeodesicNorm.theta scaling by 1/(layer_idx+1) and any other
+        # layer-index-dependent logic stays consistent with how the model
+        # was trained. Pruning configs (skip_moe_layers, skip_mixer_layers)
+        # are also expressed in ORIGINAL indices.
+        _map = getattr(config, "layer_idx_map", None)
+        if _map is not None and layer_idx < len(_map):
+            layer_idx = int(_map[layer_idx])
         self.layer_idx = layer_idx
 
         if use_ve:
@@ -2528,7 +2592,17 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.geodesic_mixer = DragonGeodesicNorm(config, self.layer_idx)
             self.geodesic_mlp = DragonGeodesicNorm(config, self.layer_idx)
 
-        if not config.moe or mlp_type == 'd':
+        # ---- pruning / skip-MoE support ----
+        # If `config.skip_moe_layers` contains this layer_idx, replace mlp with a
+        # parameter-free no-op and also disable the geodesic_mlp combine so the
+        # block becomes "mixer-only" at this layer. Saved checkpoints with these
+        # layers don't carry MoE params for them at all.
+        skip_moe = getattr(config, "skip_moe_layers", None) or []
+        if layer_idx in skip_moe:
+            self.mlp = _NullMlp()
+            if config.geodesic_update:
+                self.geodesic_mlp = _NullGeodesic()
+        elif not config.moe or mlp_type == 'd':
             if config.mlp_type == "simple":
                 self.mlp = DragonMLP(config)
             elif config.mlp_type == "gated":
@@ -2539,6 +2613,21 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.mlp = DragonMoE(config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Unknown mlp_type: {mlp_type}")
+
+        # Skip-mixer support: if this layer is in config.skip_mixer_layers,
+        # replace the mixer-side submodules with parameter-free placeholders.
+        # The forward also short-circuits the mixer phase via _skip_mixer.
+        skip_mixer = getattr(config, "skip_mixer_layers", None) or []
+        if layer_idx in skip_mixer:
+            self.mixer = _NullMixer()
+            self.mixer_proj = _NullMlp()                # returns zeros_like(input)
+            self.input_norm = nn.Identity()
+            if config.geodesic_update:
+                self.geodesic_mixer = _NullGeodesic()
+            if self.use_gate:
+                self.gate_proj = _NullMlp()
+            if config.mixer_gn:
+                self.mixer_group_norm = nn.Identity()
 
         lns = 1.
         if config.layer_norm_scaling:
@@ -2564,39 +2653,46 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         ve=None,
         **kwargs,
     ):
-        # MIXER.
-        residual = hidden_states
-        x_in = hidden_states
-        hidden_states = self.lns * self.input_norm(x_in) # (B, L, D)
-        y_mixer, last_key_states, last_value_states = self.mixer(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            position_ids=position_ids,
-            cache_params=cache_params,
-            key_value_last_layer=key_value_last_layer,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            ve=ve,
-        ) # (B, L, E*D)
-        if self.config.mixer_gn and not self.config.gate_before_norm:
-            y_mixer = self.mixer_group_norm(y_mixer)
-        if self.use_gate:
-            if self.config.gate_type == "elementwise" or self.config.gate_type == "kimi":
-                g_proj = self.gate_proj(hidden_states).view(hidden_states.size(0), hidden_states.size(1), self.num_attention_heads, self.head_dim).to(y_mixer.dtype)
-            elif self.config.gate_type == "headwise":
-                g_proj = self.gate_proj(hidden_states).unsqueeze(-1).to(y_mixer.dtype)
-            else:
-                raise ValueError(f"Unknown gate_type: {self.config.gate_type}")
-            y_mixer = y_mixer * self.gate_act(g_proj + self.gate_bias)
-        if self.config.mixer_gn and self.config.gate_before_norm:
-            y_mixer = self.mixer_group_norm(y_mixer)
-        y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
-        y_mixer = self.mixer_proj(y_mixer)
-
-        if self.config.geodesic_update:
-            hidden_states = self.geodesic_mixer(residual, y_mixer)
+        # Skip-mixer support: if this layer is in config.skip_mixer_layers,
+        # the mixer phase is bypassed entirely — residual passes through and
+        # no KV is produced (downstream layers receive None from this slot).
+        _skip_mixer = self.layer_idx in (getattr(self.config, "skip_mixer_layers", None) or [])
+        if _skip_mixer:
+            last_key_states, last_value_states = None, None
         else:
-            hidden_states = self.b * residual + self.a * y_mixer
+            # MIXER.
+            residual = hidden_states
+            x_in = hidden_states
+            hidden_states = self.lns * self.input_norm(x_in) # (B, L, D)
+            y_mixer, last_key_states, last_value_states = self.mixer(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                cache_params=cache_params,
+                key_value_last_layer=key_value_last_layer,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                ve=ve,
+            ) # (B, L, E*D)
+            if self.config.mixer_gn and not self.config.gate_before_norm:
+                y_mixer = self.mixer_group_norm(y_mixer)
+            if self.use_gate:
+                if self.config.gate_type == "elementwise" or self.config.gate_type == "kimi":
+                    g_proj = self.gate_proj(hidden_states).view(hidden_states.size(0), hidden_states.size(1), self.num_attention_heads, self.head_dim).to(y_mixer.dtype)
+                elif self.config.gate_type == "headwise":
+                    g_proj = self.gate_proj(hidden_states).unsqueeze(-1).to(y_mixer.dtype)
+                else:
+                    raise ValueError(f"Unknown gate_type: {self.config.gate_type}")
+                y_mixer = y_mixer * self.gate_act(g_proj + self.gate_bias)
+            if self.config.mixer_gn and self.config.gate_before_norm:
+                y_mixer = self.mixer_group_norm(y_mixer)
+            y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
+            y_mixer = self.mixer_proj(y_mixer)
+
+            if self.config.geodesic_update:
+                hidden_states = self.geodesic_mixer(residual, y_mixer)
+            else:
+                hidden_states = self.b * residual + self.a * y_mixer
 
         # MLP.
         residual = hidden_states
