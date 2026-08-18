@@ -146,30 +146,46 @@ def fix_saved_tensors(text):
 
 # ---------------------------------------------------------------- fix 4
 SCATTER_CAST = '''\
-                gates=None, grouped_in=False, grouped_out=False):
         # OLALA fix: the triton kernels require activations, gates and expert
-        # weights to share a dtype. Under FSDP mixed precision (fp32 master
-        # weights, bf16 compute) the surrounding model can feed fp32
-        # activations into bf16 compute params. No-op when dtypes match.
-        w_dtype = self.weight.dtype
-        if inputs.dtype != w_dtype:
-            inputs = inputs.to(w_dtype)
-        if gates is not None and gates.dtype != w_dtype:
-            gates = gates.to(w_dtype)
+        # weights to share a dtype: the compute dtype follows the ACTIVATIONS.
+        # Keying it on self.weight.dtype instead is not phase-stable under
+        # FSDP mixed precision: the weight's visible dtype can differ between
+        # the original forward (bf16 unsharded views) and gradient-checkpoint
+        # recompute (fp32 master params), flipping downstream activation
+        # dtypes and tripping check_recomputed_tensors_match. Input dtype is
+        # set upstream and identical in both phases. No-op when dtypes agree.
+        weight = self.weight
+        if weight.dtype != inputs.dtype:
+            weight = weight.to(inputs.dtype)
+        if gates is not None and gates.dtype != inputs.dtype:
+            gates = gates.to(inputs.dtype)
+
 '''
 
 def fix_scattermoe(text):
-    if "w_dtype = self.weight.dtype" in text:
+    if "compute dtype follows the ACTIVATIONS" in text:
         return "ALREADY", None
-    anchor = ("    def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,\n"
-              "                expert_offsets,\n"
-              "                gates=None, grouped_in=False, grouped_out=False):\n")
-    if anchor not in text:
+    # Handles three states: pristine upstream, or either variant of the
+    # earlier weight-dtype cast (migrated by replacing everything between the
+    # forward signature and the parallel_linear call).
+    sig = ("    def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,\n"
+           "                expert_offsets,\n"
+           "                gates=None, grouped_in=False, grouped_out=False):\n")
+    call_old = "            inputs, self.weight.permute(0, 2, 1), k,"
+    call_new = "            inputs, weight.permute(0, 2, 1), k,"
+    if sig not in text:
         return "FAIL: ParallelExperts.forward signature not found", None
-    return "apply", text.replace(
-        anchor,
-        anchor.replace("                gates=None, grouped_in=False, grouped_out=False):\n",
-                       SCATTER_CAST), 1)
+    sig_end = text.index(sig) + len(sig)
+    call_anchor = "        results = parallel_linear("
+    call_idx = text.find(call_anchor, sig_end)
+    if call_idx < 0:
+        return "FAIL: parallel_linear call not found after signature", None
+    text = text[:sig_end] + SCATTER_CAST + text[call_idx:]
+    if call_old in text:
+        text = text.replace(call_old, call_new, 1)
+    elif call_new not in text:
+        return "FAIL: parallel_linear argument line not recognized", None
+    return "apply", text
 
 # ---------------------------------------------------------------- fix 5
 FALLBACK = '''\
