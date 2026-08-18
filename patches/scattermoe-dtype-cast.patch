@@ -1,0 +1,23 @@
+diff --git a/scattermoe/parallel_experts.py b/scattermoe/parallel_experts.py
+index fe67f25..1e06cdc 100644
+--- a/scattermoe/parallel_experts.py
++++ b/scattermoe/parallel_experts.py
+@@ -172,6 +172,18 @@ class ParallelExperts(nn.Module):
+     def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,
+                 expert_offsets,
+                 gates=None, grouped_in=False, grouped_out=False):
++        # The triton kernels require activations, gates and expert weights to
++        # share a dtype. Under FSDP mixed precision (fp32 master weights,
++        # bf16 compute) the surrounding model can feed fp32 activations into
++        # bf16 compute params — and the two ParallelExperts of one MLP can
++        # even see different dtypes depending on how their params were
++        # wrapped. Cast per-module to this module's own weight dtype; no-op
++        # when everything already matches.
++        w_dtype = self.weight.dtype
++        if inputs.dtype != w_dtype:
++            inputs = inputs.to(w_dtype)
++        if gates is not None and gates.dtype != w_dtype:
++            gates = gates.to(w_dtype)
+ 
+         results = parallel_linear(
+             inputs, self.weight.permute(0, 2, 1), k,

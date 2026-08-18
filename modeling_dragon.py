@@ -37,7 +37,29 @@ try:
     from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_step_fn import mamba3_step_fn
     from dragon_mamba3_fast_step.angle_cumsum import angle_dt
 except ImportError:
-    print("dragon_mamba3_fast_step not found")
+    # Fallback: the public state-spaces/mamba package ships the same Mamba-3
+    # MIMO kernel (mamba3_mimo) — it's what Megatron-LM training uses too.
+    # Differences vs the private dragon_mamba3_fast_step API:
+    #  - it takes RAW angles and applies the angle cumsum internally, so
+    #    angle_dt must NOT be applied beforehand (angle_dt = None signals that
+    #    in forward);
+    #  - it returns a bare tensor when return_state=False (the wrapper below
+    #    normalizes to the (y, state) tuple this file unpacks);
+    #  - there is NO public decode/step kernel (mamba3_step_fn) -> call
+    #    generate() with use_cache=False (full-prefix recompute per token).
+    angle_dt = None
+    mamba3_step_fn = None
+    apply_rotary_qk_inference_fwd = None
+    try:
+        from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as _mamba3_mimo_public
+
+        def mamba3_tilelang(*, return_state=False, **kwargs):
+            out = _mamba3_mimo_public(return_state=return_state, **kwargs)
+            return out if return_state else (out, None)
+
+        print("dragon_mamba3_fast_step not found: using public mamba_ssm mamba3_mimo kernel (no decode kernel -> generate with use_cache=False)")
+    except ImportError:
+        print("dragon_mamba3_fast_step not found")
 
 try:
     import scattermoe
@@ -1944,6 +1966,39 @@ class DragonMamba3MimoFast(nn.Module):
         use_precomputed_states = cache_params is not None and q_len == 1
         is_prefill = cache_params is not None
 
+        # Packed-batch (varlen) support for training frameworks like verl
+        # that feed one packed (1, T) row holding many documents
+        # (use_remove_padding). Running that dense leaks SSM state across
+        # document boundaries, and the dense backward additionally requires
+        # T % chunk_size == 0, which packed batches don't satisfy. Derive
+        # cu_seqlens from position_ids resets (pos == 0 marks each document
+        # start — same convention as the diff-tpa shift path) and use the
+        # public kernel's varlen forward/backward, which handles boundaries
+        # and ragged lengths. Only the public mamba3_mimo kernel accepts
+        # cu_seqlens (angle_dt is None on that path).
+        _mamba3_cu_seqlens = None
+        if angle_dt is None and cache_params is None and batch == 1:
+            _mamba3_cu_seqlens = kwargs.get("cu_seqlens", None)
+            if _mamba3_cu_seqlens is None:
+                _pos = kwargs.get("position_ids", None)
+                if _pos is not None:
+                    _starts = (_pos[0] == 0).nonzero(as_tuple=False).flatten()
+                    if _starts.numel() >= 1:
+                        _mamba3_cu_seqlens = torch.cat(
+                            [
+                                _starts.to(torch.int32),
+                                torch.tensor(
+                                    [q_len],
+                                    dtype=torch.int32,
+                                    device=_starts.device,
+                                ),
+                            ]
+                        )
+            if _mamba3_cu_seqlens is not None:
+                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(
+                    device=hidden_states.device, dtype=torch.int32
+                )
+
         if use_precomputed_states:
             state = (
                 cache_params.mamba3_angle_states[layer_idx],
@@ -2007,7 +2062,10 @@ class DragonMamba3MimoFast(nn.Module):
         C = self.C_norm(C)
 
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
-        angle = angle_dt(angle, dt)
+        if angle_dt is not None:
+            # private kernel wants pre-cumsummed angles; the public mamba_ssm
+            # mamba3_mimo fallback (angle_dt is None) applies the cumsum itself
+            angle = angle_dt(angle, dt)
 
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
@@ -2031,6 +2089,11 @@ class DragonMamba3MimoFast(nn.Module):
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
             return_state=is_prefill,
+            **(
+                {"cu_seqlens": _mamba3_cu_seqlens}
+                if _mamba3_cu_seqlens is not None
+                else {}
+            ),
         )
 
         if is_prefill:
@@ -2344,8 +2407,16 @@ class DragonGeodesicNorm(nn.Module):
     def __init__(self, config: DragonConfig, layer_idx: int):
         super().__init__()
 
-        self.scale = nn.Parameter(torch.tensor(1.))
-        self.bias = nn.Parameter(torch.tensor(0.))
+        # 1-D ([1]) rather than 0-dim scalars: FSDP1/FSDP2 both reject 0-dim
+        # parameters outright ("fully_shard doesn't support scalar
+        # parameters") — sharding needs a dim 0 to shard/flatten along.
+        # Numerically identical: the only use is ``theta * scale + bias``
+        # where theta is (..., 1), so [1] broadcasts the same.
+        # NOTE: checkpoints exported before this change store these as 0-dim
+        # and need scripts/olala/patch_olala_checkpoint.py (from_pretrained
+        # compares shapes before copying); re-exported checkpoints load as is.
+        self.scale = nn.Parameter(torch.tensor([1.]))
+        self.bias = nn.Parameter(torch.tensor([0.]))
         self.register_buffer("prosres_scalar", torch.tensor(1.0))
         self.clamp = torch.pi/4
         self.layer_idx = layer_idx
