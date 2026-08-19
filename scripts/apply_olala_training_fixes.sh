@@ -432,6 +432,29 @@ def fix_transfer_queue(text):
         "                    continue\n"
         "                operation = request_msg.request_type", 1)
 
+def fix_tq_controller(text):
+    if "dropping malformed request frame" in text:
+        return "ALREADY", None
+    old = ("            messages = self.request_handle_socket.recv_multipart(copy=False)\n"
+           "            identity = messages.pop(0)\n"
+           "            serialized_msg = messages\n"
+           "            request_msg = ZMQMessage.deserialize(serialized_msg)")
+    if old not in text:
+        return "FAIL: controller request loop anchor not found", None
+    return "apply", text.replace(old,
+        "            messages = self.request_handle_socket.recv_multipart(copy=False)\n"
+        "            identity = messages.pop(0)\n"
+        "            serialized_msg = messages\n"
+        "            # OLALA fix: a malformed frame must not kill the controller\n"
+        "            # loop — every client would then block forever.\n"
+        "            try:\n"
+        "                request_msg = ZMQMessage.deserialize(serialized_msg)\n"
+        "            except Exception as e:\n"
+        "                logger.error(\n"
+        "                    f\"controller: dropping malformed request frame: \"\n"
+        "                    f\"{type(e).__name__}: {e}\")\n"
+        "                continue", 1)
+
 # ---------------------------------------------------------------- run
 vllm_dir = pkg_dir("vllm")
 tq_dir = pkg_dir("transfer_queue")
@@ -455,6 +478,8 @@ patch("checkpoint modeling varlen + fallback",
       ckpt and Path(ckpt) / "modeling_dragon.py", fix_ckpt_modeling)
 patch("verl transfer_queue hardening",
       tq_dir and tq_dir / "storage/simple_storage.py", fix_transfer_queue)
+patch("verl transfer_queue controller hardening",
+      tq_dir and tq_dir / "controller.py", fix_tq_controller)
 verl_dir = pkg_dir("verl")
 patch("verl zmq socket per-user tmpdir (sender)",
       verl_dir and verl_dir / "workers/rollout/vllm_rollout/vllm_rollout.py", fix_zmq_sender)
