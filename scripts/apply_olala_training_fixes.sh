@@ -253,6 +253,24 @@ CU_SEQLENS = '''\
                     device=hidden_states.device, dtype=torch.int32)'''
 
 def fix_ckpt_modeling(text):
+    # (f-relocate) an earlier applier could anchor the dtype pin into
+    # DragonMonoBlock.__init__ instead of forward(): on pruning-support
+    # checkpoints the "Skip-mixer support" comment exists in BOTH, and the
+    # single-occurrence replace hit __init__ first. There autocast is always
+    # off, so the pin is dead code — and forward stays unpinned (FSDP2
+    # CheckpointError: bf16 saved vs fp32 recomputed). Strip the misplaced
+    # copy; the insertion below re-adds it at the forward anchor.
+    _pin_head = "        # OLALA fix: Phase-stable compute dtype under FSDP2 mixed\n"
+    _pin_tail = "            hidden_states = hidden_states.to(torch.get_autocast_dtype(\"cuda\"))\n"
+    _init_follow = ("        # Skip-mixer support: if this layer is in config.skip_mixer_layers,\n"
+                    "        # replace the mixer-side submodules with parameter-free placeholders.\n")
+    _i = text.find(_pin_head)
+    if _i != -1:
+        _e = text.find(_pin_tail, _i)
+        if _e != -1:
+            _e += len(_pin_tail)
+            if text[_e:_e + len(_init_follow)] == _init_follow:
+                text = text[:_i] + text[_e:]
     if all(m in text for m in (
         "_mamba3_cu_seqlens", "angle_dt is not None", "_mamba3_flat_batch",
         "Phase-stable compute dtype", "return output.to(x.dtype)",
@@ -319,7 +337,11 @@ def fix_ckpt_modeling(text):
             "            and hidden_states.dtype != torch.get_autocast_dtype(\"cuda\")\n"
             "        ):\n"
             "            hidden_states = hidden_states.to(torch.get_autocast_dtype(\"cuda\"))\n")
-        a1 = "        # Skip-mixer support: if this layer is in config.skip_mixer_layers,\n"
+        # a1 must be the FORWARD's skip-mixer comment (two lines — the
+        # second line disambiguates it from the near-identical comment in
+        # __init__ on pruning-support checkpoints; see f-relocate above).
+        a1 = ("        # Skip-mixer support: if this layer is in config.skip_mixer_layers,\n"
+              "        # the mixer phase is bypassed entirely — residual passes through and\n")
         a2 = "        # MIXER.\n        residual = hidden_states\n"
         if a1 in text:
             text = text.replace(a1, pin + a1, 1)
