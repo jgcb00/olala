@@ -187,6 +187,25 @@ def fix_scattermoe(text):
         return "FAIL: parallel_linear argument line not recognized", None
     return "apply", text
 
+SCATTER_BWD_CAST = '''\
+             gates, output_expanded) = ctx.saved_tensors
+            # OLALA fix: the incoming gradient can arrive in a promoted dtype
+            # (e.g. fp32 leaking back from a mixed-precision shared-expert /
+            # gating path) while the saved forward tensors are bf16; the
+            # kernels and matmuls below need uniform dtypes. No-op when they
+            # already agree.
+            if grad_out.dtype != x.dtype:
+                grad_out = grad_out.to(x.dtype)
+'''
+
+def fix_scattermoe_bwd(text):
+    if "incoming gradient can arrive in a promoted dtype" in text:
+        return "ALREADY", None
+    anchor = "             gates, output_expanded) = ctx.saved_tensors\n"
+    if anchor not in text:
+        return "FAIL: backward saved_tensors unpack not found", None
+    return "apply", text.replace(anchor, SCATTER_BWD_CAST, 1)
+
 # ---------------------------------------------------------------- fix 5
 FALLBACK = '''\
 except ImportError:
@@ -234,7 +253,29 @@ CU_SEQLENS = '''\
                     device=hidden_states.device, dtype=torch.int32)'''
 
 def fix_ckpt_modeling(text):
-    if "_mamba3_cu_seqlens" in text and "angle_dt is not None" in text:
+    # (f-relocate) an earlier applier could anchor the dtype pin into
+    # DragonMonoBlock.__init__ instead of forward(): on pruning-support
+    # checkpoints the "Skip-mixer support" comment exists in BOTH, and the
+    # single-occurrence replace hit __init__ first. There autocast is always
+    # off, so the pin is dead code — and forward stays unpinned (FSDP2
+    # CheckpointError: bf16 saved vs fp32 recomputed). Strip the misplaced
+    # copy; the insertion below re-adds it at the forward anchor.
+    _pin_head = "        # OLALA fix: Phase-stable compute dtype under FSDP2 mixed\n"
+    _pin_tail = "            hidden_states = hidden_states.to(torch.get_autocast_dtype(\"cuda\"))\n"
+    _init_follow = ("        # Skip-mixer support: if this layer is in config.skip_mixer_layers,\n"
+                    "        # replace the mixer-side submodules with parameter-free placeholders.\n")
+    _i = text.find(_pin_head)
+    if _i != -1:
+        _e = text.find(_pin_tail, _i)
+        if _e != -1:
+            _e += len(_pin_tail)
+            if text[_e:_e + len(_init_follow)] == _init_follow:
+                text = text[:_i] + text[_e:]
+    if all(m in text for m in (
+        "_mamba3_cu_seqlens", "angle_dt is not None", "_mamba3_flat_batch",
+        "Phase-stable compute dtype", "return output.to(x.dtype)",
+        "packed-batch (varlen) document masking",
+    )):
         return "ALREADY", None
     # (a) public-kernel fallback, only if absent
     plain = 'except ImportError:\n    print("dragon_mamba3_fast_step not found")'
@@ -268,7 +309,202 @@ def fix_ckpt_modeling(text):
             '            **({"cu_seqlens": _mamba3_cu_seqlens}\n'
             "               if _mamba3_cu_seqlens is not None else {}),\n"
             "        )", 1)
+    # (e) geodesic norm: pin output dtype to the residual dtype
+    if "return output.to(x.dtype)" not in text:
+        anchor = ("        output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)\n"
+                  "        return output")
+        if anchor not in text:
+            return "FAIL: geodesic output/return not found", None
+        text = text.replace(anchor, anchor.replace(
+            "        return output",
+            "        # OLALA fix: theta inherits the scale/bias params' dtype via\n"
+            "        # promotion and can differ from the residual dtype under mixed\n"
+            "        # precision; pin the output. No-op when dtypes agree.\n"
+            "        return output.to(x.dtype)"), 1)
+    # (f) block-entry autocast dtype pin (fixes FSDP2 cast_forward_inputs vs
+    #     gradient-checkpoint recompute mismatch)
+    if "Phase-stable compute dtype" not in text:
+        pin = (
+            "        # OLALA fix: Phase-stable compute dtype under FSDP2 mixed\n"
+            "        # precision + HF gradient checkpointing. cast_forward_inputs\n"
+            "        # runs inside this (checkpointed) __call__ in the original\n"
+            "        # forward but not at the same point in the recompute, so the\n"
+            "        # block would recompute from the saved PRE-CAST fp32 input and\n"
+            "        # every derived activation dtype would mismatch. Autocast state\n"
+            "        # IS replayed in recompute, so keying on it is stable.\n"
+            "        if (\n"
+            "            torch.is_autocast_enabled()\n"
+            "            and hidden_states.is_floating_point()\n"
+            "            and hidden_states.dtype != torch.get_autocast_dtype(\"cuda\")\n"
+            "        ):\n"
+            "            hidden_states = hidden_states.to(torch.get_autocast_dtype(\"cuda\"))\n")
+        # a1 must be the FORWARD's skip-mixer comment (two lines — the
+        # second line disambiguates it from the near-identical comment in
+        # __init__ on pruning-support checkpoints; see f-relocate above).
+        a1 = ("        # Skip-mixer support: if this layer is in config.skip_mixer_layers,\n"
+              "        # the mixer phase is bypassed entirely — residual passes through and\n")
+        a2 = "        # MIXER.\n        residual = hidden_states\n"
+        if a1 in text:
+            text = text.replace(a1, pin + a1, 1)
+        elif a2 in text:
+            text = text.replace(a2, pin + a2, 1)
+        else:
+            return "FAIL: block forward start not found for dtype pin", None
+    # (g) dense -> varlen flatten. The dense TileLang kernels are compiled
+    # per sequence length (no T.dynamic) and their backward requires
+    # L % chunk_size == 0; the varlen kernels declare S/NS dynamic (one
+    # compile serves every shape, fwd+bwd, no divisibility constraint).
+    # Flatten (B, L) into a packed (1, B*L) batch with row boundaries as
+    # cu_seqlens — numerically identical, each row an independent zero-start
+    # sequence. Measured: update_actor 842s -> 147s / 1300s -> 112s.
+    # Coexists with any earlier pad-only fix (which becomes a dead branch on
+    # the public-kernel path and keeps covering the private-kernel path).
+    if "_mamba3_flat_batch" not in text:
+        anchor = ("                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
+                  "                    device=hidden_states.device, dtype=torch.int32\n"
+                  "                )\n")
+        if anchor not in text:
+            return "FAIL: flatten insertion anchor not found", None
+        flat_block = (
+            "\n"
+            "        # OLALA fix: dense -> varlen flatten (see applier notes).\n"
+            "        _mamba3_flat_batch = 0\n"
+            "        _mamba3_flat_len = q_len\n"
+            "        if (\n"
+            "            cache_params is None\n"
+            "            and _mamba3_cu_seqlens is None\n"
+            "            and angle_dt is None\n"
+            "            and not (self.config.complete_slw and self.config.slw_wsize > 128)\n"
+            "        ):\n"
+            "            _mamba3_flat_batch = batch\n"
+            "            _mamba3_cu_seqlens = torch.arange(\n"
+            "                0, (batch + 1) * q_len, q_len,\n"
+            "                device=hidden_states.device, dtype=torch.int32,\n"
+            "            )\n"
+            "            if batch > 1:\n"
+            "                hidden_states = hidden_states.reshape(1, batch * q_len, -1)\n"
+            "                batch, q_len, _ = hidden_states.shape\n")
+        text = text.replace(anchor, anchor + flat_block, 1)
+        sl_anchor = ('        y = rearrange(y, "b l h p -> b l (h p)")\n'
+                     "        if self.config.mamba3_postgate_norm:")
+        if sl_anchor not in text:
+            return "FAIL: unflatten anchor not found", None
+        text = text.replace(sl_anchor,
+            "        if _mamba3_flat_batch > 1:\n"
+            "            # Undo the dense -> varlen flatten.\n"
+            "            y = y.view(_mamba3_flat_batch, _mamba3_flat_len, *y.shape[2:])\n\n"
+            + sl_anchor, 1)
+    # (h) packed-batch DOCUMENT MASKING for the attention layers. verl's
+    # use_remove_padding path feeds one packed (1, T) row holding many
+    # documents (position_ids reset to 0 at each doc start). The mamba3
+    # mixers already derive their own cu_seqlens from those resets, but with
+    # intra_doc_masking off the attention mixers ran DENSE flash attention
+    # over the whole packed row — every document attends to all previous
+    # ones. vLLM rollout computes each sequence alone, so this is a pure
+    # training/inference logprob mismatch: rollout_probs_diff blows up
+    # whenever use_remove_padding/use_dynamic_bsz is on. Fix: derive
+    # cu_seqlens once at model level and hand it down; every attention path
+    # switches to flash_attn_varlen when it is set. Single-document rows
+    # keep cu_seqlens=None, so the unpacked path is untouched.
+    if "packed-batch (varlen) document masking" not in text:
+        c1 = "            if not self.config.intra_doc_masking:"
+        c2 = "            if not self.config.intra_doc_masking and not self.config.complete_slw:"
+        c3 = "            assert not self.config.intra_doc_masking\n"
+        if c1 not in text and c2 not in text:
+            return "FAIL: attention doc-mask conditions not found", None
+        text = text.replace(
+            c1, "            if not self.config.intra_doc_masking and cu_seqlens is None:")
+        text = text.replace(
+            c2, "            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:")
+        text = text.replace(
+            c3, "            assert not self.config.intra_doc_masking and cu_seqlens is None, \"eager attention has no document masking\"\n")
+        derive_anchor = "        all_hidden_states = () if output_hidden_states else None"
+        if text.count(derive_anchor) != 1:
+            return "FAIL: model-level doc-mask anchor not unique", None
+        derive_block = (
+            "        # OLALA fix: packed-batch (varlen) document masking for the ATTENTION\n"
+            "        # layers. Training frameworks with use_remove_padding (verl) feed one\n"
+            "        # packed (1, T) row holding many documents, position_ids resetting to\n"
+            "        # 0 at each document start. The mamba3 mixers already derive their own\n"
+            "        # cu_seqlens from those resets, and the diff-tpa token-shift masks at\n"
+            "        # doc starts — but with intra_doc_masking off the attention mixers ran\n"
+            "        # DENSE flash attention over the whole packed row, letting every\n"
+            "        # document attend to all previous ones. That is a training/inference\n"
+            "        # logprob mismatch (rollout_probs_diff blowup) whenever packing is on.\n"
+            "        # Derive cu_seqlens once here and hand it down; the attention paths\n"
+            "        # switch to flash_attn_varlen whenever it is set. Single-document\n"
+            "        # rows (one reset) keep cu_seqlens=None — dense attention is already\n"
+            "        # exact there, so the validated unpacked path is untouched.\n"
+            "        if cu_seqlens is not None:\n"
+            "            # Normalize an externally provided cu_seqlens: verl passes its\n"
+            "            # packed nested-offsets (int64) whenever the forward signature\n"
+            "            # accepts cu_seqlens -- but never max_seqlen, and flash_attn\n"
+            "            # requires both. Same convention: one entry per document start\n"
+            "            # plus the total length.\n"
+            "            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)\n"
+            "            if max_seqlen is None:\n"
+            "                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())\n"
+            "        elif (\n"
+            "            past_key_values is None\n"
+            "            and B == 1\n"
+            "            and position_ids is not None\n"
+            "        ):\n"
+            "            _doc_starts = (position_ids[0] == 0).nonzero(as_tuple=False).flatten()\n"
+            "            if _doc_starts.numel() > 1:\n"
+            "                cu_seqlens = torch.cat(\n"
+            "                    [\n"
+            "                        _doc_starts.to(torch.int32),\n"
+            "                        torch.tensor(\n"
+            "                            [position_ids.shape[-1]],\n"
+            "                            dtype=torch.int32,\n"
+            "                            device=_doc_starts.device,\n"
+            "                        ),\n"
+            "                    ]\n"
+            "                ).to(device=hidden_states.device, dtype=torch.int32)\n"
+            "                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())\n"
+            "\n"
+        )
+        text = text.replace(derive_anchor, derive_block + derive_anchor, 1)
     return "apply", text
+
+# ---------------------------------------------------------------- fix 5b
+# verl colocate weight-sync ZMQ socket: hardcoded shared /tmp + a Ray job id
+# that restarts at 01000000 every fresh cluster means a stale socket left by
+# ANOTHER user (sticky /tmp, not removable) permanently blocks new runs with
+# "ZMQError: Address already in use". Use the per-user temp dir (TMPDIR)
+# on BOTH the sender and receiver sides (they must agree).
+def _fix_zmq_tmpdir(text, old_line, new_lines):
+    if "rl-colocate-zmq" not in text:
+        return "SKIP", None
+    if "_tempfile.gettempdir()" in text:
+        return "ALREADY", None
+    if old_line not in text:
+        return "FAIL: zmq handle line not found", None
+    return "apply", text.replace(old_line, new_lines, 1)
+
+def fix_zmq_sender(text):
+    return _fix_zmq_tmpdir(
+        text,
+        '        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"',
+        "        import tempfile as _tempfile\n"
+        "        # OLALA fix: per-user temp dir (TMPDIR); see applier notes.\n"
+        '        self.zmq_handle = (\n'
+        '            f"ipc://{_tempfile.gettempdir()}/rl-colocate-zmq-{job_id}"\n'
+        '            f"-replica-{self.replica_rank}-rank-{local_rank}.sock"\n'
+        "        )",
+    )
+
+def fix_zmq_receiver(text):
+    return _fix_zmq_tmpdir(
+        text,
+        '        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"',
+        "        import tempfile as _tempfile\n"
+        "        # OLALA fix: per-user temp dir (TMPDIR); must match sender side.\n"
+        '        return (\n'
+        '            f"ipc://{_tempfile.gettempdir()}/rl-colocate-zmq-{job_id}"\n'
+        '            f"-replica-{replica_rank}-rank-{trainer_rank}.sock"\n'
+        "        )",
+    )
 
 # ---------------------------------------------------------------- fix 6
 def fix_transfer_queue(text):
@@ -290,6 +526,29 @@ def fix_transfer_queue(text):
         "                    continue\n"
         "                operation = request_msg.request_type", 1)
 
+def fix_tq_controller(text):
+    if "dropping malformed request frame" in text:
+        return "ALREADY", None
+    old = ("            messages = self.request_handle_socket.recv_multipart(copy=False)\n"
+           "            identity = messages.pop(0)\n"
+           "            serialized_msg = messages\n"
+           "            request_msg = ZMQMessage.deserialize(serialized_msg)")
+    if old not in text:
+        return "FAIL: controller request loop anchor not found", None
+    return "apply", text.replace(old,
+        "            messages = self.request_handle_socket.recv_multipart(copy=False)\n"
+        "            identity = messages.pop(0)\n"
+        "            serialized_msg = messages\n"
+        "            # OLALA fix: a malformed frame must not kill the controller\n"
+        "            # loop — every client would then block forever.\n"
+        "            try:\n"
+        "                request_msg = ZMQMessage.deserialize(serialized_msg)\n"
+        "            except Exception as e:\n"
+        "                logger.error(\n"
+        "                    f\"controller: dropping malformed request frame: \"\n"
+        "                    f\"{type(e).__name__}: {e}\")\n"
+        "                continue", 1)
+
 # ---------------------------------------------------------------- run
 vllm_dir = pkg_dir("vllm")
 tq_dir = pkg_dir("transfer_queue")
@@ -307,10 +566,19 @@ patch("mamba saved_tensors (siso)",
       mamba and Path(mamba) / "mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py", fix_saved_tensors)
 patch("scattermoe dtype cast",
       scatter and Path(scatter) / "scattermoe/parallel_experts.py", fix_scattermoe)
+patch("scattermoe backward grad cast",
+      scatter and Path(scatter) / "scattermoe/parallel_experts.py", fix_scattermoe_bwd)
 patch("checkpoint modeling varlen + fallback",
       ckpt and Path(ckpt) / "modeling_dragon.py", fix_ckpt_modeling)
 patch("verl transfer_queue hardening",
       tq_dir and tq_dir / "storage/simple_storage.py", fix_transfer_queue)
+patch("verl transfer_queue controller hardening",
+      tq_dir and tq_dir / "controller.py", fix_tq_controller)
+verl_dir = pkg_dir("verl")
+patch("verl zmq socket per-user tmpdir (sender)",
+      verl_dir and verl_dir / "workers/rollout/vllm_rollout/vllm_rollout.py", fix_zmq_sender)
+patch("verl zmq socket per-user tmpdir (receiver)",
+      verl_dir and verl_dir / "workers/rollout/vllm_rollout/utils.py", fix_zmq_receiver)
 
 width = max(len(n) for n, _, _ in results)
 fail = False

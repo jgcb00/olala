@@ -18,6 +18,21 @@ from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.utils import ModelOutput, logging
 
+# LOAD ORDER MATTERS, keep this above the mamba_ssm import below.
+# mamba_ssm pulls in tilelang, which ships libcudart_stub.so exporting the cudart
+# symbols itself. Any CUDA extension dlopened AFTER it binds its cudart calls to
+# that stub, whose own fallback resolution then fails -> "TileLang Error:
+# libcudart symbols not found globally" + abort() (kills the process at the first
+# flash-attn call, no Python traceback). Loading flash-attn's .so first makes it
+# bind to the real libcudart.
+try:
+    import flash_attn_interface  # noqa: F401  (FA3, imports flash_attn_3._C)
+except ImportError:
+    try:
+        import flash_attn  # noqa: F401  (FA2)
+    except ImportError:
+        pass
+
 try:
     from flash_attn.modules.mlp import GatedMlp
 except ImportError:
@@ -128,6 +143,28 @@ logger.info(f"Using attention implementation: {ATTN_IMPL}")
 logger.info(f"Using Gated DeltaNet implementation: {'fla' if chunk_gated_delta_rule is not None else 'torch'}")
 logger.info(f"Using short convolution implementation: {'causal-conv1d' if causal_conv1d_fn is not None else 'torch'}")
 
+# Parameter-free placeholders used for pruned/skipped MoE blocks.  When
+# config.skip_moe_layers includes a layer's index, DragonMonoBlock installs
+# these so the MLP phase becomes a no-op (residual passes through unchanged).
+# The analogous skip_mixer_layers config skips the *mixer* phase (Mamba/Attn)
+# entirely — the residual passes through unchanged on that phase.
+class _NullMlp(nn.Module):
+    def forward(self, x):
+        return torch.zeros_like(x)
+
+
+class _NullGeodesic(nn.Module):
+    def forward(self, residual, g):
+        return residual
+
+
+class _NullMixer(nn.Module):
+    """Stand-in for a DragonMonoBlock mixer when the layer is in
+    ``config.skip_mixer_layers``. Returns (zeros_like_input, None, None)."""
+    def forward(self, hidden_states, **kwargs):
+        return torch.zeros_like(hidden_states), None, None
+
+
 class DragonHeadWiseRMSNorm(nn.Module):
     def __init__(self, n_heads, d_head, eps=1e-6, zero_centered_gamma=False):
         super().__init__()
@@ -227,12 +264,18 @@ class HybridDragonDynamicCache(DynamicCache):
     def __init__(self, config: DragonConfig):
         super().__init__()
         self.config = config
+        # If layer_idx_map is set (pruned-block variant), blocks may index
+        # into these caches at their ORIGINAL layer_idx, which can exceed
+        # len(layers_config). Size the per-layer lists by the largest
+        # original index + 1 so writes don't go out of bounds.
+        _map = getattr(config, "layer_idx_map", None)
+        cache_n = max(_map) + 1 if _map else len(config.layers_config)
         # attention
         self._key_cache = {}
         self._value_cache = {}
         # attention - kv shift
-        self._kv_shift_last_k = [None for _ in range(len(config.layers_config))] # (B, H_kv, D)
-        self._kv_shift_last_v = [None for _ in range(len(config.layers_config))] # (B, H_kv, D)
+        self._kv_shift_last_k = [None for _ in range(cache_n)] # (B, H_kv, D)
+        self._kv_shift_last_v = [None for _ in range(cache_n)] # (B, H_kv, D)
         # cca
         self.cca_qk0_cache = []
         self.cca_qk1_cache = []
@@ -241,17 +284,26 @@ class HybridDragonDynamicCache(DynamicCache):
         self.conv_caches = []
         self.ssm_caches = []
         # mamba3
-        self.mamba3_hs = [None for _ in range(len(config.layers_config))]
-        self.mamba3_angle_states = [None for _ in range(len(config.layers_config))]
-        self.mamba3_ssm_states = [None for _ in range(len(config.layers_config))]
-        self.mamba3_k_states = [None for _ in range(len(config.layers_config))]
-        self.mamba3_v_states = [None for _ in range(len(config.layers_config))]
+        self.mamba3_hs = [None for _ in range(cache_n)]
+        self.mamba3_angle_states = [None for _ in range(cache_n)]
+        self.mamba3_ssm_states = [None for _ in range(cache_n)]
+        self.mamba3_k_states = [None for _ in range(cache_n)]
+        self.mamba3_v_states = [None for _ in range(cache_n)]
 
-        for idx, layer_type in enumerate(config.layers_config):
+        # Build per-position auxiliary caches keyed by ORIGINAL layer_idx
+        # when a layer_idx_map is present. Otherwise use the position
+        # sequence as before.
+        _origs = _map if _map else list(range(len(config.layers_config)))
+        # we still want the type info from layers_config; map position i ->
+        # layers_config[i] (i is also the new position), but cache lists
+        # below should be addressable up to cache_n.
+        for i, orig in enumerate(_origs):
+            layer_type = config.layers_config[i]
             if not layer_type == "r":
-                self._key_cache[idx] = None
-                self._value_cache[idx] = None
+                self._key_cache[orig] = None
+                self._value_cache[orig] = None
 
+        for _ in range(cache_n):
             self.cca_qk0_cache.append(None)
             self.cca_qk1_cache.append(None)
             self.cca_prev_hidden.append(None)
@@ -260,7 +312,7 @@ class HybridDragonDynamicCache(DynamicCache):
 
         self.window_size = config.sliding_window_size
         self.layers_config = config.layers_config
-        self.past_length = [0 for _ in range(len(config.layers_config))]
+        self.past_length = [0 for _ in range(cache_n)]
 
     def update(
         self,
@@ -601,19 +653,19 @@ class DragonAttention(nn.Module):
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
 
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking
+            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
@@ -1003,19 +1055,19 @@ class DragonDifferentialAttentionV2(nn.Module):
 
         # attention computation.
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking
+            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking and not self.config.complete_slw:
+            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking and not self.config.complete_slw:
+            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
@@ -1295,19 +1347,19 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
 
         # attention computation.
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking
+            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
@@ -1999,6 +2051,46 @@ class DragonMamba3MimoFast(nn.Module):
                     device=hidden_states.device, dtype=torch.int32
                 )
 
+        _mamba3_len = q_len
+        _mamba3_pad = 0
+        _mamba3_flat_batch = 0
+        if (
+            cache_params is None
+            and _mamba3_cu_seqlens is None
+            and angle_dt is None
+            and not (self.config.complete_slw and self.config.slw_wsize > 128)
+        ):
+            # Dense -> varlen flatten. The dense TileLang kernels are
+            # compiled per sequence length (no T.dynamic), so variable-length
+            # training batches trigger a fresh multi-second JIT compile for
+            # every new L — and the dense BACKWARD additionally requires
+            # L % chunk_size == 0. The varlen kernels declare S/NS as
+            # T.dynamic: one compilation serves every shape, forward and
+            # backward, with no divisibility constraint. Flatten (B, L) into
+            # a packed (1, B*L) batch whose row boundaries are cu_seqlens —
+            # numerically identical, each row stays an independent
+            # zero-start sequence. Measured on verl 1-GPU fsdp2 training:
+            # update_actor 842s -> 147s (step 1), 1300s -> 112s (step 2).
+            _mamba3_flat_batch = batch
+            _mamba3_cu_seqlens = torch.arange(
+                0, (batch + 1) * q_len, q_len,
+                device=hidden_states.device, dtype=torch.int32,
+            )
+            if batch > 1:
+                hidden_states = hidden_states.reshape(1, batch * q_len, -1)
+                batch, q_len, _ = hidden_states.shape
+        elif (
+            cache_params is None
+            and _mamba3_cu_seqlens is None
+            and q_len % self.chunk_size != 0
+        ):
+            # Private-kernel (angle_dt) fallback: it has no cu_seqlens
+            # support, so pad rows to the next chunk multiple instead (the
+            # dense backward requires it) and slice the output back below.
+            _mamba3_pad = self.chunk_size - (q_len % self.chunk_size)
+            hidden_states = F.pad(hidden_states, (0, 0, 0, _mamba3_pad))
+            batch, q_len, _ = hidden_states.shape
+
         if use_precomputed_states:
             state = (
                 cache_params.mamba3_angle_states[layer_idx],
@@ -2071,9 +2163,11 @@ class DragonMamba3MimoFast(nn.Module):
         dt = rearrange(dt, "b l n -> b n l")
 
         y, kernel_state = mamba3_tilelang(
-            Q=C.contiguous().bfloat16(),
-            K=B.contiguous().bfloat16(),
-            V=x.contiguous().bfloat16(),
+            # No forced .bfloat16(): keep the incoming compute dtype so fp32
+            # (or mixed-precision) training isn't silently downcast here.
+            Q=C.contiguous(),
+            K=B.contiguous(),
+            V=x.contiguous(),
             ADT=ADT.to(torch.float32).contiguous(),
             DT=dt.to(torch.float32).contiguous(),
             Trap=trap.contiguous(),
@@ -2103,6 +2197,13 @@ class DragonMamba3MimoFast(nn.Module):
             cache_params.mamba3_k_states[layer_idx]     = k_state_out
             cache_params.mamba3_v_states[layer_idx]     = v_state_out
             cache_params.past_length[layer_idx]         += q_len
+
+        if _mamba3_flat_batch > 1:
+            # Undo the dense -> varlen flatten: (1, B*L, H, P) -> (B, L, H, P).
+            y = y.view(_mamba3_flat_batch, _mamba3_len, *y.shape[2:])
+        elif _mamba3_pad:
+            # Drop the chunk-alignment padding added above.
+            y = y[:, :_mamba3_len]
 
         y = rearrange(y, "b l h p -> b l (h p)")
         if self.config.mamba3_postgate_norm:
@@ -2438,12 +2539,26 @@ class DragonGeodesicNorm(nn.Module):
         theta = torch.clamp(safe_tangent_norm / safe_R, max=self.clamp)
         theta = torch.clamp((theta * self.scale + self.bias) / (self.layer_idx + 1), max=self.clamp)
         output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
-        return output
+        # Dtype-stability: `theta * self.scale + self.bias` promotes theta —
+        # and through cos/sin the OUTPUT — to the params' dtype, which can
+        # differ from the residual dtype under mixed precision. Pin the
+        # output to the residual dtype; no-op when dtypes already agree.
+        return output.to(x.dtype)
 
 class DragonMonoBlock(GradientCheckpointingLayer):
     def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
         super().__init__()
         self.config = config
+        # When blocks have been pruned out (config.layer_idx_map present),
+        # the surviving block at *position* `layer_idx` originally had a
+        # different index. We preserve that original index so that
+        # DragonGeodesicNorm.theta scaling by 1/(layer_idx+1) and any other
+        # layer-index-dependent logic stays consistent with how the model
+        # was trained. Pruning configs (skip_moe_layers, skip_mixer_layers)
+        # are also expressed in ORIGINAL indices.
+        _map = getattr(config, "layer_idx_map", None)
+        if _map is not None and layer_idx < len(_map):
+            layer_idx = int(_map[layer_idx])
         self.layer_idx = layer_idx
 
         if use_ve:
@@ -2528,7 +2643,17 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.geodesic_mixer = DragonGeodesicNorm(config, self.layer_idx)
             self.geodesic_mlp = DragonGeodesicNorm(config, self.layer_idx)
 
-        if not config.moe or mlp_type == 'd':
+        # ---- pruning / skip-MoE support ----
+        # If `config.skip_moe_layers` contains this layer_idx, replace mlp with a
+        # parameter-free no-op and also disable the geodesic_mlp combine so the
+        # block becomes "mixer-only" at this layer. Saved checkpoints with these
+        # layers don't carry MoE params for them at all.
+        skip_moe = getattr(config, "skip_moe_layers", None) or []
+        if layer_idx in skip_moe:
+            self.mlp = _NullMlp()
+            if config.geodesic_update:
+                self.geodesic_mlp = _NullGeodesic()
+        elif not config.moe or mlp_type == 'd':
             if config.mlp_type == "simple":
                 self.mlp = DragonMLP(config)
             elif config.mlp_type == "gated":
@@ -2539,6 +2664,21 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             self.mlp = DragonMoE(config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Unknown mlp_type: {mlp_type}")
+
+        # Skip-mixer support: if this layer is in config.skip_mixer_layers,
+        # replace the mixer-side submodules with parameter-free placeholders.
+        # The forward also short-circuits the mixer phase via _skip_mixer.
+        skip_mixer = getattr(config, "skip_mixer_layers", None) or []
+        if layer_idx in skip_mixer:
+            self.mixer = _NullMixer()
+            self.mixer_proj = _NullMlp()                # returns zeros_like(input)
+            self.input_norm = nn.Identity()
+            if config.geodesic_update:
+                self.geodesic_mixer = _NullGeodesic()
+            if self.use_gate:
+                self.gate_proj = _NullMlp()
+            if config.mixer_gn:
+                self.mixer_group_norm = nn.Identity()
 
         lns = 1.
         if config.layer_norm_scaling:
@@ -2564,39 +2704,62 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         ve=None,
         **kwargs,
     ):
-        # MIXER.
-        residual = hidden_states
-        x_in = hidden_states
-        hidden_states = self.lns * self.input_norm(x_in) # (B, L, D)
-        y_mixer, last_key_states, last_value_states = self.mixer(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            position_ids=position_ids,
-            cache_params=cache_params,
-            key_value_last_layer=key_value_last_layer,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            ve=ve,
-        ) # (B, L, E*D)
-        if self.config.mixer_gn and not self.config.gate_before_norm:
-            y_mixer = self.mixer_group_norm(y_mixer)
-        if self.use_gate:
-            if self.config.gate_type == "elementwise" or self.config.gate_type == "kimi":
-                g_proj = self.gate_proj(hidden_states).view(hidden_states.size(0), hidden_states.size(1), self.num_attention_heads, self.head_dim).to(y_mixer.dtype)
-            elif self.config.gate_type == "headwise":
-                g_proj = self.gate_proj(hidden_states).unsqueeze(-1).to(y_mixer.dtype)
-            else:
-                raise ValueError(f"Unknown gate_type: {self.config.gate_type}")
-            y_mixer = y_mixer * self.gate_act(g_proj + self.gate_bias)
-        if self.config.mixer_gn and self.config.gate_before_norm:
-            y_mixer = self.mixer_group_norm(y_mixer)
-        y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
-        y_mixer = self.mixer_proj(y_mixer)
-
-        if self.config.geodesic_update:
-            hidden_states = self.geodesic_mixer(residual, y_mixer)
+        # Phase-stable compute dtype under FSDP2 mixed precision + HF
+        # gradient checkpointing. FSDP2's cast_forward_inputs runs inside
+        # this (checkpointed) __call__ during the original forward, casting
+        # the incoming fp32 residual to bf16 — but the checkpoint saves the
+        # PRE-CAST input and the hook does not re-run at the same point in
+        # the recompute, so every derived activation flips dtype and trips
+        # torch.utils.checkpoint's check_recomputed_tensors_match. Re-apply
+        # the autocast dtype explicitly: autocast state is replayed during
+        # recompute, so this is identical in both phases and a no-op when
+        # the input is already cast.
+        if (
+            torch.is_autocast_enabled()
+            and hidden_states.is_floating_point()
+            and hidden_states.dtype != torch.get_autocast_dtype("cuda")
+        ):
+            hidden_states = hidden_states.to(torch.get_autocast_dtype("cuda"))
+        # Skip-mixer support: if this layer is in config.skip_mixer_layers,
+        # the mixer phase is bypassed entirely — residual passes through and
+        # no KV is produced (downstream layers receive None from this slot).
+        _skip_mixer = self.layer_idx in (getattr(self.config, "skip_mixer_layers", None) or [])
+        if _skip_mixer:
+            last_key_states, last_value_states = None, None
         else:
-            hidden_states = self.b * residual + self.a * y_mixer
+            # MIXER.
+            residual = hidden_states
+            x_in = hidden_states
+            hidden_states = self.lns * self.input_norm(x_in) # (B, L, D)
+            y_mixer, last_key_states, last_value_states = self.mixer(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                cache_params=cache_params,
+                key_value_last_layer=key_value_last_layer,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                ve=ve,
+            ) # (B, L, E*D)
+            if self.config.mixer_gn and not self.config.gate_before_norm:
+                y_mixer = self.mixer_group_norm(y_mixer)
+            if self.use_gate:
+                if self.config.gate_type == "elementwise" or self.config.gate_type == "kimi":
+                    g_proj = self.gate_proj(hidden_states).view(hidden_states.size(0), hidden_states.size(1), self.num_attention_heads, self.head_dim).to(y_mixer.dtype)
+                elif self.config.gate_type == "headwise":
+                    g_proj = self.gate_proj(hidden_states).unsqueeze(-1).to(y_mixer.dtype)
+                else:
+                    raise ValueError(f"Unknown gate_type: {self.config.gate_type}")
+                y_mixer = y_mixer * self.gate_act(g_proj + self.gate_bias)
+            if self.config.mixer_gn and self.config.gate_before_norm:
+                y_mixer = self.mixer_group_norm(y_mixer)
+            y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1)
+            y_mixer = self.mixer_proj(y_mixer)
+
+            if self.config.geodesic_update:
+                hidden_states = self.geodesic_mixer(residual, y_mixer)
+            else:
+                hidden_states = self.b * residual + self.a * y_mixer
 
         # MLP.
         residual = hidden_states
@@ -2791,6 +2954,47 @@ class DragonModel(DragonPreTrainedModel):
 
             if self.config.patch_level_training:
                 position_ids = position_ids[:, 0:L//self.config.patch_level_training_size]
+
+        # OLALA fix: packed-batch (varlen) document masking for the ATTENTION
+        # layers. Training frameworks with use_remove_padding (verl) feed one
+        # packed (1, T) row holding many documents, position_ids resetting to
+        # 0 at each document start. The mamba3 mixers already derive their own
+        # cu_seqlens from those resets, and the diff-tpa token-shift masks at
+        # doc starts — but with intra_doc_masking off the attention mixers ran
+        # DENSE flash attention over the whole packed row, letting every
+        # document attend to all previous ones. That is a training/inference
+        # logprob mismatch (rollout_probs_diff blowup) whenever packing is on.
+        # Derive cu_seqlens once here and hand it down; the attention paths
+        # switch to flash_attn_varlen whenever it is set. Single-document
+        # rows (one reset) keep cu_seqlens=None — dense attention is already
+        # exact there, so the validated unpacked path is untouched.
+        if cu_seqlens is not None:
+            # Normalize an externally provided cu_seqlens: verl passes its
+            # packed nested-offsets (int64) whenever the forward signature
+            # accepts cu_seqlens -- but never max_seqlen, and flash_attn
+            # requires both. Same convention: one entry per document start
+            # plus the total length.
+            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)
+            if max_seqlen is None:
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        elif (
+            past_key_values is None
+            and B == 1
+            and position_ids is not None
+        ):
+            _doc_starts = (position_ids[0] == 0).nonzero(as_tuple=False).flatten()
+            if _doc_starts.numel() > 1:
+                cu_seqlens = torch.cat(
+                    [
+                        _doc_starts.to(torch.int32),
+                        torch.tensor(
+                            [position_ids.shape[-1]],
+                            dtype=torch.int32,
+                            device=_doc_starts.device,
+                        ),
+                    ]
+                ).to(device=hidden_states.device, dtype=torch.int32)
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
         all_hidden_states = () if output_hidden_states else None
 

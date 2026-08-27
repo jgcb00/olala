@@ -1,8 +1,22 @@
 diff --git a/scattermoe/parallel_experts.py b/scattermoe/parallel_experts.py
-index fe67f25..0424c43 100644
+index fe67f25..5a42436 100644
 --- a/scattermoe/parallel_experts.py
 +++ b/scattermoe/parallel_experts.py
-@@ -172,9 +172,22 @@ class ParallelExperts(nn.Module):
+@@ -68,6 +68,13 @@ class ParallelLinear(torch.autograd.Function):
+              sorted_scattered_idxs,
+              expert_offsets,
+              gates, output_expanded) = ctx.saved_tensors
++            # OLALA fix: the incoming gradient can arrive in a promoted dtype
++            # (e.g. fp32 leaking back from a mixed-precision shared-expert /
++            # gating path) while the saved forward tensors are bf16; the
++            # kernels and matmuls below need uniform dtypes. No-op when they
++            # already agree.
++            if grad_out.dtype != x.dtype:
++                grad_out = grad_out.to(x.dtype)
+             k = ctx.k
+             grouped_in = ctx.grouped_in
+             grouped_out = ctx.grouped_out
+@@ -172,9 +179,22 @@ class ParallelExperts(nn.Module):
      def forward(self, inputs, k, sorted_expert_idxs, sorted_scattered_idxs,
                  expert_offsets,
                  gates=None, grouped_in=False, grouped_out=False):
