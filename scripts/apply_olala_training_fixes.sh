@@ -18,7 +18,7 @@
 #      frame kill a storage worker thread permanently. (optional hardening)
 #
 # NOT done here (weights, not code): widening the checkpoint's 0-dim
-# scale/bias tensors — run scripts/olala/patch_olala_checkpoint.py for that.
+# scale/bias tensors — run scripts/patch_olala_checkpoint.py for that.
 #
 # Usage:
 #   ./apply_olala_training_fixes.sh \
