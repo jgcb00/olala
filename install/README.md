@@ -26,7 +26,7 @@ mkdir -p $OLALA_HOME && cd $OLALA_HOME
 uv venv venv --python /usr/bin/python3.12
 
 # pinned sources
-git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 1379ba0df
+git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 8a124b6b0
 git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 761b409
 git clone --filter=blob:none https://github.com/shawntan/scattermoe.git scattermoe && git -C scattermoe checkout 47b5e15
 git clone --filter=blob:none https://github.com/jgcb00/olala.git olala-fixes
