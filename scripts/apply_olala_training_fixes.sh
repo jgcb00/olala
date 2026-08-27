@@ -274,6 +274,7 @@ def fix_ckpt_modeling(text):
     if all(m in text for m in (
         "_mamba3_cu_seqlens", "angle_dt is not None", "_mamba3_flat_batch",
         "Phase-stable compute dtype", "return output.to(x.dtype)",
+        "packed-batch (varlen) document masking",
     )):
         return "ALREADY", None
     # (a) public-kernel fallback, only if absent
@@ -393,6 +394,77 @@ def fix_ckpt_modeling(text):
             "            # Undo the dense -> varlen flatten.\n"
             "            y = y.view(_mamba3_flat_batch, _mamba3_flat_len, *y.shape[2:])\n\n"
             + sl_anchor, 1)
+    # (h) packed-batch DOCUMENT MASKING for the attention layers. verl's
+    # use_remove_padding path feeds one packed (1, T) row holding many
+    # documents (position_ids reset to 0 at each doc start). The mamba3
+    # mixers already derive their own cu_seqlens from those resets, but with
+    # intra_doc_masking off the attention mixers ran DENSE flash attention
+    # over the whole packed row — every document attends to all previous
+    # ones. vLLM rollout computes each sequence alone, so this is a pure
+    # training/inference logprob mismatch: rollout_probs_diff blows up
+    # whenever use_remove_padding/use_dynamic_bsz is on. Fix: derive
+    # cu_seqlens once at model level and hand it down; every attention path
+    # switches to flash_attn_varlen when it is set. Single-document rows
+    # keep cu_seqlens=None, so the unpacked path is untouched.
+    if "packed-batch (varlen) document masking" not in text:
+        c1 = "            if not self.config.intra_doc_masking:"
+        c2 = "            if not self.config.intra_doc_masking and not self.config.complete_slw:"
+        c3 = "            assert not self.config.intra_doc_masking\n"
+        if c1 not in text and c2 not in text:
+            return "FAIL: attention doc-mask conditions not found", None
+        text = text.replace(
+            c1, "            if not self.config.intra_doc_masking and cu_seqlens is None:")
+        text = text.replace(
+            c2, "            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:")
+        text = text.replace(
+            c3, "            assert not self.config.intra_doc_masking and cu_seqlens is None, \"eager attention has no document masking\"\n")
+        derive_anchor = "        all_hidden_states = () if output_hidden_states else None"
+        if text.count(derive_anchor) != 1:
+            return "FAIL: model-level doc-mask anchor not unique", None
+        derive_block = (
+            "        # OLALA fix: packed-batch (varlen) document masking for the ATTENTION\n"
+            "        # layers. Training frameworks with use_remove_padding (verl) feed one\n"
+            "        # packed (1, T) row holding many documents, position_ids resetting to\n"
+            "        # 0 at each document start. The mamba3 mixers already derive their own\n"
+            "        # cu_seqlens from those resets, and the diff-tpa token-shift masks at\n"
+            "        # doc starts — but with intra_doc_masking off the attention mixers ran\n"
+            "        # DENSE flash attention over the whole packed row, letting every\n"
+            "        # document attend to all previous ones. That is a training/inference\n"
+            "        # logprob mismatch (rollout_probs_diff blowup) whenever packing is on.\n"
+            "        # Derive cu_seqlens once here and hand it down; the attention paths\n"
+            "        # switch to flash_attn_varlen whenever it is set. Single-document\n"
+            "        # rows (one reset) keep cu_seqlens=None — dense attention is already\n"
+            "        # exact there, so the validated unpacked path is untouched.\n"
+            "        if cu_seqlens is not None:\n"
+            "            # Normalize an externally provided cu_seqlens: verl passes its\n"
+            "            # packed nested-offsets (int64) whenever the forward signature\n"
+            "            # accepts cu_seqlens -- but never max_seqlen, and flash_attn\n"
+            "            # requires both. Same convention: one entry per document start\n"
+            "            # plus the total length.\n"
+            "            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)\n"
+            "            if max_seqlen is None:\n"
+            "                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())\n"
+            "        elif (\n"
+            "            past_key_values is None\n"
+            "            and B == 1\n"
+            "            and position_ids is not None\n"
+            "        ):\n"
+            "            _doc_starts = (position_ids[0] == 0).nonzero(as_tuple=False).flatten()\n"
+            "            if _doc_starts.numel() > 1:\n"
+            "                cu_seqlens = torch.cat(\n"
+            "                    [\n"
+            "                        _doc_starts.to(torch.int32),\n"
+            "                        torch.tensor(\n"
+            "                            [position_ids.shape[-1]],\n"
+            "                            dtype=torch.int32,\n"
+            "                            device=_doc_starts.device,\n"
+            "                        ),\n"
+            "                    ]\n"
+            "                ).to(device=hidden_states.device, dtype=torch.int32)\n"
+            "                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())\n"
+            "\n"
+        )
+        text = text.replace(derive_anchor, derive_block + derive_anchor, 1)
     return "apply", text
 
 # ---------------------------------------------------------------- fix 5b

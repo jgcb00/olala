@@ -653,19 +653,19 @@ class DragonAttention(nn.Module):
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
 
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking
+            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
@@ -1055,19 +1055,19 @@ class DragonDifferentialAttentionV2(nn.Module):
 
         # attention computation.
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking
+            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking and not self.config.complete_slw:
+            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking and not self.config.complete_slw:
+            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
@@ -1347,19 +1347,19 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
 
         # attention computation.
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking
+            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking:
+            if not self.config.intra_doc_masking and cu_seqlens is None:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
@@ -2954,6 +2954,47 @@ class DragonModel(DragonPreTrainedModel):
 
             if self.config.patch_level_training:
                 position_ids = position_ids[:, 0:L//self.config.patch_level_training_size]
+
+        # OLALA fix: packed-batch (varlen) document masking for the ATTENTION
+        # layers. Training frameworks with use_remove_padding (verl) feed one
+        # packed (1, T) row holding many documents, position_ids resetting to
+        # 0 at each document start. The mamba3 mixers already derive their own
+        # cu_seqlens from those resets, and the diff-tpa token-shift masks at
+        # doc starts — but with intra_doc_masking off the attention mixers ran
+        # DENSE flash attention over the whole packed row, letting every
+        # document attend to all previous ones. That is a training/inference
+        # logprob mismatch (rollout_probs_diff blowup) whenever packing is on.
+        # Derive cu_seqlens once here and hand it down; the attention paths
+        # switch to flash_attn_varlen whenever it is set. Single-document
+        # rows (one reset) keep cu_seqlens=None — dense attention is already
+        # exact there, so the validated unpacked path is untouched.
+        if cu_seqlens is not None:
+            # Normalize an externally provided cu_seqlens: verl passes its
+            # packed nested-offsets (int64) whenever the forward signature
+            # accepts cu_seqlens -- but never max_seqlen, and flash_attn
+            # requires both. Same convention: one entry per document start
+            # plus the total length.
+            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)
+            if max_seqlen is None:
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        elif (
+            past_key_values is None
+            and B == 1
+            and position_ids is not None
+        ):
+            _doc_starts = (position_ids[0] == 0).nonzero(as_tuple=False).flatten()
+            if _doc_starts.numel() > 1:
+                cu_seqlens = torch.cat(
+                    [
+                        _doc_starts.to(torch.int32),
+                        torch.tensor(
+                            [position_ids.shape[-1]],
+                            dtype=torch.int32,
+                            device=_doc_starts.device,
+                        ),
+                    ]
+                ).to(device=hidden_states.device, dtype=torch.int32)
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
         all_hidden_states = () if output_hidden_states else None
 
