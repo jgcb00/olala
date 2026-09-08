@@ -172,6 +172,7 @@ class OlalaConfig(PretrainedConfig):
         sliding_window_size=1024,
         slw_wsize=-1,
         complete_slw=False,
+        artificial_seq_len=0,
         rope_type="",
         rope_theta=0.,
         gdn_d_conv=4,
@@ -259,6 +260,11 @@ class OlalaConfig(PretrainedConfig):
         self.sliding_window_size = sliding_window_size
         self.slw_wsize = slw_wsize
         self.complete_slw = complete_slw
+        # Megatron's `--artificial-seq-len`: the mamba SSM state is reset every
+        # this many tokens (merged into cu_seqlens, see _pack_cu_seqlens).
+        # 0 = never. NOT the same thing as slw_wsize, which is the attention
+        # sliding window; the two happened to both be 32768 in the 65k run.
+        self.artificial_seq_len = artificial_seq_len
         self.max_position_embeddings = max_position_embeddings
 
         if num_key_value_heads is None:
