@@ -1,6 +1,13 @@
 *.pyc
 __pycache__/
-*.sh
 *.err
-*.out__pycache__/
-*.pyc
+*.out
+
+# Local launch/run scripts are not versioned, but the ones this repo ships are.
+*.sh
+!scripts/*.sh
+!install/*.example.sh
+!convert/convert.sh
+
+# Machine-specific; convert/.env.example is the versioned template.
+convert/.env
