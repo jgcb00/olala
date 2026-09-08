@@ -57,12 +57,12 @@ cp olala-fixes/install/selective_scan_cuda.py $SP/
 # save, so the on-disk shape never changes.
 CKPT=/data/home/gaetan.caillaut/dragon-sft/7A1B/training/checkpoints/65k-betterpacks-lrfix/huggingface/iter_0099518
 
-# apply every training fix (idempotent)
+# patch the third-party packages that still need it (idempotent).
+# vllm and mamba need nothing (fixed at their pinned refs) and neither
+# does the checkpoint (the converter ships olala-fixes' modeling).
 ./olala-fixes/scripts/apply_olala_training_fixes.sh \
   --python $OLALA_HOME/venv/bin/python \
-  --mamba $OLALA_HOME/mamba \
-  --scattermoe $OLALA_HOME/scattermoe \
-  --checkpoint $OLALA_HOME/patched_checkpoint
+  --scattermoe $OLALA_HOME/scattermoe
 ```
 
 Then copy `launch_Olala.example.sh`, set `OLALA_HOME` inside, provide the
