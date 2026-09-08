@@ -5,9 +5,10 @@ and those modules use relative imports (``from .configuration_olala import
 OlalaConfig``), so they cannot be loaded as flat top-level modules -- Python
 raises "attempted relative import with no known parent package".
 
-Importing the repo root as a package is also not automatic: the clone is
-normally called ``olala-fixes``, and a hyphen is not a legal module name, so
-``import olala`` would fail no matter what is on sys.path.
+Importing the repo root as a package is also not automatic. It works only if
+the checkout directory happens to be named exactly ``olala`` AND its parent is
+on sys.path -- rename the directory, clone it somewhere else, or run from a
+different cwd and ``import olala`` stops resolving.
 
 So bind the repo root to the name ``olala`` explicitly. This keeps ONE copy of
 the model code -- the repo root -- instead of the duplicate ``olala/`` tree the
@@ -42,7 +43,7 @@ def _bind(name: str = "olala") -> object:
     if not init.is_file():
         raise ImportError(
             f"{_REPO} is not an importable package (no __init__.py). "
-            "Point OLALA_PKG_DIR at the olala-fixes checkout."
+            "Point OLALA_PKG_DIR at the olala checkout."
         )
     for required in ("modeling_olala.py", "configuration_olala.py"):
         if not (_REPO / required).is_file():

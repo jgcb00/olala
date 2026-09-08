@@ -1,4 +1,4 @@
-# olala-fixes
+# olala
 
 Model code, checkpoint conversion, and the few third-party patches the Olala
 7A1B stack still needs.

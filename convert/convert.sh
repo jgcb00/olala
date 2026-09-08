@@ -20,11 +20,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 [ -f .env ] || { echo "ERROR: no .env here — start from .env.example:" >&2
                  echo "         cp .env.example .env   # then edit" >&2; exit 1; }
 
-# OLALA_FIXES_DIR must point at the repo root (the parent of this dir) so the
+# OLALA_DIR must point at the repo root (the parent of this dir) so the
 # container gets the model code. Default it rather than making people repeat it.
-if ! grep -q '^OLALA_FIXES_DIR=' .env; then
-    export OLALA_FIXES_DIR="$(cd .. && pwd)"
-    echo ">> OLALA_FIXES_DIR not in .env; using $OLALA_FIXES_DIR"
+if ! grep -q '^OLALA_DIR=' .env; then
+    export OLALA_DIR="$(cd .. && pwd)"
+    echo ">> OLALA_DIR not in .env; using $OLALA_DIR"
 fi
 
 direction=${1:-mg2hf}

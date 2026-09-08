@@ -684,7 +684,9 @@ def build_dragon_config(sd, params_dtype=torch.float32):
         use_geodesic_norm=getattr(sd['args'], 'use_geodesic_norm', False),
         normalize_embeddings=sd['args'].normalize_embeddings,
         normalize_lm_head=sd['args'].normalize_lm_head,
-        artificial_seq_len=sd['args'].artificial_seq_len,
+        # Absent on checkpoints trained after the flag was dropped from the
+        # training script; absent means no SSM state resets, i.e. 0.
+        artificial_seq_len=getattr(sd['args'], 'artificial_seq_len', 0),
     )
     return config_mg
 

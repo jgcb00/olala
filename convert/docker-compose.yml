@@ -35,7 +35,7 @@
 #   docker compose run --rm mg2hf
 #
 # Notes:
-#  - The model code is mounted from the olala-fixes checkout and bound to the
+#  - The model code is mounted from the olala checkout and bound to the
 #    package name `olala` by _olala_pkg.py, so the converter exports exactly the
 #    modeling_olala.py this repo ships. There is no second copy to drift.
 #  - MEGATRON_LM_DIR must point at a Megatron-LM checkout INSIDE the container;
@@ -61,8 +61,8 @@ x-convert-base: &convert-base
     OLALA_TOKENIZER_DIR: ${OLALA_TOKENIZER_DIR:-/data/home/gaetan.caillaut/dragon-sft/7A1B/tokenizers/tokenizer-channels-v3}
     OLALA_PKG_DIR: /work
   volumes:
-    # The olala-fixes checkout: model code (repo root) + this convert/ dir.
-    - ${OLALA_FIXES_DIR:?set OLALA_FIXES_DIR in .env}:/work
+    # The olala checkout: model code (repo root) + this convert/ dir.
+    - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
     # Megatron-LM + the tokenizers, at their host paths so the env defaults resolve.
     - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
 
@@ -78,7 +78,7 @@ services:
               device_ids: [ "${GPU:-0}" ]   # which host GPU, e.g. GPU=3
               capabilities: [ gpu ]
     volumes:
-      - ${OLALA_FIXES_DIR:?set OLALA_FIXES_DIR in .env}:/work
+      - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
       - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
       - ${LOAD_DIR:?set LOAD_DIR in .env}:${LOAD_DIR}:ro
       - ${SAVE_DIR:?set SAVE_DIR in .env}:${SAVE_DIR}
@@ -98,7 +98,7 @@ services:
     <<: *convert-base
     # No deploy.resources -> no GPU is attached to this container at all.
     volumes:
-      - ${OLALA_FIXES_DIR:?set OLALA_FIXES_DIR in .env}:/work
+      - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
       - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
       - ${LOAD_DIR:?set LOAD_DIR in .env}:${LOAD_DIR}:ro
       - ${SAVE_DIR:?set SAVE_DIR in .env}:${SAVE_DIR}
@@ -119,7 +119,7 @@ services:
   hf2mg:
     <<: *convert-base
     volumes:
-      - ${OLALA_FIXES_DIR:?set OLALA_FIXES_DIR in .env}:/work
+      - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
       - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
       - ${HF_DIR:?set HF_DIR in .env}:${HF_DIR}:ro
       - ${REF_MG_DIR:?set REF_MG_DIR in .env}:${REF_MG_DIR}:ro
