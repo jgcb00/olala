@@ -47,34 +47,35 @@ except ImportError:
     mamba_chunk_scan_combined = None
     RMSNormGated = None
 
-# Mamba-3 MIMO kernels, from state-spaces/mamba -- the same kernels Megatron-LM
-# training uses. Two properties matter at the call sites:
-#  - the chunk kernel takes RAW angles and applies the angle cumsum itself, so
-#    `angle_dt` stays None and must NOT be applied beforehand;
+# Mamba-3 MIMO chunk kernel, from state-spaces/mamba. A hard requirement, not
+# one option among several: this is the only chunk kernel, and it is the same
+# one Megatron-LM trains with. Two properties matter at the call sites:
+#  - it takes RAW angles and applies the angle cumsum itself, so nothing must
+#    pre-cumsum them;
 #  - it returns a bare tensor when return_state=False, so the wrapper below
 #    normalizes to the (y, state) tuple this file unpacks.
-_HAS_MAMBA3_CHUNK = False   # True once the chunk kernel imported
-angle_dt = None
 try:
     from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as _mamba3_mimo
+except ImportError as _e:  # fail here, not later inside forward()
+    raise ImportError(
+        "Olala needs the Mamba-3 MIMO chunk kernel from state-spaces/mamba "
+        f"(mamba_ssm.ops.tilelang.mamba3.mamba3_mimo): {_e}"
+    ) from _e
 
-    def mamba3_tilelang(*, return_state=False, **kwargs):
-        out = _mamba3_mimo(return_state=return_state, **kwargs)
-        if not return_state:
-            return out, None
-        # mamba3_mimo returns a FLAT 5-tuple
-        # (Out, Final_Angle, Final_SSM_State, Final_K, Final_V), but this
-        # file unpacks `y, kernel_state` and then splits kernel_state into
-        # four states. Returning `out` unchanged raised
-        # "too many values to unpack (expected 2)" on every prefill that
-        # passed a cache -- i.e. the whole cached path was dead.
-        y, *state = out
-        return y, tuple(state)
 
-    _HAS_MAMBA3_CHUNK = True
-except ImportError as _e:
-    mamba3_tilelang = None
-    print(f"mamba3: no chunk kernel ({_e}) -- the model cannot run")
+def mamba3_tilelang(*, return_state=False, **kwargs):
+    out = _mamba3_mimo(return_state=return_state, **kwargs)
+    if not return_state:
+        return out, None
+    # mamba3_mimo returns a FLAT 5-tuple
+    # (Out, Final_Angle, Final_SSM_State, Final_K, Final_V), but this file
+    # unpacks `y, kernel_state` and then splits kernel_state into four states.
+    # Returning `out` unchanged raised "too many values to unpack (expected 2)"
+    # on every prefill that passed a cache -- i.e. the whole cached path was
+    # dead.
+    y, *state = out
+    return y, tuple(state)
+
 
 # Decode kernels. Kept in their own try so a missing CuteDSL only disables
 # cached decode instead of the whole model.
@@ -2221,8 +2222,6 @@ class OlalaMamba3MimoFast(nn.Module):
         # Outputs match the dense path to bf16 noise (rel <= 2.1e-04, measured
         # at S = 1024 / 1152 / 2048).
         #
-        # Gated on `_HAS_MAMBA3_CHUNK`: no kernel, no varlen path.
-        #
         # The varlen helpers (angle_dt_fwd, dacs/segsum) assert B == 1,
         # so a real batch is PACKED into one row: (b, l, ...) -> (1, b*l, ...)
         # with cu_seqlens = [0, l, 2l, ..., b*l]. That IS the dense semantics --
@@ -2240,8 +2239,7 @@ class OlalaMamba3MimoFast(nn.Module):
         # NB: read the batch off x, not `batch` -- complete_slw reshapes the
         # rows into windows above and leaves `batch` stale.
         kb, kl = x.shape[0], x.shape[1]
-        _use_varlen = (_HAS_MAMBA3_CHUNK
-                       and os.environ.get("OLALA_MAMBA3_VARLEN", "1") != "0")
+        _use_varlen = os.environ.get("OLALA_MAMBA3_VARLEN", "1") != "0"
         _varlen_kw = {}
         if _use_varlen:
             # When the model packed the batch, cu_seqlens already carries the
