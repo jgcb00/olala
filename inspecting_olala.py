@@ -8,8 +8,8 @@ from functools import partial
 from collections import defaultdict
 import tyro
 
-from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM
+from .configuration_olala import OlalaConfig
+from .modeling_olala import OlalaForCausalLM
 
 @dataclass
 class NanoArgs:
@@ -21,7 +21,7 @@ class NanoArgs:
     n_heads : int = 6 # head dim 128 suggested by @Grad62304977
     head_dim: Optional[int] = None
     layers_config : str = 4*"lrdlr"
-    expand_factor : int = 2 # expand factor for Mamba/Dragon
+    expand_factor : int = 2 # expand factor for Mamba/Olala
     rope_type_local: str = "" #p-rope
     rope_type_global: str = "" #p-rope
     rope_theta_local: float = 10000.0
@@ -135,7 +135,7 @@ class NanoArgs:
 args = tyro.cli(NanoArgs)
 
 # load model.
-config_hf = DragonConfig(
+config_hf = OlalaConfig(
     final_norm=args.final_norm,
     mla_kv_rank=args.mla_kv_rank,
     rope_gdn=args.rope_gdn,
@@ -203,7 +203,7 @@ config_hf = DragonConfig(
     mlp_linking=args.mlp_linking
 )
 
-model = DragonForCausalLM(config_hf)
+model = OlalaForCausalLM(config_hf)
 model = model.cuda()
 
 B, L = 2, 2048

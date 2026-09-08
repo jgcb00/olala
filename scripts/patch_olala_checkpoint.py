@@ -4,7 +4,7 @@
     python scripts/patch_olala_checkpoint.py SRC_CKPT DST_CKPT
     MODEL_PATH=DST_CKPT ./launch_Olala.sh
 
-``DragonGeodesicNorm`` declares its two learnables as 0-dim tensors::
+``OlalaGeodesicNorm`` declares its two learnables as 0-dim tensors::
 
     self.scale = nn.Parameter(torch.tensor(1.))
     self.bias  = nn.Parameter(torch.tensor(0.))
@@ -12,7 +12,7 @@
 and both FSDP1 and FSDP2 refuse those outright — ``fully_shard doesn't support scalar
 parameters`` — for all 144 of them (2 params x 2 modules x 36 layers). It is not a
 strategy choice: verl's fsdp/fsdp2 paths and veomni's ``torch_parallelize`` all end up in
-the same ``_verify_managed_param``, and veomni additionally has no Dragon modeling at all.
+the same ``_verify_managed_param``, and veomni additionally has no Olala modeling at all.
 So the parameters have to become 1-D, which is numerically identical — the only use is
 ``theta * scale + bias`` where ``theta`` is ``[..., 1]``, so ``[1]`` broadcasts the same.
 
@@ -30,12 +30,12 @@ Everything else is symlinked, so this costs ~13 GB, not a full copy. The 72
 parameters.
 
 Also needed, separately: the same two-line widening in the vLLM port
-(``vllm/model_executor/models/dragon.py``), applied by scripts/apply_olala_training_fixes.sh
+(``vllm/model_executor/models/olala.py``), applied by scripts/apply_olala_training_fixes.sh
 (fix 2) — already merged at source in jgcb00/vllm dragon-v0.26 (pin 8a124b6b0). Without
 it the first weight sync dies — a 0-dim param cannot receive a ``[1]`` tensor
 (``output with shape [] doesn't match the broadcast shape [1]``).
 
-The real fix is upstream: the same change in Dragon's own HF code and vLLM port, plus a
+The real fix is upstream: the same change in Olala's own HF code and vLLM port, plus a
 re-export. Then no patched copy is needed on any machine.
 """
 
@@ -59,12 +59,12 @@ def patch_modeling(src: Path, dst: Path) -> None:
     text = src.read_text()
     old, new = PATCH
     if text.count(new):
-        print("  modeling_dragon.py: already 1-D")
+        print("  modeling_olala.py: already 1-D")
     n = text.count(old)
     if n != 1 and not text.count(new):
         sys.exit(f"expected exactly 1 occurrence of the 0-dim declaration in {src}, found {n}")
     dst.write_text(text.replace(old, new))
-    print(f"  modeling_dragon.py: patched -> {dst}")
+    print(f"  modeling_olala.py: patched -> {dst}")
 
 
 def reshape_weights(src: Path, dst: Path) -> int:
@@ -105,7 +105,7 @@ def main() -> None:
     args = ap.parse_args()
 
     src, dst = args.src.resolve(), args.dst.resolve()
-    for name in ("config.json", "modeling_dragon.py", "model.safetensors"):
+    for name in ("config.json", "modeling_olala.py", "model.safetensors"):
         if not (src / name).exists():
             sys.exit(f"not an olala checkpoint: {src} has no {name}")
     if dst == src:
@@ -121,8 +121,8 @@ def main() -> None:
             link.unlink()
         os.symlink(entry, link)
 
-    (dst / "modeling_dragon.py").unlink()
-    patch_modeling(src / "modeling_dragon.py", dst / "modeling_dragon.py")
+    (dst / "modeling_olala.py").unlink()
+    patch_modeling(src / "modeling_olala.py", dst / "modeling_olala.py")
 
     (dst / "model.safetensors").unlink()
     reshape_weights(src / "model.safetensors", dst / "model.safetensors")

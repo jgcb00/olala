@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# apply_olala_training_fixes.sh — apply every fix from the Olala/Dragon verl
+# apply_olala_training_fixes.sh — apply every fix from the Olala verl
 # training investigation to an EXISTING environment, idempotently.
 #
 # Fixes applied (each skipped cleanly if already present):
-#   1. vllm  dragon/mamba3.py : refresh weight caches IN PLACE instead of
+#   1. vllm  olala/mamba3.py : refresh weight caches IN PLACE instead of
 #      dropping them (fixes the FULL-cudagraph illegal-memory-access on
 #      verl weight syncs). Applied ungated — no env var needed.
-#   2. vllm  models/dragon.py : widen DragonGeodesicNorm scale/bias 0-dim -> [1]
+#   2. vllm  models/olala.py : widen OlalaGeodesicNorm scale/bias 0-dim -> [1]
 #      (FSDP weight-sync shape compatibility).
 #   3. mamba mamba3_mimo.py + mamba3_siso_combined.py : access
 #      ctx.saved_tensors exactly once in backward (gradient checkpointing).
 #   4. scattermoe parallel_experts.py : per-module dtype cast of inputs/gates
 #      to the expert weight dtype (FSDP bf16 mixed precision).
-#   5. checkpoint modeling_dragon.py : public mamba_ssm kernel fallback,
+#   5. checkpoint modeling_olala.py : public mamba_ssm kernel fallback,
 #      angle_dt guard, and packed-batch (varlen) cu_seqlens support.
 #   6. verl transfer_queue simple_storage.py : don't let one malformed ZMQ
 #      frame kill a storage worker thread permanently. (optional hardening)
@@ -49,10 +49,18 @@ from pathlib import Path
 
 results = []
 
-def patch(name, path, fn):
+def patch(name, path, fn, required=False):
+    """required=True: a missing target is a FAIL, not a SKIP.
+
+    Use it wherever the file MUST be there once its package is installed. A
+    silent SKIP there means a rename upstream quietly disables the fix while
+    the applier still exits 0 -- exactly how the dragon->olala rename turned
+    off both vllm fixes unnoticed.
+    """
     p = Path(path) if path else None
     if not p or not p.exists():
-        results.append((name, "SKIP", f"not found: {path or '(no path given)'}"))
+        status = "FAIL" if required else "SKIP"
+        results.append((name, status, f"not found: {path or '(no path given)'}"))
         return
     text = p.read_text()
     status, new = fn(text)
@@ -80,7 +88,7 @@ def pkg_dir(mod):
 # ---------------------------------------------------------------- fix 1
 CACHE_REFRESH = '''\
         # OLALA fix: refresh the snapshots IN PLACE. FULL-mode CUDA graphs
-        # capture _decode (inside the dragon_mamba3 op) and bake the snapshot
+        # capture _decode (inside the olala_mamba3 op) and bake the snapshot
         # tensors' device addresses into every captured decode graph; dropping
         # the cache frees memory those graphs still read -> illegal memory
         # access after RL weight syncs. Rewriting the same storage keeps the
@@ -254,7 +262,7 @@ CU_SEQLENS = '''\
 
 def fix_ckpt_modeling(text):
     # (f-relocate) an earlier applier could anchor the dtype pin into
-    # DragonMonoBlock.__init__ instead of forward(): on pruning-support
+    # OlalaMonoBlock.__init__ instead of forward(): on pruning-support
     # checkpoints the "Skip-mixer support" comment exists in BOTH, and the
     # single-occurrence replace hit __init__ first. There autocast is always
     # off, so the pin is dead code — and forward stays unpinned (FSDP2
@@ -360,10 +368,18 @@ def fix_ckpt_modeling(text):
     # Coexists with any earlier pad-only fix (which becomes a dead branch on
     # the public-kernel path and keeps covering the private-kernel path).
     if "_mamba3_flat_batch" not in text:
-        anchor = ("                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
-                  "                    device=hidden_states.device, dtype=torch.int32\n"
-                  "                )\n")
-        if anchor not in text:
+        # Anchor on the .to(...) block that the varlen step above inserts. It
+        # emits the closing paren on the SAME line; a modeling that already
+        # carried an earlier hand-applied varlen fix has it on its own line.
+        # Accept both, or this step FAILs on every freshly exported modeling
+        # (which is what forced the modeling-swap workaround in the installer).
+        anchor_2line = ("                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
+                        "                    device=hidden_states.device, dtype=torch.int32)\n")
+        anchor_3line = ("                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(\n"
+                        "                    device=hidden_states.device, dtype=torch.int32\n"
+                        "                )\n")
+        anchor = next((a for a in (anchor_2line, anchor_3line) if a in text), None)
+        if anchor is None:
             return "FAIL: flatten insertion anchor not found", None
         flat_block = (
             "\n"
@@ -406,7 +422,14 @@ def fix_ckpt_modeling(text):
     # cu_seqlens once at model level and hand it down; every attention path
     # switches to flash_attn_varlen when it is set. Single-document rows
     # keep cu_seqlens=None, so the unpacked path is untouched.
-    if "packed-batch (varlen) document masking" not in text:
+    # Upstream implemented this natively from iter_0099518 on: every attention
+    # path now derives `_varlen_attn = intra_doc_masking or kwargs["unpadded"]`
+    # and switches to flash_attn_varlen_func(cu_seqlens=...) under fa2/fa3. The
+    # `_varlen_attn` probe detects that and leaves the file alone -- without it
+    # this step FAILs on a modern export, because the `if not
+    # self.config.intra_doc_masking:` shape it patches no longer exists.
+    if ("packed-batch (varlen) document masking" not in text
+            and "_varlen_attn" not in text):
         c1 = "            if not self.config.intra_doc_masking:"
         c2 = "            if not self.config.intra_doc_masking and not self.config.complete_slw:"
         c3 = "            assert not self.config.intra_doc_masking\n"
@@ -557,9 +580,11 @@ scatter = os.environ.get("OLALA_FIX_SCATTER") or None
 ckpt = os.environ.get("OLALA_FIX_CKPT") or None
 
 patch("vllm cudagraph weight-cache refresh",
-      vllm_dir and vllm_dir / "model_executor/layers/mamba/dragon/mamba3.py", fix_vllm_cache)
+      vllm_dir and vllm_dir / "model_executor/layers/mamba/olala/mamba3.py", fix_vllm_cache,
+      required=True)
 patch("vllm GeodesicNorm 0-dim -> [1]",
-      vllm_dir and vllm_dir / "model_executor/models/dragon.py", fix_vllm_widen)
+      vllm_dir and vllm_dir / "model_executor/models/olala.py", fix_vllm_widen,
+      required=True)
 patch("mamba saved_tensors (mimo)",
       mamba and Path(mamba) / "mamba_ssm/ops/tilelang/mamba3/mamba3_mimo.py", fix_saved_tensors)
 patch("mamba saved_tensors (siso)",
@@ -569,7 +594,8 @@ patch("scattermoe dtype cast",
 patch("scattermoe backward grad cast",
       scatter and Path(scatter) / "scattermoe/parallel_experts.py", fix_scattermoe_bwd)
 patch("checkpoint modeling varlen + fallback",
-      ckpt and Path(ckpt) / "modeling_dragon.py", fix_ckpt_modeling)
+      ckpt and Path(ckpt) / "modeling_olala.py", fix_ckpt_modeling,
+      required=bool(ckpt))
 patch("verl transfer_queue hardening",
       tq_dir and tq_dir / "storage/simple_storage.py", fix_transfer_queue)
 patch("verl transfer_queue controller hardening",

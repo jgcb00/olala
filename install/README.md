@@ -1,4 +1,4 @@
-# From-scratch install of the Olala/Dragon-7A1B verl training environment
+# From-scratch install of the Olala 7A1B verl training environment
 
 Validated end-to-end on 2026-08-26 (hippo, CUDA 12.9, Python 3.12.3):
 fresh env in `/data/home/j-g.barthelemy/olala`, 1-GPU and 2-GPU GRPO smoke runs.
@@ -13,7 +13,7 @@ Files here:
   not re-resolvable — numpy 2.4.6 vs mistral-common's `<2.4` pin).
 - `selective_scan_cuda.py` — import-only stub to drop into `site-packages`.
   The real extension targets the torch 2.9 ABI and fails to import under
-  torch 2.11; Dragon never calls selective scan, so an import stub that
+  torch 2.11; Olala never calls selective scan, so an import stub that
   raises on actual use is correct.
 - `launch_Olala.example.sh` — validated verl GRPO launcher (GSM8K). Adapt
   `OLALA_HOME` and the data/reward paths.
@@ -37,7 +37,7 @@ uv pip sync --python venv/bin/python olala-fixes/install/requirements.txt \
   --extra-index-url https://download.pytorch.org/whl/cu128 \
   --extra-index-url https://flashinfer.ai/whl/cu128
 
-# vllm fork, precompiled binaries (the Dragon port is Python-only).
+# vllm fork, precompiled binaries (the Olala port is Python-only).
 # VLLM_VERSION_OVERRIDE is REQUIRED: without upstream tags setuptools-scm
 # stamps 0.1.dev..., and verl refuses vllm < 0.18.0 at import time.
 VLLM_USE_PRECOMPILED=1 \

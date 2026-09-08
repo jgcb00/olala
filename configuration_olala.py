@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Dragon model configuration"""
+"""Olala model configuration"""
 # TODO : TP (cf qwen)
 # TODO : init
 
@@ -11,16 +11,16 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-class DragonConfig(PretrainedConfig):
+class OlalaConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`DragonModel`]. It is used to instantiate a
-    Dragon model according to the specified arguments, defining the model architecture.
+    This is the configuration class to store the configuration of a [`OlalaModel`]. It is used to instantiate a
+    Olala model according to the specified arguments, defining the model architecture.
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
     Args:
         vocab_size (`int`, *optional*, defaults to 151936):
-            Vocabulary size of the Dragon model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`DragonModel`]
+            Vocabulary size of the Olala model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`OlalaModel`]
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the model's input and output word embeddings should be tied. Note that this is only relevant if the
             model has a output word embedding layer.
@@ -87,7 +87,7 @@ class DragonConfig(PretrainedConfig):
             Floor value for time step initialization in Mamba.
     """
 
-    model_type = "dragon"
+    model_type = "olala"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -288,9 +288,9 @@ class DragonConfig(PretrainedConfig):
         )
         # TODO: better way to handle those?
         self.auto_map = dict(getattr(self, "auto_map", {}))
-        self.auto_map.setdefault("AutoConfig", "configuration_dragon.DragonConfig")
-        self.auto_map.setdefault("AutoModel", "modeling_dragon.DragonModel")
-        self.auto_map.setdefault("AutoModelForCausalLM", "modeling_dragon.DragonForCausalLM")
+        self.auto_map.setdefault("AutoConfig", "configuration_olala.OlalaConfig")
+        self.auto_map.setdefault("AutoModel", "modeling_olala.OlalaModel")
+        self.auto_map.setdefault("AutoModelForCausalLM", "modeling_olala.OlalaForCausalLM")
 
-DragonConfig.register_for_auto_class("AutoConfig")
-__all__ = ["DragonConfig"]
+OlalaConfig.register_for_auto_class("AutoConfig")
+__all__ = ["OlalaConfig"]

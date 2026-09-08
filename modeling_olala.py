@@ -1,5 +1,5 @@
 # coding=utf-8
-"""PyTorch Dragon model."""
+"""PyTorch Olala model."""
 
 from typing import Any, Dict, Optional, Tuple, Union, List, Literal
 from dataclasses import dataclass
@@ -83,7 +83,7 @@ try:
 except ImportError:
     pass
 
-from .configuration_dragon import DragonConfig
+from .configuration_olala import OlalaConfig
 
 try:
     from fla.modules import FusedRMSNormGated
@@ -144,7 +144,7 @@ logger.info(f"Using Gated DeltaNet implementation: {'fla' if chunk_gated_delta_r
 logger.info(f"Using short convolution implementation: {'causal-conv1d' if causal_conv1d_fn is not None else 'torch'}")
 
 # Parameter-free placeholders used for pruned/skipped MoE blocks.  When
-# config.skip_moe_layers includes a layer's index, DragonMonoBlock installs
+# config.skip_moe_layers includes a layer's index, OlalaMonoBlock installs
 # these so the MLP phase becomes a no-op (residual passes through unchanged).
 # The analogous skip_mixer_layers config skips the *mixer* phase (Mamba/Attn)
 # entirely — the residual passes through unchanged on that phase.
@@ -159,13 +159,13 @@ class _NullGeodesic(nn.Module):
 
 
 class _NullMixer(nn.Module):
-    """Stand-in for a DragonMonoBlock mixer when the layer is in
+    """Stand-in for a OlalaMonoBlock mixer when the layer is in
     ``config.skip_mixer_layers``. Returns (zeros_like_input, None, None)."""
     def forward(self, hidden_states, **kwargs):
         return torch.zeros_like(hidden_states), None, None
 
 
-class DragonHeadWiseRMSNorm(nn.Module):
+class OlalaHeadWiseRMSNorm(nn.Module):
     def __init__(self, n_heads, d_head, eps=1e-6, zero_centered_gamma=False):
         super().__init__()
         self.rms = nn.RMSNorm(d_head, eps=eps, elementwise_affine=False)
@@ -177,18 +177,18 @@ class DragonHeadWiseRMSNorm(nn.Module):
         y = self.rms(hidden_states) * (1.0 + self.weight.view(1, 1, H, D)) if self.zero_centered_gamma else self.rms(hidden_states) * self.weight.view(1, 1, H, D)
         return y.view(B, L, H, D)
 
-class DragonNorm(nn.Module):
-    def __init__(self, config: DragonConfig, hidden_size: int):
+class OlalaNorm(nn.Module):
+    def __init__(self, config: OlalaConfig, hidden_size: int):
         super().__init__()
         if config.normalization_type == "rmsnorm":
-            self.norm = DragonRMSNorm(hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+            self.norm = OlalaRMSNorm(hidden_size, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
         else:
             raise ValueError(f"Unknown normalization_type: {config.normalization_type}")
 
     def forward(self, hidden_states):
         return self.norm(hidden_states)
 
-class DragonRMSNorm(nn.Module):
+class OlalaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, zero_centered_gamma=False):
         super().__init__()
         self.rms = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
@@ -199,13 +199,13 @@ class DragonRMSNorm(nn.Module):
         y = self.rms(hidden_states) * (1.0 + self.weight) if self.zero_centered_gamma else self.rms(hidden_states) * self.weight
         return y
 
-class DragonLinear(nn.Linear):
-    def __init__(self, config: DragonConfig, in_features, out_features, bias=False, cosnet=True, **kwargs):
+class OlalaLinear(nn.Linear):
+    def __init__(self, config: OlalaConfig, in_features, out_features, bias=False, cosnet=True, **kwargs):
         super().__init__(in_features, out_features, bias, **kwargs)
         self.config = config
 
         if self.config.cosnet and cosnet:
-            self.cosnet_branch = DragonCosNetBranch(
+            self.cosnet_branch = OlalaCosNetBranch(
                 in_features=in_features,
                 out_features=out_features,
                 rank=config.cosnet_rank,
@@ -217,7 +217,7 @@ class DragonLinear(nn.Linear):
             out = out + self.cosnet_branch(x)
         return out
 
-class DragonCosNetBranch(nn.Module):
+class OlalaCosNetBranch(nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -250,7 +250,7 @@ class DragonCosNetBranch(nn.Module):
         h = torch.cos(h * self.omega2 + self.phi2)
         return self.up(h)
 
-class HybridDragonDynamicCache(DynamicCache):
+class HybridOlalaDynamicCache(DynamicCache):
     """
     A dynamic cache that handle both the attention cache (which has a seq_len dimension) and the GDN cache
     (which has a constant shape regardless of seq_len).
@@ -261,7 +261,7 @@ class HybridDragonDynamicCache(DynamicCache):
     while `conv_states` represents the convolution state and has a shape of `(batch_size, d_inner, d_conv)`,
     and `ssm_states` represents the ssm state and has a shape of `(batch_size, d_inner, d_state)`.
     """
-    def __init__(self, config: DragonConfig):
+    def __init__(self, config: OlalaConfig):
         super().__init__()
         self.config = config
         # If layer_idx_map is set (pruned-block variant), blocks may index
@@ -385,14 +385,14 @@ class HybridDragonDynamicCache(DynamicCache):
         return self.past_length[layer_idx]
 
     def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
-        raise NotImplementedError("HybridDragonDynamicCache does not have a legacy cache equivalent.")
+        raise NotImplementedError("HybridOlalaDynamicCache does not have a legacy cache equivalent.")
 
     @classmethod
     def from_legacy_cache(cls, cache_params: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
-        raise NotImplementedError("HybridDragonDynamicCache does not have a legacy cache equivalent.")
+        raise NotImplementedError("HybridOlalaDynamicCache does not have a legacy cache equivalent.")
 
-class DragonRotaryEmbedding(torch.nn.Module):
-    def __init__(self, config: DragonConfig, head_dim: int, theta: float):
+class OlalaRotaryEmbedding(torch.nn.Module):
+    def __init__(self, config: OlalaConfig, head_dim: int, theta: float):
         super().__init__()
         self.config = config
 
@@ -546,14 +546,14 @@ def get_query_key_value_tensors(module: nn.Module, hidden_states: torch.Tensor):
 
     return query, key, value
 
-class DragonAttention(nn.Module):
+class OlalaAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper.
     Modified to use sliding window attention: Longformer and "Generating Long Sequences with Sparse Transformers".
     Doesn't include output projection: output is (B, L, H, D).
     """
 
-    def __init__(self, config: DragonConfig, reuse_kv: bool, layer_idx: Optional[int], **kwargs):
+    def __init__(self, config: OlalaConfig, reuse_kv: bool, layer_idx: Optional[int], **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -572,12 +572,12 @@ class DragonAttention(nn.Module):
         self.reuse_kv = reuse_kv
 
         projection_dim = self.head_dim * (self.num_attention_heads + 2 * (0 if reuse_kv else self.num_key_value_heads))
-        self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
+        self.linear_qkv = OlalaLinear(config, config.hidden_size, projection_dim, bias=False)
 
         if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_dim)
+            self.q_norm = OlalaNorm(config, self.head_dim)
             if not reuse_kv:
-                self.k_norm = DragonNorm(config, self.head_dim)
+                self.k_norm = OlalaNorm(config, self.head_dim)
 
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
@@ -604,7 +604,7 @@ class DragonAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cache_params: Optional[HybridOlalaDynamicCache] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
@@ -689,14 +689,14 @@ class DragonAttention(nn.Module):
 
         return attn_output, last_key_states, last_value_states
 
-class DragonTensorProductAttention(nn.Module):
+class OlalaTensorProductAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper.
     Modified to use sliding window attention: Longformer and "Generating Long Sequences with Sparse Transformers".
     Doesn't include output projection: output is (B, L, H, D).
     """
 
-    def __init__(self, config: DragonConfig, reuse_kv: bool, layer_idx: Optional[int], **kwargs):
+    def __init__(self, config: OlalaConfig, reuse_kv: bool, layer_idx: Optional[int], **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -714,15 +714,15 @@ class DragonTensorProductAttention(nn.Module):
         self.window_size = config.sliding_window_size
         self.reuse_kv = reuse_kv
 
-        self.c_q = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.head_dim, bias=False)
-        self.W_A_k = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.rank, bias=False)
-        self.W_A_v = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.rank, bias=False)
-        self.W_B_k = DragonLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
-        self.W_B_v = DragonLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
+        self.c_q = OlalaLinear(config, self.hidden_size, self.num_attention_heads * self.head_dim, bias=False)
+        self.W_A_k = OlalaLinear(config, self.hidden_size, self.num_attention_heads * self.rank, bias=False)
+        self.W_A_v = OlalaLinear(config, self.hidden_size, self.num_attention_heads * self.rank, bias=False)
+        self.W_B_k = OlalaLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
+        self.W_B_v = OlalaLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
 
         if self.config.token_shift_attn:
-            self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
-            self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
+            self.shift_proj_k = OlalaLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
+            self.shift_proj_v = OlalaLinear(config, self.hidden_size, self.num_attention_heads, bias=False)
             if self.config.scalar_proj_as_hidden_matrix:
                 self.shift_proj_k.is_scalar_weight = True
                 self.shift_proj_v.is_scalar_weight = True
@@ -735,9 +735,9 @@ class DragonTensorProductAttention(nn.Module):
             self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
 
         if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_dim)
+            self.q_norm = OlalaNorm(config, self.head_dim)
             if not reuse_kv:
-                self.k_norm = DragonNorm(config, self.head_dim)
+                self.k_norm = OlalaNorm(config, self.head_dim)
 
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
@@ -764,7 +764,7 @@ class DragonTensorProductAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cache_params: Optional[HybridOlalaDynamicCache] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
@@ -909,12 +909,12 @@ class DragonTensorProductAttention(nn.Module):
 
         return attn_output, last_key_states, last_value_states
 
-class DragonDifferentialAttentionV2(nn.Module):
+class OlalaDifferentialAttentionV2(nn.Module):
     """
     https://spiky-homegrown-4cb.notion.site/Differential-Transformer-V2-2e7baa052def80ecaa93d4d67d125417
     """
 
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], **kwargs):
+    def __init__(self, config: OlalaConfig, layer_idx: Optional[int], **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -944,16 +944,16 @@ class DragonDifferentialAttentionV2(nn.Module):
         #assert self.num_noise_heads % self.gqa == 0, "GQA factor must divide number of noise heads."
 
         projection_dim = self.head_dim * self.num_attention_heads + 2 * self.head_dim * self.num_key_value_heads
-        self.linear_qkv = DragonLinear(config, config.hidden_size, projection_dim, bias=False)
+        self.linear_qkv = OlalaLinear(config, config.hidden_size, projection_dim, bias=False)
 
         if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_dim)
-            self.k_norm = DragonNorm(config, self.head_dim)
+            self.q_norm = OlalaNorm(config, self.head_dim)
+            self.k_norm = OlalaNorm(config, self.head_dim)
 
         if self.scalable_softmax:
             self.softmax_scaler = nn.Parameter(torch.ones(self.num_attention_heads, dtype=torch.float32))
 
-        self.lambda_proj = DragonLinear(config, config.hidden_size, self.num_noise_heads, bias=False)
+        self.lambda_proj = OlalaLinear(config, config.hidden_size, self.num_noise_heads, bias=False)
 
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
@@ -979,7 +979,7 @@ class DragonDifferentialAttentionV2(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cache_params: Optional[HybridOlalaDynamicCache] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         **kwargs,
@@ -1103,12 +1103,12 @@ class DragonDifferentialAttentionV2(nn.Module):
 
         return attn_output, None, None
 
-class DragonDifferentialTensorProductAttentionV2(nn.Module):
+class OlalaDifferentialTensorProductAttentionV2(nn.Module):
     """
     differential attention V2 + TPA
     """
 
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
+    def __init__(self, config: OlalaConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -1132,18 +1132,18 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
         self.snr = self.num_signal_heads // self.num_noise_heads
         self.num_key_value_heads = self.num_noise_heads
 
-        self.c_q = DragonLinear(config, self.hidden_size, self.num_attention_heads * self.head_dim, bias=False)
-        self.W_A_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads * self.rank, bias=False)
-        self.W_A_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads * self.rank, bias=False)
-        self.W_B_k = DragonLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
-        self.W_B_v = DragonLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
+        self.c_q = OlalaLinear(config, self.hidden_size, self.num_attention_heads * self.head_dim, bias=False)
+        self.W_A_k = OlalaLinear(config, self.hidden_size, self.num_key_value_heads * self.rank, bias=False)
+        self.W_A_v = OlalaLinear(config, self.hidden_size, self.num_key_value_heads * self.rank, bias=False)
+        self.W_B_k = OlalaLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
+        self.W_B_v = OlalaLinear(config, self.hidden_size, self.rank * self.head_dim, bias=False)
 
         if use_ve:
             self.ve_scalars = nn.Parameter(torch.zeros(self.num_noise_heads, self.head_dim, dtype=torch.float32))
 
         if self.config.token_shift_attn:
-            self.shift_proj_k = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
-            self.shift_proj_v = DragonLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
+            self.shift_proj_k = OlalaLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
+            self.shift_proj_v = OlalaLinear(config, self.hidden_size, self.num_key_value_heads, bias=False)
             if self.config.scalar_proj_as_hidden_matrix:    
                 self.shift_proj_k.is_scalar_weight = True
                 self.shift_proj_v.is_scalar_weight = True
@@ -1156,13 +1156,13 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
 
         if self.qk_norm:
-            self.q_norm = DragonNorm(config, self.head_dim)
-            self.k_norm = DragonNorm(config, self.head_dim)
+            self.q_norm = OlalaNorm(config, self.head_dim)
+            self.k_norm = OlalaNorm(config, self.head_dim)
 
         if self.scalable_softmax:
             self.softmax_scaler = nn.Parameter(torch.ones(self.num_attention_heads, dtype=torch.float32))
 
-        self.lambda_proj = DragonLinear(config, config.hidden_size, self.num_noise_heads, bias=False)
+        self.lambda_proj = OlalaLinear(config, config.hidden_size, self.num_noise_heads, bias=False)
 
         if ATTN_IMPL == "flex":
             # score mod (for softcap)
@@ -1185,7 +1185,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
             self.last_wsize = self.build_mask(self.config.slw_wsize)
 
         if self.config.rope_theta > 0.0 and self.config.rope_type != "":
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=self.head_dim, theta=config.rope_theta)
+            self.rotary_emb = OlalaRotaryEmbedding(config, head_dim=self.head_dim, theta=config.rope_theta)
         else:
             self.rotary_emb = None
 
@@ -1193,7 +1193,7 @@ class DragonDifferentialTensorProductAttentionV2(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cache_params: Optional[HybridOlalaDynamicCache] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         ve=None,
@@ -1566,8 +1566,8 @@ def get_qkv_tensors_gdn(module: nn.Module, hidden_states: torch.Tensor):
 def prepare_sequence_ids_no_compile(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return prepare_sequence_ids(cu_seqlens)
 
-class DragonGatedDeltaNet(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
+class OlalaGatedDeltaNet(nn.Module):
+    def __init__(self, config: OlalaConfig, layer_idx: Optional[int], use_ve: bool = False, **kwargs):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -1593,7 +1593,7 @@ class DragonGatedDeltaNet(nn.Module):
         self.key_dim_local = self.n_heads_local * self.dk
         self.value_dim_local = self.n_heads_local * self.dv
 
-        self.in_proj = DragonLinear(
+        self.in_proj = OlalaLinear(
             config,
             config.hidden_size,
             self.num_attention_heads*self.dk + self.n_kv_heads*self.dk + 2*self.n_kv_heads*self.dv+2*self.num_attention_heads,
@@ -1631,8 +1631,8 @@ class DragonGatedDeltaNet(nn.Module):
             self.qkv_conv1d = nn.Conv1d(in_channels=self.conv_dim, out_channels=self.conv_dim, bias=False, kernel_size=self.conv_size, groups=self.conv_dim, padding=self.conv_size-1)
 
         if self.config.token_shift_gdn:
-            self.shift_proj_k = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
-            self.shift_proj_v = DragonLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
+            self.shift_proj_k = OlalaLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
+            self.shift_proj_v = OlalaLinear(config, self.config.hidden_size, self.n_kv_heads, bias=False)
             if self.config.scalar_proj_as_hidden_matrix:
                 self.shift_proj_k.is_scalar_weight = True
                 self.shift_proj_v.is_scalar_weight = True
@@ -1645,7 +1645,7 @@ class DragonGatedDeltaNet(nn.Module):
     def forward(self,
                 hidden_states: torch.Tensor,
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] = None,
-                cache_params: Optional[HybridDragonDynamicCache] = None,
+                cache_params: Optional[HybridOlalaDynamicCache] = None,
                 cu_seqlens: Optional[torch.Tensor] = None,
                 ve=None,
                 **kwargs,
@@ -1777,8 +1777,8 @@ class DragonGatedDeltaNet(nn.Module):
 
         return o, None, None
 
-class DragonMamba2(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: Optional[int]):
+class OlalaMamba2(nn.Module):
+    def __init__(self, config: OlalaConfig, layer_idx: Optional[int]):
         super().__init__()
         self.config = config
         self.d_model = config.hidden_size
@@ -1793,7 +1793,7 @@ class DragonMamba2(nn.Module):
 
         # Order: [x, B, C, dt]
         d_in_proj = self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
-        self.in_proj = DragonLinear(config, self.d_model, d_in_proj, bias=False)
+        self.in_proj = OlalaLinear(config, self.d_model, d_in_proj, bias=False)
 
         if not self.config.mamba3_remove_conv:
             conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
@@ -1832,7 +1832,7 @@ class DragonMamba2(nn.Module):
         self.D._no_weight_decay = True
 
         if config.legacy_gate:
-            self.linear_g = DragonLinear(
+            self.linear_g = OlalaLinear(
                 config, config.hidden_size,
                 self.d_inner,
                 bias=False,
@@ -1893,8 +1893,8 @@ class DragonMamba2(nn.Module):
 
         return y, None, None
 
-class DragonMamba3MimoFast(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: int, use_ve: bool = False):
+class OlalaMamba3MimoFast(nn.Module):
+    def __init__(self, config: OlalaConfig, layer_idx: int, use_ve: bool = False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -1947,13 +1947,13 @@ class DragonMamba3MimoFast(nn.Module):
         assert self.nheads % self.ngroups == 0, "nheads must be evenly divisible by ngroups"
 
         # Assume sequence parallelism: input is already partitioned along the sequence dimension
-        self.in_proj = DragonLinear(
+        self.in_proj = OlalaLinear(
             config,
             self.d_model,
             self.d_inner * 2 + 3 * self.nheads,
             bias=False,
         )
-        self.in_proj_dyn = DragonLinear(
+        self.in_proj_dyn = OlalaLinear(
             config,
             self.d_model,
             2 * self.ngroups * self.d_state * self.mimo_dim + self.num_rope_angles,
@@ -1962,8 +1962,8 @@ class DragonMamba3MimoFast(nn.Module):
 
         self.B_bias = nn.Parameter(torch.ones((self.nheads_local_tp, self.mimo_dim, self.d_state), dtype=torch.float32), requires_grad=True)
         self.C_bias = nn.Parameter(torch.ones((self.nheads_local_tp, self.mimo_dim, self.d_state), dtype=torch.float32), requires_grad=True)
-        self.B_norm = DragonNorm(config, self.d_state)
-        self.C_norm = DragonNorm(config, self.d_state)
+        self.B_norm = OlalaNorm(config, self.d_state)
+        self.C_norm = OlalaNorm(config, self.d_state)
 
         # Initialize up/down MIMO projection (for x and z)
         in_proj_mimo_x_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)/self.mimo_dim
@@ -2002,11 +2002,11 @@ class DragonMamba3MimoFast(nn.Module):
         self.D._no_weight_decay = True # useless flag
 
         if self.config.mamba3_postgate_norm:
-            self.output_norm = DragonNorm(config, self.d_inner_local_tp)
+            self.output_norm = OlalaNorm(config, self.d_inner_local_tp)
 
         self.previous_window_size = 0
 
-    def forward(self, hidden_states, cache_params: Optional[HybridDragonDynamicCache] = None, **kwargs):
+    def forward(self, hidden_states, cache_params: Optional[HybridOlalaDynamicCache] = None, **kwargs):
         """
         hidden_states: (B L D)
         Returns: same shape as hidden_states
@@ -2358,13 +2358,13 @@ class DragonMamba3MimoFast(nn.Module):
 
         return (angle_dt_state, ssm_state, k_state, v_state)
 
-class DragonMLP(nn.Module):
-    def __init__(self, config: DragonConfig, intermediate_size: Optional[int] = None):
+class OlalaMLP(nn.Module):
+    def __init__(self, config: OlalaConfig, intermediate_size: Optional[int] = None):
         super().__init__()
         self.config = config
         intermediate_size = intermediate_size or config.intermediate_size
-        self.fc_1 = DragonLinear(config, config.hidden_size, intermediate_size, bias=False)
-        self.fc_2 = DragonLinear(config, intermediate_size, config.hidden_size, bias=False)
+        self.fc_1 = OlalaLinear(config, config.hidden_size, intermediate_size, bias=False)
+        self.fc_2 = OlalaLinear(config, intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden_states):
         hidden_states = self.fc_1(hidden_states)
@@ -2372,7 +2372,7 @@ class DragonMLP(nn.Module):
         hidden_states = self.fc_2(hidden_states)
         return hidden_states
 
-class DragonFANMLP(nn.Module):
+class OlalaFANMLP(nn.Module):
     """
     FAN-style MLP. Splits the intermediate dimension into:
       - periodic_dim: processed with cos/sin (2x because cos+sin)
@@ -2380,7 +2380,7 @@ class DragonFANMLP(nn.Module):
     
     periodic_ratio controls the split (default 0.2 = 20% periodic, 80% standard).
     
-    Parameter count is similar to original DragonMLP when periodic_ratio=0.5
+    Parameter count is similar to original OlalaMLP when periodic_ratio=0.5
     because cos/sin don't need separate weights for real/imaginary parts -
     they share W_p and just apply cos and sin respectively.
     """
@@ -2422,16 +2422,16 @@ class DragonFANMLP(nn.Module):
         # Down projection
         return self.fc_down(combined)
 
-class DragonMoE(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: int):
+class OlalaMoE(nn.Module):
+    def __init__(self, config: OlalaConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
 
-        self.moe_gate = DragonLinear(config, config.hidden_size, config.moe_num_routed_experts, bias=False, cosnet=False)
+        self.moe_gate = OlalaLinear(config, config.hidden_size, config.moe_num_routed_experts, bias=False, cosnet=False)
         if self.config.moe_routed_input_dim:
-            self.down_proj = DragonLinear(config, config.hidden_size, config.moe_routed_input_dim, bias=False)
-            self.up_proj = DragonLinear(config, config.moe_routed_input_dim, config.hidden_size, bias=False)
+            self.down_proj = OlalaLinear(config, config.hidden_size, config.moe_routed_input_dim, bias=False)
+            self.up_proj = OlalaLinear(config, config.moe_routed_input_dim, config.hidden_size, bias=False)
         self.experts = ScatterMoE(
             input_size=config.moe_routed_input_dim or config.hidden_size,
             hidden_size=config.moe_routed_intermediate_size,
@@ -2440,9 +2440,9 @@ class DragonMoE(nn.Module):
             activation=lambda x: F.relu(x).square(),
         )
         if self.config.moe_shared_expert_gate:
-            self.shared_gate = DragonLinear(config, config.hidden_size, 1, bias=False)
+            self.shared_gate = OlalaLinear(config, config.hidden_size, 1, bias=False)
         self.shared_experts = (
-            DragonMLP(config, config.moe_shared_intermediate_size)
+            OlalaMLP(config, config.moe_shared_intermediate_size)
             if config.moe_shared_intermediate_size and config.moe_shared_intermediate_size > 0
             else None
         )
@@ -2504,8 +2504,8 @@ class DragonMoE(nn.Module):
             return out_experts.reshape(bs, slen, dim)
         return (out + out_experts).reshape(bs, slen, dim)#, top_indices, scores_orig
 
-class DragonGeodesicNorm(nn.Module):
-    def __init__(self, config: DragonConfig, layer_idx: int):
+class OlalaGeodesicNorm(nn.Module):
+    def __init__(self, config: OlalaConfig, layer_idx: int):
         super().__init__()
 
         # 1-D ([1]) rather than 0-dim scalars: FSDP1/FSDP2 both reject 0-dim
@@ -2545,14 +2545,14 @@ class DragonGeodesicNorm(nn.Module):
         # output to the residual dtype; no-op when dtypes already agree.
         return output.to(x.dtype)
 
-class DragonMonoBlock(GradientCheckpointingLayer):
-    def __init__(self, config: DragonConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
+class OlalaMonoBlock(GradientCheckpointingLayer):
+    def __init__(self, config: OlalaConfig, layer_idx: int, layer_type: str, use_ve: bool = False, mlp_type: str = 'd'):
         super().__init__()
         self.config = config
         # When blocks have been pruned out (config.layer_idx_map present),
         # the surviving block at *position* `layer_idx` originally had a
         # different index. We preserve that original index so that
-        # DragonGeodesicNorm.theta scaling by 1/(layer_idx+1) and any other
+        # OlalaGeodesicNorm.theta scaling by 1/(layer_idx+1) and any other
         # layer-index-dependent logic stays consistent with how the model
         # was trained. Pruning configs (skip_moe_layers, skip_mixer_layers)
         # are also expressed in ORIGINAL indices.
@@ -2565,37 +2565,37 @@ class DragonMonoBlock(GradientCheckpointingLayer):
             assert layer_type in ['g', 'T', 'M'], "VE is only supported for 'g', 'T' and 'M' layer types."
 
         if layer_type == 'g':
-            self.mixer = DragonGatedDeltaNet(config, layer_idx=layer_idx, use_ve=use_ve)
+            self.mixer = OlalaGatedDeltaNet(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
             use_gate = False
         elif layer_type == 'v':
-            self.mixer = DragonDifferentialAttentionV2(config, layer_idx=layer_idx)
+            self.mixer = OlalaDifferentialAttentionV2(config, layer_idx=layer_idx)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_signal_heads
             use_gate = config.gate_attn
         elif layer_type == 'w':
-            self.mixer = DragonAttention(config, reuse_kv=False, layer_idx=layer_idx)
+            self.mixer = OlalaAttention(config, reuse_kv=False, layer_idx=layer_idx)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
             use_gate = config.gate_attn
         elif layer_type == 't':
-            self.mixer = DragonTensorProductAttention(config, reuse_kv=False, layer_idx=layer_idx)
+            self.mixer = OlalaTensorProductAttention(config, reuse_kv=False, layer_idx=layer_idx)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_attention_heads
             use_gate = config.gate_attn
         elif layer_type == 'V':
-            self.mixer = DragonDifferentialTensorProductAttentionV2(config, layer_idx=layer_idx, use_ve=use_ve)
+            self.mixer = OlalaDifferentialTensorProductAttentionV2(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.head_dim
             num_attention_heads = self.mixer.num_signal_heads
             use_gate = config.gate_attn
         elif layer_type == '2':
-            self.mixer = DragonMamba2(config, layer_idx=layer_idx)
+            self.mixer = OlalaMamba2(config, layer_idx=layer_idx)
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
             use_gate = config.gate_gdn
         elif layer_type == 'M':
-            self.mixer = DragonMamba3MimoFast(config, layer_idx=layer_idx, use_ve=use_ve)
+            self.mixer = OlalaMamba3MimoFast(config, layer_idx=layer_idx, use_ve=use_ve)
             head_dim = self.mixer.headdim
             num_attention_heads = self.mixer.nheads
             use_gate = False # inside Mamba3MimoFast
@@ -2604,14 +2604,14 @@ class DragonMonoBlock(GradientCheckpointingLayer):
 
         if use_gate:
             if self.config.gate_type == "elementwise":
-                self.gate_proj = DragonLinear(self.config, config.hidden_size, num_attention_heads*head_dim, bias=False)
+                self.gate_proj = OlalaLinear(self.config, config.hidden_size, num_attention_heads*head_dim, bias=False)
             elif self.config.gate_type == "kimi":
                 self.gate_proj = nn.Sequential(
-                    DragonLinear(config, config.hidden_size, head_dim, bias=False),
-                    DragonLinear(config, head_dim, num_attention_heads*head_dim, bias=True),
+                    OlalaLinear(config, config.hidden_size, head_dim, bias=False),
+                    OlalaLinear(config, head_dim, num_attention_heads*head_dim, bias=True),
                 )
             elif self.config.gate_type == "headwise":
-                self.gate_proj = DragonLinear(self.config, config.hidden_size, num_attention_heads, bias=False)
+                self.gate_proj = OlalaLinear(self.config, config.hidden_size, num_attention_heads, bias=False)
                 if self.config.scalar_proj_as_hidden_matrix:
                     self.gate_proj.is_scalar_weight = True
             else:
@@ -2630,18 +2630,18 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         self.head_dim = head_dim
         self.use_gate = use_gate
 
-        self.mixer_proj = DragonLinear(config, head_dim*num_attention_heads, config.hidden_size, bias=False)
+        self.mixer_proj = OlalaLinear(config, head_dim*num_attention_heads, config.hidden_size, bias=False)
         if config.mixer_gn:
-            self.mixer_group_norm = DragonHeadWiseRMSNorm(n_heads=num_attention_heads, d_head=head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
+            self.mixer_group_norm = OlalaHeadWiseRMSNorm(n_heads=num_attention_heads, d_head=head_dim, eps=config.norm_epsilon, zero_centered_gamma=config.zero_centered_gamma)
 
         if not config.geodesic_update:
-            self.input_norm = DragonNorm(config, config.hidden_size)
-            self.postmixer_norm = DragonNorm(config, config.hidden_size)
+            self.input_norm = OlalaNorm(config, config.hidden_size)
+            self.postmixer_norm = OlalaNorm(config, config.hidden_size)
         else:
             self.input_norm = torch.nn.Identity()
             self.postmixer_norm = torch.nn.Identity()
-            self.geodesic_mixer = DragonGeodesicNorm(config, self.layer_idx)
-            self.geodesic_mlp = DragonGeodesicNorm(config, self.layer_idx)
+            self.geodesic_mixer = OlalaGeodesicNorm(config, self.layer_idx)
+            self.geodesic_mlp = OlalaGeodesicNorm(config, self.layer_idx)
 
         # ---- pruning / skip-MoE support ----
         # If `config.skip_moe_layers` contains this layer_idx, replace mlp with a
@@ -2655,13 +2655,13 @@ class DragonMonoBlock(GradientCheckpointingLayer):
                 self.geodesic_mlp = _NullGeodesic()
         elif not config.moe or mlp_type == 'd':
             if config.mlp_type == "simple":
-                self.mlp = DragonMLP(config)
+                self.mlp = OlalaMLP(config)
             elif config.mlp_type == "gated":
                 self.mlp = GatedMlp(in_features=config.hidden_size, hidden_features=config.intermediate_size, out_features=config.hidden_size, activation=F.silu, bias1=False, bias2=False)
             elif config.mlp_type == "fan":
-                self.mlp = DragonFANMLP(config, periodic_ratio=config.fan_periodic_ratio)
+                self.mlp = OlalaFANMLP(config, periodic_ratio=config.fan_periodic_ratio)
         elif mlp_type == 'm':
-            self.mlp = DragonMoE(config, layer_idx=layer_idx)
+            self.mlp = OlalaMoE(config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Unknown mlp_type: {mlp_type}")
 
@@ -2695,7 +2695,7 @@ class DragonMonoBlock(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[HybridDragonDynamicCache] = None,
+        cache_params: Optional[HybridOlalaDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -2774,11 +2774,11 @@ class DragonMonoBlock(GradientCheckpointingLayer):
 
         return hidden_states, last_key_states, last_value_states
 
-class DragonPreTrainedModel(PreTrainedModel):
-    config: DragonConfig
+class OlalaPreTrainedModel(PreTrainedModel):
+    config: OlalaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["DragonMonoBlock"]
+    _no_split_modules = ["OlalaMonoBlock"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -2786,18 +2786,18 @@ class DragonPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": DragonMonoBlock,
-        "attentions": DragonMonoBlock,
+        "hidden_states": OlalaMonoBlock,
+        "attentions": OlalaMonoBlock,
     }
 
 @dataclass
-class DragonOutput(ModelOutput):
+class OlalaOutput(ModelOutput):
     """
-    Class for the Dragon model outputs.
+    Class for the Olala model outputs.
     Args:
         last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
-        cache_params (`HybridDragonDynamicCache`):
+        cache_params (`HybridOlalaDynamicCache`):
             The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
             avoid providing the old `input_ids`.
             Includes both the RNN-like state matrices after the selective scan, and the conv states
@@ -2808,11 +2808,11 @@ class DragonOutput(ModelOutput):
     """
 
     last_hidden_state: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[HybridDragonDynamicCache] = None
+    past_key_values: Optional[HybridOlalaDynamicCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 @dataclass
-class DragonCausalLMOutput(ModelOutput):
+class OlalaCausalLMOutput(ModelOutput):
     """
     Base class for causal language model (or autoregressive) outputs.
     Args:
@@ -2820,7 +2820,7 @@ class DragonCausalLMOutput(ModelOutput):
             Language modeling loss (for next-token prediction).
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        cache_params (`HybridDragonDynamicCache`):
+        cache_params (`HybridOlalaDynamicCache`):
             The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
             avoid providing the old `input_ids`.
             Includes both the State space model state matrices after the selective scan, and the Convolutional states
@@ -2834,13 +2834,13 @@ class DragonCausalLMOutput(ModelOutput):
     geo_loss: Optional[torch.FloatTensor] = None
     ce_loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[HybridDragonDynamicCache] = None
+    past_key_values: Optional[HybridOlalaDynamicCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
-class DragonModel(DragonPreTrainedModel):
-    def __init__(self, config: DragonConfig):
+class OlalaModel(OlalaPreTrainedModel):
+    def __init__(self, config: OlalaConfig):
         super().__init__(config)
-        self.config: DragonConfig = config
+        self.config: OlalaConfig = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -2875,17 +2875,17 @@ class DragonModel(DragonPreTrainedModel):
         assert len(layers_mlp_config) == len(config.layers_config)
 
         if not self.config.use_value_embedding:
-            self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, ) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) for i, (layer, mlp_type) in enumerate(zip(config.layers_config, layers_mlp_config))])
+            self.layers = nn.ModuleList([OlalaMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type, ) if layer in ['l', 'r', 'd'] else OlalaMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) for i, (layer, mlp_type) in enumerate(zip(config.layers_config, layers_mlp_config))])
         else:
             assert len(config.layers_ve_config) == len(config.layers_config)
-            self.layers = nn.ModuleList([DragonMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else DragonMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
+            self.layers = nn.ModuleList([OlalaMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else OlalaMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
 
         self.rotary_emb = None
         if self.config.rope_type != '' and self.config.rope_theta > 0.:
-            self.rotary_emb = DragonRotaryEmbedding(config, head_dim=config.head_dim, theta=config.rope_theta)
+            self.rotary_emb = OlalaRotaryEmbedding(config, head_dim=config.head_dim, theta=config.rope_theta)
 
         if self.config.final_norm:
-            self.final_norm = DragonNorm(config, config.hidden_size)
+            self.final_norm = OlalaNorm(config, config.hidden_size)
 
         self.gradient_checkpointing = False
         self.post_init()
@@ -2902,14 +2902,14 @@ class DragonModel(DragonPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        past_key_values: Optional[HybridDragonDynamicCache] = None,
+        past_key_values: Optional[HybridOlalaDynamicCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         output_hidden_states: Optional[bool] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         **kwargs
-    ) -> DragonOutput:
+    ) -> OlalaOutput:
         B, L = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
         use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
 
@@ -2937,11 +2937,11 @@ class DragonModel(DragonPreTrainedModel):
 
         if use_cache:
             if past_key_values is None:
-                past_key_values = HybridDragonDynamicCache(self.config)
-            elif not isinstance(past_key_values, HybridDragonDynamicCache):
+                past_key_values = HybridOlalaDynamicCache(self.config)
+            elif not isinstance(past_key_values, HybridOlalaDynamicCache):
                 if type(past_key_values) is DynamicCache:
                     del past_key_values
-                    past_key_values = HybridDragonDynamicCache(self.config)
+                    past_key_values = HybridOlalaDynamicCache(self.config)
                 else:
                     raise TypeError(f"Unsupported cache type: {type(past_key_values)}")
 
@@ -3037,20 +3037,20 @@ class DragonModel(DragonPreTrainedModel):
         if past_key_values and not past_key_values.has_previous_state:
             past_key_values.has_previous_state = True
 
-        return DragonOutput(
+        return OlalaOutput(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
         )
-DragonModel.register_for_auto_class("AutoModel")
+OlalaModel.register_for_auto_class("AutoModel")
 
-class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
-    def __init__(self, config: DragonConfig):
+class OlalaForCausalLM(OlalaPreTrainedModel, GenerationMixin):
+    def __init__(self, config: OlalaConfig):
         super().__init__(config)
         self.config = config
-        self.model = DragonModel(config)
+        self.model = OlalaModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = DragonLinear(config, config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = OlalaLinear(config, config.hidden_size, config.vocab_size, bias=False)
         if config.normalize_lm_head:
             self.temperature = nn.Parameter(torch.tensor(math.log(math.sqrt(config.hidden_size))))
         if config.logits_scaling_ngpt:
@@ -3067,7 +3067,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         use_cache: Optional[bool] = None,
-        past_key_values: Optional[HybridDragonDynamicCache] = None,
+        past_key_values: Optional[HybridOlalaDynamicCache] = None,
         cache_position: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -3076,10 +3076,10 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
         max_seqlen: Optional[int] = None,
         token_type_ids=None,
         **kwargs,
-    ) -> DragonCausalLMOutput:
+    ) -> OlalaCausalLMOutput:
         output_hidden_states = (output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states)
 
-        outputs: DragonOutput = self.model(
+        outputs: OlalaOutput = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -3168,7 +3168,7 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
             else:
                 logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)[:, slice_indices, :]).float()
 
-        return DragonCausalLMOutput(
+        return OlalaCausalLMOutput(
             loss=loss,
             geo_loss=geo_loss,
             ce_loss=ce_loss,
@@ -3183,6 +3183,6 @@ class DragonForCausalLM(DragonPreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-DragonForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+OlalaForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
-__all__ = ["DragonModel", "DragonForCausalLM", "DragonPreTrainedModel"]
+__all__ = ["OlalaModel", "OlalaForCausalLM", "OlalaPreTrainedModel"]

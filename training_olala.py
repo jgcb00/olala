@@ -31,8 +31,8 @@ import transformers
 from transformers import get_wsd_schedule
 from transformers import AutoModelForCausalLM
 
-from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM, DragonMoE, DragonGeodesicNorm
+from .configuration_olala import OlalaConfig
+from .modeling_olala import OlalaForCausalLM, OlalaMoE, OlalaGeodesicNorm
 
 # TODO: save code files!!!!
 
@@ -46,7 +46,7 @@ class NanoArgs:
     n_heads : int = 6 # head dim 128 suggested by @Grad62304977
     head_dim: Optional[int] = None
     layers_config : str = 4*"lrdlr"
-    expand_factor : int = 2 # expand factor for Mamba/Dragon
+    expand_factor : int = 2 # expand factor for Mamba/Olala
     rope_type: str = "" #p-rope
     rope_theta: float = 0.0
     eps_rmsnorm: float = 1e-6
@@ -106,7 +106,7 @@ class NanoArgs:
 
     # MoE
     moe: bool = False
-    moe_router_type: str = "classic" # "classic", "dragon"
+    moe_router_type: str = "classic" # "classic", "olala"
     moe_num_routed_experts: int = 2
     moe_num_active_experts: int = 1
     moe_routed_scaling_factor: float = 2.5
@@ -999,7 +999,7 @@ print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} 
 print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 # load model.
-config_hf = DragonConfig(
+config_hf = OlalaConfig(
     xsa=args.xsa,
     normalize_embeddings_ngpt=args.normalize_embeddings_ngpt,
     logits_scaling_ngpt=args.logits_scaling_ngpt,
@@ -1120,7 +1120,7 @@ config_hf = DragonConfig(
 
 if resume_dir is None:
     if args.start_from_dir is None:
-        model = DragonForCausalLM(config_hf)
+        model = OlalaForCausalLM(config_hf)
         model = model.cuda()
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -1131,7 +1131,7 @@ if resume_dir is None:
         ).cuda()
         config_hf = model.config
 else:
-    model = DragonForCausalLM.from_pretrained(resume_dir, config=config_hf)
+    model = OlalaForCausalLM.from_pretrained(resume_dir, config=config_hf)
     model = model.cuda()
 print0(model)
 
@@ -1610,7 +1610,7 @@ for iter_ in range(start_iter, args.total_iterations+1):
     # PRORES SCALARS UPDATE
     if args.prores:
         for mod in raw_model.modules():
-            if isinstance(mod, DragonGeodesicNorm):
+            if isinstance(mod, OlalaGeodesicNorm):
                 mod.prosres_scalar.fill_(min(iter_ / args.prores_warmup_iters * (mod.layer_idx + 1), 1))
                 to_log[f'prores_scalar/layer_{mod.layer_idx}'] = mod.prosres_scalar.item()
 
@@ -1756,7 +1756,7 @@ for iter_ in range(start_iter, args.total_iterations+1):
     # update expert biases (and report balance).
     with torch.no_grad():
         for moe in model.module.modules():
-            if not isinstance(moe, DragonMoE):
+            if not isinstance(moe, OlalaMoE):
                 continue
             counts = moe.tokens_per_expert # (E,) float32 buffer on device
             if dist.is_available() and dist.is_initialized():

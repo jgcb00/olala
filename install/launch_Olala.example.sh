@@ -1,5 +1,5 @@
 #!/bin/bash -l
-# Olala (Dragon 7A1B) GSM8K GRPO training — self-contained environment under
+# Olala (Olala 7A1B) GSM8K GRPO training — self-contained environment under
 # /data/home/j-g.barthelemy/olala, built from scratch on 2026-08-26 following
 # the "Olala verl training — install & fix guide" (Notion). Mirrors erisa's
 # validated launch_Olala.sh, with paths pointing at this env.
