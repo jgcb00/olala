@@ -2622,19 +2622,43 @@ class OlalaGeodesicNorm(nn.Module):
     def __init__(self, config: OlalaConfig, layer_idx: int):
         super().__init__()
 
-        # 1-D ([1]) rather than 0-dim scalars: FSDP1/FSDP2 both reject 0-dim
-        # parameters outright ("fully_shard doesn't support scalar
-        # parameters") -- sharding needs a dim 0 to shard/flatten along.
-        # Numerically identical: the only use is ``theta * scale + bias``
-        # where theta is (..., 1), so [1] broadcasts the same.
-        # NOTE: checkpoints exported with 0-dim tensors need
-        # scripts/patch_olala_checkpoint.py before from_pretrained will load
-        # them (it compares shapes before copying).
-        self.scale = nn.Parameter(torch.tensor([1.]))
-        self.bias = nn.Parameter(torch.tensor([0.]))
+        # Declared 0-dim to match what every export on disk stores. FSDP
+        # rejects 0-dim parameters, so they are widened to [1] AFTER loading
+        # by OlalaPreTrainedModel.widen_geodesic_scalars(), which
+        # from_pretrained calls for you.
+        #
+        # Declaring [1] here instead does NOT work: transformers records a
+        # shape mismatch on the way in, and _initialize_missing_keys()
+        # REINITIALIZES every mismatched key (loading_info
+        # .missing_and_mismatched()) before any model hook can intervene, so
+        # the trained values are silently replaced with garbage. Widening
+        # after the load is the only point where both constraints hold.
+        self.scale = nn.Parameter(torch.tensor(1.))
+        self.bias = nn.Parameter(torch.tensor(0.))
         self.register_buffer("prosres_scalar", torch.tensor(1.0))
         self.clamp = torch.pi/4
         self.layer_idx = layer_idx
+
+    _SCALARS = ("scale", "bias")
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # torch's load_state_dict (FSDP / verl checkpoint restore) copies INTO
+        # the existing tensor and validates shapes first, so it raises on any
+        # 0-dim vs [1] difference. Reshape the incoming entry to whatever this
+        # module currently holds -- the model may be 0-dim (fresh) or [1]
+        # (already widened), and a checkpoint may be either.
+        for _name in OlalaGeodesicNorm._SCALARS:
+            _key = prefix + _name
+            _incoming = state_dict.get(_key)
+            _current = getattr(self, _name, None)
+            if _incoming is None or _current is None:
+                continue
+            if _incoming.shape != _current.shape and _incoming.numel() == 1:
+                state_dict[_key] = _incoming.reshape(_current.shape)
+        return super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, x, g):
         """
@@ -2905,6 +2929,44 @@ class OlalaPreTrainedModel(PreTrainedModel):
         "hidden_states": OlalaMonoBlock,
         "attentions": OlalaMonoBlock,
     }
+
+    def widen_geodesic_scalars(self) -> int:
+        """Reshape every 0-dim GeodesicNorm scale/bias to [1]; returns the count.
+
+        FSDP1 and FSDP2 both refuse 0-dim parameters ("fully_shard doesn't
+        support scalar parameters") -- sharding needs a dim 0 to shard along --
+        but every Olala export stores these as 0-dim scalars. Widening here,
+        after the weights are in, keeps the load itself mismatch-free: declaring
+        [1] in __init__ makes transformers record a shape mismatch and then
+        REINITIALIZE those keys, destroying the trained values.
+
+        Numerically identical: the only use is ``theta * scale + bias`` with
+        theta of shape (..., 1), which broadcasts the same either way.
+
+        from_pretrained() calls this automatically. Call it yourself if you
+        build the model some other way (from_config, or a manual state_dict
+        restore) and intend to wrap it in FSDP.
+        """
+        widened = 0
+        for module in self.modules():
+            if not isinstance(module, OlalaGeodesicNorm):
+                continue
+            for name in OlalaGeodesicNorm._SCALARS:
+                param = getattr(module, name, None)
+                if isinstance(param, nn.Parameter) and param.dim() == 0:
+                    setattr(module, name,
+                            nn.Parameter(param.data.reshape(1),
+                                         requires_grad=param.requires_grad))
+                    widened += 1
+        return widened
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        model = super().from_pretrained(*args, **kwargs)
+        # Only meaningful on a real module tree (not a meta/quantized shell).
+        if isinstance(model, nn.Module):
+            model.widen_geodesic_scalars()
+        return model
 
 @dataclass
 class OlalaOutput(ModelOutput):
