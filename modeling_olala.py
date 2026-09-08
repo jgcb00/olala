@@ -7,6 +7,7 @@ import inspect
 from contextlib import nullcontext
 
 import math
+import os
 from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
@@ -46,35 +47,69 @@ except ImportError:
     mamba_chunk_scan_combined = None
     RMSNormGated = None
 
+# Mamba-3 MIMO kernels, from the public state-spaces/mamba package -- the same
+# kernels Megatron-LM training uses. Two properties matter at the call sites:
+#  - the chunk kernel takes RAW angles and applies the angle cumsum itself, so
+#    `angle_dt` stays None and must NOT be applied beforehand;
+#  - it returns a bare tensor when return_state=False, so the wrapper below
+#    normalizes to the (y, state) tuple this file unpacks.
+_MAMBA3_PUBLIC = False   # True once the chunk kernel is available
+angle_dt = None
 try:
-    from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
-    from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_rotary_step import apply_rotary_qk_inference_fwd
-    from dragon_mamba3_fast_step.fused_mimo_variant.mamba3_step_fn import mamba3_step_fn
-    from dragon_mamba3_fast_step.angle_cumsum import angle_dt
-except ImportError:
-    # Fallback: the public state-spaces/mamba package ships the same Mamba-3
-    # MIMO kernel (mamba3_mimo) — it's what Megatron-LM training uses too.
-    # Differences vs the private dragon_mamba3_fast_step API:
-    #  - it takes RAW angles and applies the angle cumsum internally, so
-    #    angle_dt must NOT be applied beforehand (angle_dt = None signals that
-    #    in forward);
-    #  - it returns a bare tensor when return_state=False (the wrapper below
-    #    normalizes to the (y, state) tuple this file unpacks);
-    #  - there is NO public decode/step kernel (mamba3_step_fn) -> call
-    #    generate() with use_cache=False (full-prefix recompute per token).
-    angle_dt = None
+    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as _mamba3_mimo_public
+
+    def mamba3_tilelang(*, return_state=False, **kwargs):
+        out = _mamba3_mimo_public(return_state=return_state, **kwargs)
+        if not return_state:
+            return out, None
+        # mamba3_mimo returns a FLAT 5-tuple
+        # (Out, Final_Angle, Final_SSM_State, Final_K, Final_V), but this
+        # file unpacks `y, kernel_state` and then splits kernel_state into
+        # four states. Returning `out` unchanged raised
+        # "too many values to unpack (expected 2)" on every prefill that
+        # passed a cache -- i.e. the whole cached path was dead.
+        y, *state = out
+        return y, tuple(state)
+
+    _MAMBA3_PUBLIC = True
+except ImportError as _e:
+    mamba3_tilelang = None
+    print(f"mamba3: no chunk kernel ({_e}) -- the model cannot run")
+
+# Decode kernels. Kept in their own try so a missing CuteDSL only disables
+# cached decode instead of the whole model.
+try:
+    from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import (
+        mamba3_step_fn as _mamba3_step_fn_public,
+    )
+    from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
+        apply_rotary_qk_inference_fwd,
+    )
+
+    def mamba3_step_fn(*a, **kw):
+        # The CuteDSL step kernel imports cleanly but can still fail at CALL
+        # time on a cutlass-dsl / tvm-ffi version mismatch (observed:
+        # nvidia-cutlass-dsl 4.6.0 with apache-tvm-ffi 0.1.9 ->
+        # "make_kwargs_wrapper() got an unexpected keyword argument
+        # 'map_dataclass_to_tuple'"). Turn that into something actionable
+        # rather than an opaque cutlass traceback. Deliberately NOT a silent
+        # fallback to recompute: that costs ~5000x per token and would look
+        # like the model is merely slow.
+        try:
+            return _mamba3_step_fn_public(*a, **kw)
+        except TypeError as e:
+            raise RuntimeError(
+                "mamba3 cached decode unavailable: the CuteDSL step kernel "
+                f"failed to launch ({e}). Align the nvidia-cutlass-dsl and "
+                "apache-tvm-ffi versions, or generate with use_cache=False."
+            ) from e
+
+    print("mamba3: public chunk + decode kernels (cached generation available)")
+except ImportError as _e:
     mamba3_step_fn = None
     apply_rotary_qk_inference_fwd = None
-    try:
-        from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as _mamba3_mimo_public
-
-        def mamba3_tilelang(*, return_state=False, **kwargs):
-            out = _mamba3_mimo_public(return_state=return_state, **kwargs)
-            return out if return_state else (out, None)
-
-        print("dragon_mamba3_fast_step not found: using public mamba_ssm mamba3_mimo kernel (no decode kernel -> generate with use_cache=False)")
-    except ImportError:
-        print("dragon_mamba3_fast_step not found")
+    print(f"mamba3: public chunk kernel only, no decode kernel ({_e}) "
+          f"-> generate with use_cache=False")
 
 try:
     import scattermoe
@@ -652,20 +687,24 @@ class OlalaAttention(nn.Module):
         # attention computation.
         wsize = min(self.window_size, self.config.slw_wsize) if self.config.slw_wsize > 0 else self.window_size
 
+        # Row boundaries from a packed batch need the varlen path just as
+        # document boundaries do; eager/flex have none, which is why
+        # OlalaModel.forward only packs under fa2/fa3.
+        _varlen_attn = self.config.intra_doc_masking or kwargs.get("unpadded", False)
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
+            assert not _varlen_attn
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking and cu_seqlens is None:
+            if not _varlen_attn:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking and cu_seqlens is None:
+            if not _varlen_attn:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
@@ -1054,20 +1093,24 @@ class OlalaDifferentialAttentionV2(nn.Module):
             key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
 
         # attention computation.
+        # Row boundaries from a packed batch need the varlen path just as
+        # document boundaries do; eager/flex have none, which is why
+        # OlalaModel.forward only packs under fa2/fa3.
+        _varlen_attn = self.config.intra_doc_masking or kwargs.get("unpadded", False)
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
+            assert not _varlen_attn
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:
+            if not _varlen_attn and not self.config.complete_slw:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking and not self.config.complete_slw and cu_seqlens is None:
+            if not _varlen_attn and not self.config.complete_slw:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)[0]
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw)[0].unsqueeze(0)
@@ -1346,20 +1389,24 @@ class OlalaDifferentialTensorProductAttentionV2(nn.Module):
             key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
 
         # attention computation.
+        # Row boundaries from a packed batch need the varlen path just as
+        # document boundaries do; eager/flex have none, which is why
+        # OlalaModel.forward only packs under fa2/fa3.
+        _varlen_attn = self.config.intra_doc_masking or kwargs.get("unpadded", False)
         if ATTN_IMPL == "eager":
-            assert not self.config.intra_doc_masking and cu_seqlens is None, "eager attention has no document masking"
+            assert not _varlen_attn
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
         elif ATTN_IMPL == "flex":
             if wsize != self.last_wsize:
                 self.last_wsize = self.build_mask(wsize)
             attention_interface = lambda q, k, v, softmax_scale, **kw: flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=create_block_mask(self.attn_mask, B=None, H=None, Q_LEN=q.size(1), KV_LEN=k.size(1)), score_mod=self.score_mod, scale=softmax_scale, enable_gqa=self.num_attention_heads > self.num_key_value_heads).transpose(1, 2)
         elif ATTN_IMPL == "fa2":
-            if not self.config.intra_doc_masking and cu_seqlens is None:
+            if not _varlen_attn:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
         elif ATTN_IMPL == "fa3":
-            if not self.config.intra_doc_masking and cu_seqlens is None:
+            if not _varlen_attn:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_func(q, k, v, window_size=(wsize, 0), **kw)
             else:
                 attention_interface = lambda q, k, v, wsize, **kw: flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen, window_size=(wsize, 0), **kw).unsqueeze(0)
@@ -1893,6 +1940,58 @@ class OlalaMamba2(nn.Module):
 
         return y, None, None
 
+def _pack_cu_seqlens(cu_seqlens, batch, seqlen, device, window=0):
+    """cu_seqlens for a (batch, seqlen) input packed into ONE varlen row.
+
+    Row i occupies [i*seqlen, (i+1)*seqlen), so rows stay independent exactly as
+    they are in the dense path. Inside a row we rebuild what Megatron's
+    dragon_mamba3.py feeds the same kernel: the caller's document boundaries,
+    merged with a state reset every `window` tokens (config.artificial_seq_len,
+    0 = disabled).
+
+    Kept sync-free in the common cases -- torch.unique has a data-dependent
+    output size and forces a device->host stall, once per mamba layer.
+    """
+    windowed = 0 < window < seqlen
+    if cu_seqlens is None:
+        if not windowed:
+            inner = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
+        else:
+            inner = torch.arange(0, seqlen + 1, window, dtype=torch.int32, device=device)
+            if seqlen % window:  # both are Python ints: no sync
+                inner = torch.cat([inner, torch.tensor([seqlen], dtype=torch.int32, device=device)])
+    else:
+        inner = cu_seqlens.to(device=device, dtype=torch.int32).flatten()
+        if windowed:
+            # only case that needs a merge, and the only one that stalls
+            inner = torch.unique(torch.cat([
+                inner, torch.arange(0, seqlen + 1, window, dtype=torch.int32, device=device),
+                torch.tensor([0, seqlen], dtype=torch.int32, device=device),
+            ]), sorted=True)
+
+    if batch == 1:
+        return inner.contiguous()
+    offsets = torch.arange(batch, device=device, dtype=torch.int32) * seqlen
+    return torch.cat([
+        (inner[:-1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1),
+        torch.full((1,), batch * seqlen, dtype=torch.int32, device=device),
+    ])
+
+
+def _row_window_boundaries(cu_seqlens, lengths, window):
+    """Add artificial_seq_len boundaries INSIDE each row of a packed batch.
+
+    Windows restart per row, matching training: there one row is the whole
+    packed sequence (Megatron asserts micro_batch_size == 1), so the boundary
+    is measured from that row's own start, not from the start of the pack.
+    """
+    bounds = []
+    for start, length in zip(cu_seqlens[:-1].tolist(), lengths.tolist()):
+        bounds.extend(range(start, start + length, window))
+    bounds.append(int(cu_seqlens[-1]))
+    return torch.tensor(bounds, dtype=torch.int32, device=cu_seqlens.device)
+
+
 class OlalaMamba3MimoFast(nn.Module):
     def __init__(self, config: OlalaConfig, layer_idx: int, use_ve: bool = False):
         super().__init__()
@@ -1981,7 +2080,10 @@ class OlalaMamba3MimoFast(nn.Module):
             dt = torch.exp(
                 torch.rand(
                     self.nheads_local_tp,
-                    device=torch.cuda.current_device(),
+                    # `.current_device()` raises without a driver; the CPU-only
+                    # checkpoint conversion builds this model with no GPU. On a
+                    # GPU this is unchanged, RNG stream included.
+                    device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu",
                 )
                 * (math.log(dt_max) - math.log(dt_min))
                 + math.log(dt_min)
@@ -1998,7 +2100,8 @@ class OlalaMamba3MimoFast(nn.Module):
             self.dt_bias._no_weight_decay = True
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.nheads_local_tp, device=torch.cuda.current_device())) # Keep in fp32
+        self.D = nn.Parameter(torch.ones(self.nheads_local_tp,
+                                         device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu")) # Keep in fp32
         self.D._no_weight_decay = True # useless flag
 
         if self.config.mamba3_postgate_norm:
@@ -2006,7 +2109,11 @@ class OlalaMamba3MimoFast(nn.Module):
 
         self.previous_window_size = 0
 
-    def forward(self, hidden_states, cache_params: Optional[HybridOlalaDynamicCache] = None, **kwargs):
+    def forward(self, hidden_states,
+                cache_params: Optional[HybridOlalaDynamicCache] = None,
+                cu_seqlens: Optional[torch.Tensor] = None,
+                unpadded: bool = False,
+                **kwargs):
         """
         hidden_states: (B L D)
         Returns: same shape as hidden_states
@@ -2018,79 +2125,6 @@ class OlalaMamba3MimoFast(nn.Module):
         use_precomputed_states = cache_params is not None and q_len == 1
         is_prefill = cache_params is not None
 
-        # Packed-batch (varlen) support for training frameworks like verl
-        # that feed one packed (1, T) row holding many documents
-        # (use_remove_padding). Running that dense leaks SSM state across
-        # document boundaries, and the dense backward additionally requires
-        # T % chunk_size == 0, which packed batches don't satisfy. Derive
-        # cu_seqlens from position_ids resets (pos == 0 marks each document
-        # start — same convention as the diff-tpa shift path) and use the
-        # public kernel's varlen forward/backward, which handles boundaries
-        # and ragged lengths. Only the public mamba3_mimo kernel accepts
-        # cu_seqlens (angle_dt is None on that path).
-        _mamba3_cu_seqlens = None
-        if angle_dt is None and cache_params is None and batch == 1:
-            _mamba3_cu_seqlens = kwargs.get("cu_seqlens", None)
-            if _mamba3_cu_seqlens is None:
-                _pos = kwargs.get("position_ids", None)
-                if _pos is not None:
-                    _starts = (_pos[0] == 0).nonzero(as_tuple=False).flatten()
-                    if _starts.numel() >= 1:
-                        _mamba3_cu_seqlens = torch.cat(
-                            [
-                                _starts.to(torch.int32),
-                                torch.tensor(
-                                    [q_len],
-                                    dtype=torch.int32,
-                                    device=_starts.device,
-                                ),
-                            ]
-                        )
-            if _mamba3_cu_seqlens is not None:
-                _mamba3_cu_seqlens = _mamba3_cu_seqlens.to(
-                    device=hidden_states.device, dtype=torch.int32
-                )
-
-        _mamba3_len = q_len
-        _mamba3_pad = 0
-        _mamba3_flat_batch = 0
-        if (
-            cache_params is None
-            and _mamba3_cu_seqlens is None
-            and angle_dt is None
-            and not (self.config.complete_slw and self.config.slw_wsize > 128)
-        ):
-            # Dense -> varlen flatten. The dense TileLang kernels are
-            # compiled per sequence length (no T.dynamic), so variable-length
-            # training batches trigger a fresh multi-second JIT compile for
-            # every new L — and the dense BACKWARD additionally requires
-            # L % chunk_size == 0. The varlen kernels declare S/NS as
-            # T.dynamic: one compilation serves every shape, forward and
-            # backward, with no divisibility constraint. Flatten (B, L) into
-            # a packed (1, B*L) batch whose row boundaries are cu_seqlens —
-            # numerically identical, each row stays an independent
-            # zero-start sequence. Measured on verl 1-GPU fsdp2 training:
-            # update_actor 842s -> 147s (step 1), 1300s -> 112s (step 2).
-            _mamba3_flat_batch = batch
-            _mamba3_cu_seqlens = torch.arange(
-                0, (batch + 1) * q_len, q_len,
-                device=hidden_states.device, dtype=torch.int32,
-            )
-            if batch > 1:
-                hidden_states = hidden_states.reshape(1, batch * q_len, -1)
-                batch, q_len, _ = hidden_states.shape
-        elif (
-            cache_params is None
-            and _mamba3_cu_seqlens is None
-            and q_len % self.chunk_size != 0
-        ):
-            # Private-kernel (angle_dt) fallback: it has no cu_seqlens
-            # support, so pad rows to the next chunk multiple instead (the
-            # dense backward requires it) and slice the output back below.
-            _mamba3_pad = self.chunk_size - (q_len % self.chunk_size)
-            hidden_states = F.pad(hidden_states, (0, 0, 0, _mamba3_pad))
-            batch, q_len, _ = hidden_states.shape
-
         if use_precomputed_states:
             state = (
                 cache_params.mamba3_angle_states[layer_idx],
@@ -2098,6 +2132,17 @@ class OlalaMamba3MimoFast(nn.Module):
                 cache_params.mamba3_k_states[layer_idx],
                 cache_params.mamba3_v_states[layer_idx],
             )
+
+            # Window reset. Training clears the SSM state at every multiple of
+            # artificial_seq_len (Megatron folds those boundaries into
+            # cu_seqlens), so the token at absolute position k*w opens a fresh
+            # segment. past_length is that position, since it counts the tokens
+            # already consumed. Without this, a generation crossing the window
+            # carries state training would have thrown away.
+            _w = getattr(self.config, "artificial_seq_len", 0)
+            _pos = cache_params.past_length[layer_idx]
+            if _w > 0 and _pos > 0 and _pos % _w == 0:
+                state = tuple(torch.zeros_like(t) for t in state)
 
             y_t, *state = self.step(hidden_states[:, 0, :], *state)
 
@@ -2122,6 +2167,10 @@ class OlalaMamba3MimoFast(nn.Module):
             batch, l, dim = hidden_states.shape
             assert batch == 1, "complete_slw only supports batch size of 1"
             hidden_states = hidden_states.reshape(-1, self.config.slw_wsize, dim).contiguous()
+            # The rows ARE the windows now, so caller offsets (expressed in the
+            # original L coordinates) no longer apply. One segment per window,
+            # which is what the dense path did here.
+            cu_seqlens = None
 
         # Input projection
         zxdtAtrap = self.in_proj(hidden_states)
@@ -2154,20 +2203,69 @@ class OlalaMamba3MimoFast(nn.Module):
         C = self.C_norm(C)
 
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
-        if angle_dt is not None:
-            # private kernel wants pre-cumsummed angles; the public mamba_ssm
-            # mamba3_mimo fallback (angle_dt is None) applies the cumsum itself
-            angle = angle_dt(angle, dt)
+        # No angle cumsum here: mamba3_mimo takes RAW angles and applies it
+        # internally (see the kernel imports at the top of this file).
 
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
 
+        # Route the public kernel through its VARLEN path by describing the
+        # prompt as a single segment [0, q_len]. Two wins, no kernel change:
+        #  * varlen declares S = T.dynamic, so it is compiled ONCE rather than
+        #    once per prompt length -- the dense path costs 12-18 s of tilelang
+        #    compilation for every new length (measured);
+        #  * varlen carries the two-level scan, which removes the
+        #    longest-segment bottleneck: one thread-block per (head, SEGMENT)
+        #    becomes one per (head, CHUNK-BLOCK). A 65k prefill at B=1 is
+        #    otherwise 48 blocks on 114 SMs with 4096 sequential chunk steps.
+        # Outputs match the dense path to bf16 noise (rel <= 2.1e-04, measured
+        # at S = 1024 / 1152 / 2048).
+        #
+        # Gated on `_MAMBA3_PUBLIC`, i.e. the chunk kernel actually imported.
+        #
+        # The public varlen helpers (angle_dt_fwd, dacs/segsum) assert B == 1,
+        # so a real batch is PACKED into one row: (b, l, ...) -> (1, b*l, ...)
+        # with cu_seqlens = [0, l, 2l, ..., b*l]. That IS the dense semantics --
+        # every row already starts from a zero state and never sees its
+        # neighbours -- and the per-row final states fall out for free, because
+        # varlen returns one state per SEGMENT ([NS, H, ...]), NS == b here.
+        # `cu_seqlens` from the caller is passed straight through, matching
+        # training: Megatron's dragon_mamba3.py hands packed_seq_params.cu_seqlens_q
+        # to this same kernel UNCONDITIONALLY, so the SSM state was reset at every
+        # document boundary during pretraining. (config.intra_doc_masking is an
+        # ATTENTION-only switch there -- causal vs padding_causal -- so it must NOT
+        # gate this.) Row boundaries from a batch are appended the same way.
+        # Set OLALA_MAMBA3_VARLEN=0 to force the dense path back.
+        #
+        # NB: read the batch off x, not `batch` -- complete_slw reshapes the
+        # rows into windows above and leaves `batch` stale.
+        kb, kl = x.shape[0], x.shape[1]
+        _use_varlen = (_MAMBA3_PUBLIC
+                       and os.environ.get("OLALA_MAMBA3_VARLEN", "1") != "0")
+        _varlen_kw = {}
+        if _use_varlen:
+            # When the model packed the batch, cu_seqlens already carries the
+            # row boundaries AND their per-row window resets; re-applying the
+            # window here would place it in PACKED coordinates, which is a
+            # different (wrong) set of boundaries.
+            _win = 0 if unpadded else getattr(self.config, "artificial_seq_len", 0)
+            _varlen_kw["cu_seqlens"] = _pack_cu_seqlens(
+                cu_seqlens, kb, kl, x.device, window=_win)
+            if kb > 1:
+                C     = rearrange(C,     "b l r g n -> 1 (b l) r g n")
+                B     = rearrange(B,     "b l r g n -> 1 (b l) r g n")
+                x     = rearrange(x,     "b l h p -> 1 (b l) h p")
+                z     = rearrange(z,     "b l h p -> 1 (b l) h p")
+                angle = rearrange(angle, "b l h n -> 1 (b l) h n")
+                ADT   = rearrange(ADT,   "b h l -> 1 h (b l)")
+                dt    = rearrange(dt,    "b h l -> 1 h (b l)")
+                trap  = rearrange(trap,  "b h l -> 1 h (b l)")
+
         y, kernel_state = mamba3_tilelang(
-            # No forced .bfloat16(): keep the incoming compute dtype so fp32
-            # (or mixed-precision) training isn't silently downcast here.
-            Q=C.contiguous(),
-            K=B.contiguous(),
-            V=x.contiguous(),
+            **_varlen_kw,
+            Q=C.contiguous(),#.bfloat16(),
+            K=B.contiguous(),#.bfloat16(),
+            V=x.contiguous(),#.bfloat16(),
             ADT=ADT.to(torch.float32).contiguous(),
             DT=dt.to(torch.float32).contiguous(),
             Trap=trap.contiguous(),
@@ -2183,27 +2281,43 @@ class OlalaMamba3MimoFast(nn.Module):
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
             return_state=is_prefill,
-            **(
-                {"cu_seqlens": _mamba3_cu_seqlens}
-                if _mamba3_cu_seqlens is not None
-                else {}
-            ),
         )
 
+        if _use_varlen and kb > 1:
+            y = y.reshape(kb, kl, *y.shape[2:])
+
         if is_prefill:
+            # varlen returns one state per SEGMENT, the cache holds one per ROW.
+            # Segments are row-major (row r owns r*w .. r*w+w-1), so the state
+            # generation must continue from is the LAST segment of each row --
+            # which is the point of a window reset: everything before the last
+            # boundary is deliberately forgotten. w > 1 whenever
+            # artificial_seq_len splits a row, or the caller packed documents.
+            n_seg = (_varlen_kw["cu_seqlens"].numel() - 1) if _varlen_kw else kb
+            if n_seg % kb:
+                raise ValueError(
+                    f"cache prefill got {n_seg} varlen segments over {kb} rows, "
+                    "which do not divide; the state cache is per-row.")
             angle_state_out, ssm_state_out, k_state_out, v_state_out = kernel_state
+            if _use_varlen:
+                # The public kernel sets Final_V = V[:, -1] of the WHOLE packed
+                # row (mamba3_mimo.py:127) instead of per segment, so it is only
+                # right for the last one. Recompute it: last token of each
+                # segment. Without this, batched prefill-with-cache would give
+                # every row the final row's V.
+                _ends = _varlen_kw["cu_seqlens"][1:].long() - 1
+                v_state_out = x[0, _ends].contiguous()          # (NS, H, P)
+            if n_seg != kb:
+                w = n_seg // kb
+                angle_state_out, ssm_state_out, k_state_out, v_state_out = (
+                    t.reshape(kb, w, *t.shape[1:])[:, -1].contiguous()
+                    for t in (angle_state_out, ssm_state_out, k_state_out, v_state_out)
+                )
             cache_params.mamba3_angle_states[layer_idx] = angle_state_out
             cache_params.mamba3_ssm_states[layer_idx]   = ssm_state_out
             cache_params.mamba3_k_states[layer_idx]     = k_state_out
             cache_params.mamba3_v_states[layer_idx]     = v_state_out
             cache_params.past_length[layer_idx]         += q_len
-
-        if _mamba3_flat_batch > 1:
-            # Undo the dense -> varlen flatten: (1, B*L, H, P) -> (B, L, H, P).
-            y = y.view(_mamba3_flat_batch, _mamba3_len, *y.shape[2:])
-        elif _mamba3_pad:
-            # Drop the chunk-alignment padding added above.
-            y = y[:, :_mamba3_len]
 
         y = rearrange(y, "b l h p -> b l (h p)")
         if self.config.mamba3_postgate_norm:
@@ -2510,12 +2624,12 @@ class OlalaGeodesicNorm(nn.Module):
 
         # 1-D ([1]) rather than 0-dim scalars: FSDP1/FSDP2 both reject 0-dim
         # parameters outright ("fully_shard doesn't support scalar
-        # parameters") — sharding needs a dim 0 to shard/flatten along.
+        # parameters") -- sharding needs a dim 0 to shard/flatten along.
         # Numerically identical: the only use is ``theta * scale + bias``
         # where theta is (..., 1), so [1] broadcasts the same.
-        # NOTE: checkpoints exported before this change store these as 0-dim
-        # and need scripts/olala/patch_olala_checkpoint.py (from_pretrained
-        # compares shapes before copying); re-exported checkpoints load as is.
+        # NOTE: checkpoints exported with 0-dim tensors need
+        # scripts/patch_olala_checkpoint.py before from_pretrained will load
+        # them (it compares shapes before copying).
         self.scale = nn.Parameter(torch.tensor([1.]))
         self.bias = nn.Parameter(torch.tensor([0.]))
         self.register_buffer("prosres_scalar", torch.tensor(1.0))
@@ -2539,8 +2653,8 @@ class OlalaGeodesicNorm(nn.Module):
         theta = torch.clamp(safe_tangent_norm / safe_R, max=self.clamp)
         theta = torch.clamp((theta * self.scale + self.bias) / (self.layer_idx + 1), max=self.clamp)
         output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
-        # Dtype-stability: `theta * self.scale + self.bias` promotes theta —
-        # and through cos/sin the OUTPUT — to the params' dtype, which can
+        # Dtype-stability: `theta * self.scale + self.bias` promotes theta --
+        # and through cos/sin the OUTPUT -- to the params' dtype, which can
         # differ from the residual dtype under mixed precision. Pin the
         # output to the residual dtype; no-op when dtypes already agree.
         return output.to(x.dtype)
@@ -2701,13 +2815,14 @@ class OlalaMonoBlock(GradientCheckpointingLayer):
         key_value_last_layer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        unpadded: bool = False,
         ve=None,
         **kwargs,
     ):
         # Phase-stable compute dtype under FSDP2 mixed precision + HF
         # gradient checkpointing. FSDP2's cast_forward_inputs runs inside
         # this (checkpointed) __call__ during the original forward, casting
-        # the incoming fp32 residual to bf16 — but the checkpoint saves the
+        # the incoming fp32 residual to bf16 -- but the checkpoint saves the
         # PRE-CAST input and the hook does not re-run at the same point in
         # the recompute, so every derived activation flips dtype and trips
         # torch.utils.checkpoint's check_recomputed_tensors_match. Re-apply
@@ -2739,6 +2854,7 @@ class OlalaMonoBlock(GradientCheckpointingLayer):
                 key_value_last_layer=key_value_last_layer,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                unpadded=unpadded,
                 ve=ve,
             ) # (B, L, E*D)
             if self.config.mixer_gn and not self.config.gate_before_norm:
@@ -2880,6 +2996,14 @@ class OlalaModel(OlalaPreTrainedModel):
             assert len(config.layers_ve_config) == len(config.layers_config)
             self.layers = nn.ModuleList([OlalaMonoBlock(config, layer_idx=i, layer_type=layer, mlp_type=mlp_type) if layer in ['l', 'r', 'd'] else OlalaMonoBlock(config, layer_idx=i, layer_type=layer, use_ve=int(ve), mlp_type=mlp_type) for i, (layer, ve, mlp_type) in enumerate(zip(config.layers_config, config.layers_ve_config, layers_mlp_config))])
 
+        # See the padding note in forward(); the check runs on the first batch
+        # only, padding side being a property of the collator.
+        self._padding_checked = False
+        # Can a padded batch be packed into one varlen row? Only if every
+        # mixer can express a row boundary. Mamba2 ('2') ignores cu_seqlens
+        # entirely, so rows would leak into each other there.
+        self._unpad_safe_layers = all(c in "MgTVvwt" for c in config.layers_config)
+
         self.rotary_emb = None
         if self.config.rope_type != '' and self.config.rope_theta > 0.:
             self.rotary_emb = OlalaRotaryEmbedding(config, head_dim=config.head_dim, theta=config.rope_theta)
@@ -2955,46 +3079,70 @@ class OlalaModel(OlalaPreTrainedModel):
             if self.config.patch_level_training:
                 position_ids = position_ids[:, 0:L//self.config.patch_level_training_size]
 
-        # OLALA fix: packed-batch (varlen) document masking for the ATTENTION
-        # layers. Training frameworks with use_remove_padding (verl) feed one
-        # packed (1, T) row holding many documents, position_ids resetting to
-        # 0 at each document start. The mamba3 mixers already derive their own
-        # cu_seqlens from those resets, and the diff-tpa token-shift masks at
-        # doc starts — but with intra_doc_masking off the attention mixers ran
-        # DENSE flash attention over the whole packed row, letting every
-        # document attend to all previous ones. That is a training/inference
-        # logprob mismatch (rollout_probs_diff blowup) whenever packing is on.
-        # Derive cu_seqlens once here and hand it down; the attention paths
-        # switch to flash_attn_varlen whenever it is set. Single-document
-        # rows (one reset) keep cu_seqlens=None — dense attention is already
-        # exact there, so the validated unpacked path is untouched.
-        if cu_seqlens is not None:
-            # Normalize an externally provided cu_seqlens: verl passes its
-            # packed nested-offsets (int64) whenever the forward signature
-            # accepts cu_seqlens -- but never max_seqlen, and flash_attn
-            # requires both. Same convention: one entry per document start
-            # plus the total length.
-            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)
-            if max_seqlen is None:
-                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-        elif (
-            past_key_values is None
-            and B == 1
-            and position_ids is not None
-        ):
-            _doc_starts = (position_ids[0] == 0).nonzero(as_tuple=False).flatten()
-            if _doc_starts.numel() > 1:
-                cu_seqlens = torch.cat(
-                    [
-                        _doc_starts.to(torch.int32),
-                        torch.tensor(
-                            [position_ids.shape[-1]],
-                            dtype=torch.int32,
-                            device=_doc_starts.device,
-                        ),
-                    ]
-                ).to(device=hidden_states.device, dtype=torch.int32)
-                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        # ---- padding-free packing ------------------------------------
+        # Fold a padded batch into ONE varlen row holding only the real tokens,
+        # with cu_seqlens marking the rows. Every mixer here honours those
+        # boundaries (mamba3 and GDN take cu_seqlens, attention takes the flash
+        # varlen path), so the result is exactly a per-row forward -- padding
+        # side becomes irrelevant, ragged included, and no compute is spent on
+        # pads. This is the only way this model handles LEFT padding at all:
+        # it has no attention-mask plumbing, so a pad left in place pollutes
+        # both the attention softmax and the SSM recurrence.
+        #
+        # Skipped when anything would break, and then the right-padding check
+        # below still applies:
+        #   use_cache      decode appends one token per ROW into a dense
+        #                  (B, L, h, D) KV cache, which a packed row cannot
+        #                  extend -- generation needs its own masking instead
+        #   cu_seqlens     caller already packed; its offsets are in padded
+        #                  coordinates and would not survive the gather
+        #   ATTN_IMPL      eager/flex have no varlen path (see the mixers)
+        #   layers_config  Mamba2 ('2') ignores cu_seqlens, so rows would leak
+        unpadded = False
+        if (attention_mask is not None and attention_mask.dim() == 2
+                and cu_seqlens is None and not use_cache
+                and not output_hidden_states
+                and not self.config.patch_level_training
+                and ATTN_IMPL in ("fa2", "fa3")
+                and self._unpad_safe_layers
+                and not bool(attention_mask.all())):
+            _mask = attention_mask.bool()
+            _keep = _mask.reshape(-1).nonzero().flatten()
+            _lengths = _mask.sum(-1)
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])[
+                _keep
+            ].unsqueeze(0)
+            # Position of each kept token WITHIN its row, so left padding does
+            # not shift anything.
+            position_ids = (_mask.cumsum(-1) - 1).reshape(-1)[_keep].unsqueeze(0)
+            cache_position = position_ids[0]
+            cu_seqlens = F.pad(_lengths.cumsum(0), (1, 0)).to(torch.int32)
+            _w = getattr(self.config, "artificial_seq_len", 0)
+            if _w > 0:
+                cu_seqlens = _row_window_boundaries(cu_seqlens, _lengths, _w)
+            max_seqlen = int(_lengths.max())
+            if input_ids is not None:
+                input_ids = input_ids.reshape(-1)[_keep].unsqueeze(0)
+            unpadded = True
+
+        if (not unpadded and attention_mask is not None
+                and attention_mask.dim() == 2 and not self._padding_checked):
+            # Could not pack, so the pads stay in place: only RIGHT padding is
+            # then harmless (causality keeps real tokens from seeing it, and
+            # the pads' own garbage output is dropped by the loss).
+            self._padding_checked = True
+            lengths = attention_mask.sum(-1)
+            right = (torch.arange(attention_mask.shape[1], device=attention_mask.device)[None, :]
+                     < lengths[:, None])
+            if not torch.equal(attention_mask.bool(), right):
+                raise ValueError(
+                    "attention_mask is not right-padded, and this batch could not be "
+                    "packed into a varlen row (see the conditions in "
+                    "OlalaModel.forward). Olala has no attention-mask plumbing: it "
+                    "relies on causality, which only holds when the padding is at the "
+                    "end of each row. Use padding_side='right', pack the batch "
+                    "yourself and pass cu_seqlens, or generate one sequence at a time."
+                )
 
         all_hidden_states = () if output_hidden_states else None
 
@@ -3005,6 +3153,8 @@ class OlalaModel(OlalaPreTrainedModel):
 
         shared_kv = (None, None)
         for i, block in enumerate(self.layers):
+            #if not (i == 4):
+            #    continue
             ve_i = None
             if self.config.use_value_embedding:
                 j = self.value_embedding_map[i]
@@ -3023,10 +3173,18 @@ class OlalaModel(OlalaPreTrainedModel):
                 key_value_last_layer=shared_kv,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                unpadded=unpadded,
                 ve=ve_i,
                 **kwargs,
             )
             shared_kv = (last_k, last_v)
+
+        if unpadded:
+            # Scatter the packed row back into (B, L, D); pad positions stay
+            # zero and are dropped by the loss / ignored by the caller.
+            _flat = hidden_states.new_zeros(B * L, hidden_states.shape[-1])
+            _flat[_keep] = hidden_states[0]
+            hidden_states = _flat.view(B, L, -1)
 
         if self.config.final_norm:
             hidden_states = self.final_norm(hidden_states)
@@ -3043,6 +3201,11 @@ class OlalaModel(OlalaPreTrainedModel):
             hidden_states=all_hidden_states,
         )
 OlalaModel.register_for_auto_class("AutoModel")
+
+# HuggingFace/TRL convention for "no loss here". Megatron-side data marks the
+# same positions with pad_token_id; forward() normalises both to this.
+IGNORE_INDEX = -100
+
 
 class OlalaForCausalLM(OlalaPreTrainedModel, GenerationMixin):
     def __init__(self, config: OlalaConfig):
@@ -3075,6 +3238,7 @@ class OlalaForCausalLM(OlalaPreTrainedModel, GenerationMixin):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         token_type_ids=None,
+        num_items_in_batch: Optional[Union[torch.Tensor, int]] = None,
         **kwargs,
     ) -> OlalaCausalLMOutput:
         output_hidden_states = (output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states)
@@ -3104,6 +3268,14 @@ class OlalaForCausalLM(OlalaPreTrainedModel, GenerationMixin):
         cosine_sims = None
         if labels is not None:
             labels = labels.to(hidden_states.device)
+            # Two label conventions reach this model: pretraining data marks
+            # dead positions with pad_token_id, HF/TRL marks them with -100.
+            # Normalise to -100 so every branch below agrees -- and so that
+            # cross_entropy does not trip over a negative class index.
+            # NOTE: this also makes the fused (cut_cross_entropy) path ignore
+            # pad_token_id, which the unfused path already did; a config switch
+            # should not change what the loss counts.
+            labels = labels.masked_fill(labels == self.model.padding_idx, IGNORE_INDEX)
 
             # --- Step 1: compute logits (3 paths) ---
             if self.config.normalize_lm_head:
@@ -3123,14 +3295,14 @@ class OlalaForCausalLM(OlalaPreTrainedModel, GenerationMixin):
                 if not self.config.patch_level_training:
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-                    loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=self.model.padding_idx)
+                    loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=IGNORE_INDEX)
                 else:
                     shift_logits = logits[..., :-1, :].reshape(-1, self.config.vocab_size)
                     shift_labels = labels[..., self.config.patch_level_training_size:].reshape(-1, self.config.patch_level_training_size)
                     loss = 0
                     log_probs = F.log_softmax(shift_logits, dim=-1)
                     for i in range(self.config.patch_level_training_size):
-                        loss = loss + F.nll_loss(log_probs, shift_labels[:, i])
+                        loss = loss + F.nll_loss(log_probs, shift_labels[:, i], ignore_index=IGNORE_INDEX)
                     loss = loss / self.config.patch_level_training_size
             else:
                 assert not self.config.patch_level_training, "Fused loss computation is not supported with patch-level training."
@@ -3140,12 +3312,28 @@ class OlalaForCausalLM(OlalaPreTrainedModel, GenerationMixin):
                     labels.view(-1),
                     impl="cce_exact",
                     shift=1,
+                    ignore_index=IGNORE_INDEX,
                 )
+
+            # --- Step 2b: gradient-accumulation-safe normalisation ---
+            # transformers' Trainer sees **kwargs on this forward, concludes the
+            # model handles loss kwargs, and therefore passes the GLOBAL token
+            # count and does NOT divide by gradient_accumulation_steps: it
+            # expects sum/num_items_in_batch, not a per-microbatch mean. Convert
+            # the mean back (mean * n_valid == sum). Without this, accumulated
+            # steps are scaled by ~gradient_accumulation_steps and short
+            # microbatches are over-weighted.
+            # n_valid is counted exactly as the Trainer counts num_items_in_batch:
+            # over labels[..., 1:], since the loss shifts.
+            if (num_items_in_batch is not None and loss is not None
+                    and not self.config.patch_level_training):
+                n_valid = (labels[..., 1:] != IGNORE_INDEX).sum()
+                loss = loss * (n_valid / num_items_in_batch)
 
             # --- Step 3: geodesic loss ---
             if self.config.geo_loss_coeff > 0:
                 shift_targets = labels[..., 1:].contiguous()
-                mask = shift_targets != self.model.padding_idx
+                mask = shift_targets != IGNORE_INDEX
                 if cosine_sims is not None:
                     # reuse cosine similarities from normalized path (no temperature)
                     flat_cos = cosine_sims[..., :-1, :].contiguous().view(-1, self.config.vocab_size)
