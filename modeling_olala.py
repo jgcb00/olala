@@ -47,19 +47,19 @@ except ImportError:
     mamba_chunk_scan_combined = None
     RMSNormGated = None
 
-# Mamba-3 MIMO kernels, from the public state-spaces/mamba package -- the same
-# kernels Megatron-LM training uses. Two properties matter at the call sites:
+# Mamba-3 MIMO kernels, from state-spaces/mamba -- the same kernels Megatron-LM
+# training uses. Two properties matter at the call sites:
 #  - the chunk kernel takes RAW angles and applies the angle cumsum itself, so
 #    `angle_dt` stays None and must NOT be applied beforehand;
 #  - it returns a bare tensor when return_state=False, so the wrapper below
 #    normalizes to the (y, state) tuple this file unpacks.
-_MAMBA3_PUBLIC = False   # True once the chunk kernel is available
+_HAS_MAMBA3_CHUNK = False   # True once the chunk kernel imported
 angle_dt = None
 try:
-    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as _mamba3_mimo_public
+    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as _mamba3_mimo
 
     def mamba3_tilelang(*, return_state=False, **kwargs):
-        out = _mamba3_mimo_public(return_state=return_state, **kwargs)
+        out = _mamba3_mimo(return_state=return_state, **kwargs)
         if not return_state:
             return out, None
         # mamba3_mimo returns a FLAT 5-tuple
@@ -71,7 +71,7 @@ try:
         y, *state = out
         return y, tuple(state)
 
-    _MAMBA3_PUBLIC = True
+    _HAS_MAMBA3_CHUNK = True
 except ImportError as _e:
     mamba3_tilelang = None
     print(f"mamba3: no chunk kernel ({_e}) -- the model cannot run")
@@ -80,7 +80,7 @@ except ImportError as _e:
 # cached decode instead of the whole model.
 try:
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import (
-        mamba3_step_fn as _mamba3_step_fn_public,
+        mamba3_step_fn as _mamba3_step_fn_impl,
     )
     from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
         apply_rotary_qk_inference_fwd,
@@ -96,7 +96,7 @@ try:
         # fallback to recompute: that costs ~5000x per token and would look
         # like the model is merely slow.
         try:
-            return _mamba3_step_fn_public(*a, **kw)
+            return _mamba3_step_fn_impl(*a, **kw)
         except TypeError as e:
             raise RuntimeError(
                 "mamba3 cached decode unavailable: the CuteDSL step kernel "
@@ -104,11 +104,11 @@ try:
                 "apache-tvm-ffi versions, or generate with use_cache=False."
             ) from e
 
-    print("mamba3: public chunk + decode kernels (cached generation available)")
+    print("mamba3: chunk + decode kernels (cached generation available)")
 except ImportError as _e:
     mamba3_step_fn = None
     apply_rotary_qk_inference_fwd = None
-    print(f"mamba3: public chunk kernel only, no decode kernel ({_e}) "
+    print(f"mamba3: chunk kernel only, no decode kernel ({_e}) "
           f"-> generate with use_cache=False")
 
 try:
@@ -2209,7 +2209,7 @@ class OlalaMamba3MimoFast(nn.Module):
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
 
-        # Route the public kernel through its VARLEN path by describing the
+        # Route the chunk kernel through its VARLEN path by describing the
         # prompt as a single segment [0, q_len]. Two wins, no kernel change:
         #  * varlen declares S = T.dynamic, so it is compiled ONCE rather than
         #    once per prompt length -- the dense path costs 12-18 s of tilelang
@@ -2221,9 +2221,9 @@ class OlalaMamba3MimoFast(nn.Module):
         # Outputs match the dense path to bf16 noise (rel <= 2.1e-04, measured
         # at S = 1024 / 1152 / 2048).
         #
-        # Gated on `_MAMBA3_PUBLIC`, i.e. the chunk kernel actually imported.
+        # Gated on `_HAS_MAMBA3_CHUNK`: no kernel, no varlen path.
         #
-        # The public varlen helpers (angle_dt_fwd, dacs/segsum) assert B == 1,
+        # The varlen helpers (angle_dt_fwd, dacs/segsum) assert B == 1,
         # so a real batch is PACKED into one row: (b, l, ...) -> (1, b*l, ...)
         # with cu_seqlens = [0, l, 2l, ..., b*l]. That IS the dense semantics --
         # every row already starts from a zero state and never sees its
@@ -2240,7 +2240,7 @@ class OlalaMamba3MimoFast(nn.Module):
         # NB: read the batch off x, not `batch` -- complete_slw reshapes the
         # rows into windows above and leaves `batch` stale.
         kb, kl = x.shape[0], x.shape[1]
-        _use_varlen = (_MAMBA3_PUBLIC
+        _use_varlen = (_HAS_MAMBA3_CHUNK
                        and os.environ.get("OLALA_MAMBA3_VARLEN", "1") != "0")
         _varlen_kw = {}
         if _use_varlen:
@@ -2300,7 +2300,7 @@ class OlalaMamba3MimoFast(nn.Module):
                     "which do not divide; the state cache is per-row.")
             angle_state_out, ssm_state_out, k_state_out, v_state_out = kernel_state
             if _use_varlen:
-                # The public kernel sets Final_V = V[:, -1] of the WHOLE packed
+                # The chunk kernel sets Final_V = V[:, -1] of the WHOLE packed
                 # row (mamba3_mimo.py:127) instead of per segment, so it is only
                 # right for the last one. Recompute it: last token of each
                 # segment. Without this, batched prefill-with-cache would give
@@ -2967,6 +2967,31 @@ class OlalaPreTrainedModel(PreTrainedModel):
         if isinstance(model, nn.Module):
             model.widen_geodesic_scalars()
         return model
+
+    def save_pretrained(self, *args, state_dict=None, **kwargs):
+        """Write GeodesicNorm scale/bias back out 0-dim.
+
+        The widening above is an in-MEMORY concern (FSDP), and 0-dim is the
+        canonical on-disk shape -- every export and the vLLM loader assume it.
+        Leaving [1] in the file would re-create the corruption this whole dance
+        avoids, just mirrored: a [1] checkpoint against the 0-dim declaration in
+        __init__ is a recorded mismatch, and transformers REINITIALIZES
+        mismatched keys before any hook can intervene.
+
+        It is also the only shape vLLM can take. Its OlalaGeodesicNorm declares
+        [1] and loads with copy_, which broadcasts a 0-dim tensor up to [1] but
+        NOT a [1] tensor down to 0-dim -- so 0-dim on disk loads everywhere,
+        while [1] on disk loads only where the parameter is already [1].
+        """
+        if state_dict is None:
+            state_dict = self.state_dict()
+        squeezed = dict(state_dict)
+        for key, value in state_dict.items():
+            if (".geodesic_" in key
+                    and key.rsplit(".", 1)[-1] in OlalaGeodesicNorm._SCALARS
+                    and getattr(value, "shape", None) == (1,)):
+                squeezed[key] = value.reshape(())
+        return super().save_pretrained(*args, state_dict=squeezed, **kwargs)
 
 @dataclass
 class OlalaOutput(ModelOutput):

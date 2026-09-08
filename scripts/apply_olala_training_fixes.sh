@@ -17,8 +17,9 @@
 #   6. verl transfer_queue simple_storage.py : don't let one malformed ZMQ
 #      frame kill a storage worker thread permanently. (optional hardening)
 #
-# NOT done here (weights, not code): widening the checkpoint's 0-dim
-# scale/bias tensors — run scripts/patch_olala_checkpoint.py for that.
+# NOT done here, and no longer needed anywhere: the checkpoint's 0-dim
+# scale/bias tensors. modeling_olala.py widens them in memory after loading
+# and saves them back 0-dim, so no checkpoint rewrite is involved.
 #
 # Usage:
 #   ./apply_olala_training_fixes.sh \
@@ -614,9 +615,8 @@ for name, status, detail in results:
     fail |= status.startswith("FAIL")
 print()
 if ckpt:
-    print("NOTE: this patches checkpoint *code* only. If the checkpoint's")
-    print("      scale/bias weights are still 0-dim, also run")
-    print("      patch_olala_checkpoint.py (from_pretrained rejects the")
-    print("      shape mismatch otherwise).")
+    print("NOTE: this patches checkpoint *code* only. 0-dim scale/bias")
+    print("      weights need nothing: modeling_olala.py widens them after")
+    print("      loading and writes them back 0-dim on save.")
 sys.exit(1 if fail else 0)
 PY

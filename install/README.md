@@ -51,11 +51,11 @@ echo "$OLALA_HOME/mamba"      > $SP/mamba_public.pth
 echo "$OLALA_HOME/scattermoe" > $SP/scattermoe.pth
 cp olala-fixes/install/selective_scan_cuda.py $SP/
 
-# checkpoint (already 0-dim-patched + fixed modeling)
-cp -r /data/home/erisa.kohansal/olala/patched_checkpoint $OLALA_HOME/patched_checkpoint
-# ...or build one from a RAW checkpoint (widens the 144 0-dim GeodesicNorm
-# params to [1] — FSDP rejects scalar parameters; symlinks everything else):
-#   venv/bin/python olala-fixes/scripts/patch_olala_checkpoint.py RAW_CKPT $OLALA_HOME/patched_checkpoint
+# checkpoint: use a RAW export as it is. No pre-patching step any more --
+# modeling_olala.py widens the 144 0-dim GeodesicNorm params to [1] itself
+# after loading (FSDP rejects scalar parameters) and writes them back 0-dim on
+# save, so the on-disk shape never changes.
+CKPT=/data/home/gaetan.caillaut/dragon-sft/7A1B/training/checkpoints/65k-betterpacks-lrfix/huggingface/iter_0099518
 
 # apply every training fix (idempotent)
 ./olala-fixes/scripts/apply_olala_training_fixes.sh \
