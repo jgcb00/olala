@@ -24,6 +24,22 @@ env was built with, so what you serve matches what you trained against. It warns
 before starting if `MAX_LEN` is not a multiple of 144, or if `MAX_NUM_SEQS`
 exceeds what the KV cache holds at that length — both explained in its NOTES.
 
+## Or take the image
+
+Same env, same pins, built by the same script — `docker/` runs
+`setup_olala_env.sh` rather than re-implementing it, so the two cannot drift.
+
+```bash
+./docker/build.sh                 # build, tag from the commit, push
+PUSH=0 ./docker/build.sh          # build only
+```
+
+`git.corp.linguacustodia.com:5050/gcaillaut/olala-env/olala:<short sha>`. It adds
+**TRL** on top of the snapshot (which was frozen for verl and does not include
+it), and is based on `nvcr.io/nvidia/pytorch:26.05-py3` for the NCCL/RDMA
+userspace — but *not* for its torch, which is 2.12/CUDA 13.2 and cannot load the
+vLLM fork's precompiled binaries. See [docker/README.md](docker/README.md).
+
 ## What it pins
 
 | source | pin |
