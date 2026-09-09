@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM
+from .configuration_olala import OlalaConfig
+from .modeling_olala import OlalaForCausalLM
 from .coordcheck_utils import get_coord_data, plot_coord_data
 
 # TRITON_HOME="/p/project1/jureap140/temp" python make_coord_check.py
@@ -38,7 +38,7 @@ class RandomDataset(Dataset):
         return data.cuda(), data.cuda()
 
 def lazy_model(width):
-    config_hf = DragonConfig(
+    config_hf = OlalaConfig(
         layers_config=args.layers_config,
         hidden_size=width,
         intermediate_size=4*width,
@@ -73,7 +73,7 @@ def lazy_model(width):
         config_hf.use_uscaling = False
         config_hf.initializer_range = 0.006
 
-    return lambda: DragonForCausalLM(config_hf).to("cuda")
+    return lambda: OlalaForCausalLM(config_hf).to("cuda")
 
 def param_groups_mup(model, base_lr_hidden, base_lr_scalar, base_lr_embed, base_lr_head, wd):
     groups, seen = [], set()

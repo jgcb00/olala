@@ -9,8 +9,8 @@ import numpy as np
 
 import torch
 
-from .configuration_dragon import DragonConfig
-from .modeling_dragon import DragonForCausalLM
+from .configuration_olala import OlalaConfig
+from .modeling_olala import OlalaForCausalLM
 
 @dataclass
 class Args:
@@ -27,7 +27,7 @@ class NanoArgs:
     n_heads : int = 6 # head dim 128 suggested by @Grad62304977
     head_dim: Optional[int] = None
     layers_config : str = 4*"lrdlr"
-    expand_factor : int = 2 # expand factor for Mamba/Dragon
+    expand_factor : int = 2 # expand factor for Mamba/Olala
     rope_type_local: str = "" #p-rope
     rope_type_global: str = "" #p-rope
     rope_theta_local: float = 10000.0
@@ -294,7 +294,7 @@ val_loader = DistributedDataLoader(run_args.val_bin, False, B, T, 0, 1, args.bos
 print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 # load model.
-config_hf = DragonConfig(
+config_hf = OlalaConfig(
     tie_lm_head=args.tie_lm_head,
     mlp_type=args.mlp_type,
     layer_norm_scaling=args.layer_norm_scaling,
@@ -381,7 +381,7 @@ config_hf = DragonConfig(
     mlp_linking=args.mlp_linking
 )
 
-model = DragonForCausalLM.from_pretrained(run_args.load_dir, config=config_hf, torch_dtype=torch.bfloat16)
+model = OlalaForCausalLM.from_pretrained(run_args.load_dir, config=config_hf, torch_dtype=torch.bfloat16)
 model = model.cuda()
 
 model = torch.compile(model, dynamic=args.compile_dynamic) if args.compile else model

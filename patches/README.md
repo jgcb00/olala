@@ -11,7 +11,7 @@ Target: [shawntan/scattermoe](https://github.com/shawntan/scattermoe)
 The scattermoe triton kernels (`scatter2scatter`) require activations, gates
 and expert weights to share a dtype (`tl.dot` asserts otherwise). Under FSDP
 bf16 mixed precision over fp32 master weights (verl's default with
-`model_dtype=fp32`), Dragon's modeling code feeds fp32 activations into bf16
+`model_dtype=fp32`), Olala's modeling code feeds fp32 activations into bf16
 compute params — and the two `ParallelExperts` of one MLP can even see
 different compute dtypes depending on how their params were wrapped. The patch
 makes each `ParallelExperts.forward` cast the weight and gates to the

@@ -1,0 +1,145 @@
+# =============================================================================
+# Olala checkpoint conversion, both directions, GPU or CPU.
+#
+#   docker compose run --rm mg2hf        # Megatron -> HF, 1 GPU, converts AND verifies
+#   docker compose run --rm mg2hf-cpu    # Megatron -> HF, no GPU, converts only
+#   docker compose run --rm hf2mg        # HF -> Megatron (CPU by design, see below)
+#
+# Prefer ./convert.sh, which wraps these.
+#
+# mg2hf vs mg2hf-cpu
+# ------------------
+# Same image, same output. `mg2hf` is the reference: it runs the weight-level
+# audit AND a forward pass through both models, comparing logits. `mg2hf-cpu`
+# never instantiates the Megatron model (TransformerEngine refuses to build its
+# modules without CUDA) and reads the torch_dist store directly instead -- see
+# mg_cpu_loader.py. It still runs the weight audit, which is what catches a
+# tensor left at its random init or truncated by a dtype narrowing; it just
+# cannot run the forward comparison. Use it when you want the artifact quickly
+# and something else will validate it, and `mg2hf` when the conversion itself is
+# what is in question.
+#
+# hf2mg has no GPU variant on purpose
+# -----------------------------------
+# load_hf_save_mg.py is CPU-only BY DESIGN, not by omission: TransformerEngine
+# cannot build its modules without CUDA, so the Megatron model is never
+# instantiated and the DCP store is written directly (mg_cpu_writer.py). There
+# is nothing for a GPU to do. It also needs a REFERENCE Megatron checkpoint --
+# an HF export carries neither Megatron's `args` Namespace nor the padded vocab
+# rows. See the module docstring.
+#
+# Knobs live in `.env` (copy .env.example). Override inline:
+#
+#   GPU=3 ITERATION=2400 \
+#   LOAD_DIR=/some/where/megatron SAVE_DIR=/some/where/huggingface/iter_0002400 \
+#   docker compose run --rm mg2hf
+#
+# Notes:
+#  - The model code is mounted from the olala checkout and bound to the
+#    package name `olala` by _olala_pkg.py, so the converter exports exactly the
+#    modeling_olala.py this repo ships. There is no second copy to drift.
+#  - MEGATRON_LM_DIR must point at a Megatron-LM checkout INSIDE the container;
+#    its host tree is mounted below.
+#  - Create SAVE_DIR yourself first (mkdir -p) -- if docker creates the missing
+#    host dir for the bind mount it will be root-owned. Output files are written
+#    as root either way; `sudo chown -R $USER` after if that bothers you.
+#  - torchrun (not plain python) for mg2hf*: the script calls
+#    dist.init_process_group with init_method='env://'. The CPU path uses gloo
+#    but still goes through torchrun. hf2mg needs neither.
+#  - The selected GPU appears as device 0 inside the container, so no
+#    CUDA_VISIBLE_DEVICES is needed.
+# =============================================================================
+
+x-convert-base: &convert-base
+  image: ${CONVERT_IMAGE:-git.corp.linguacustodia.com:5050/gcaillaut/olala-sft:convert-ckpt}
+  pull_policy: missing
+  working_dir: /work/convert
+  shm_size: 32gb
+  environment:
+    # Resolved INSIDE the container.
+    MEGATRON_LM_DIR: ${MEGATRON_LM_DIR:-/data/home/gaetan.caillaut/dragon-sft/7A1B/training/Megatron-LM}
+    OLALA_TOKENIZER_DIR: ${OLALA_TOKENIZER_DIR:-/data/home/gaetan.caillaut/dragon-sft/7A1B/tokenizers/tokenizer-channels-v3}
+    OLALA_PKG_DIR: /work
+  volumes:
+    # The olala checkout: model code (repo root) + this convert/ dir.
+    - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
+    # Megatron-LM + the tokenizers, at their host paths so the env defaults resolve.
+    - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+    # The tokenizer copied into the export, mounted in its own right so it may
+    # live anywhere -- not only under DRAGON_SFT_DIR.
+    - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
+
+services:
+  # --------------------------------------------------------------- Megatron -> HF
+  mg2hf:
+    <<: *convert-base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ "${GPU:-0}" ]   # which host GPU, e.g. GPU=3
+              capabilities: [ gpu ]
+    volumes:
+      - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
+      - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+      - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
+      - ${LOAD_DIR:?set LOAD_DIR in .env}:${LOAD_DIR}:ro
+      - ${SAVE_DIR:?set SAVE_DIR in .env}:${SAVE_DIR}
+    command:
+      - torchrun
+      - --standalone
+      - --nproc-per-node=1
+      - load_mg_save_hf.py
+      - --load-dir
+      - ${LOAD_DIR}
+      - --save_dir
+      - ${SAVE_DIR}
+      - --iteration
+      - ${ITERATION:?set ITERATION in .env}
+
+  mg2hf-cpu:
+    <<: *convert-base
+    # No deploy.resources -> no GPU is attached to this container at all.
+    volumes:
+      - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
+      - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+      - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
+      - ${LOAD_DIR:?set LOAD_DIR in .env}:${LOAD_DIR}:ro
+      - ${SAVE_DIR:?set SAVE_DIR in .env}:${SAVE_DIR}
+    command:
+      - torchrun
+      - --standalone
+      - --nproc-per-node=1
+      - load_mg_save_hf.py
+      - --cpu
+      - --load-dir
+      - ${LOAD_DIR}
+      - --save_dir
+      - ${SAVE_DIR}
+      - --iteration
+      - ${ITERATION:?set ITERATION in .env}
+
+  # --------------------------------------------------------------- HF -> Megatron
+  hf2mg:
+    <<: *convert-base
+    volumes:
+      - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
+      - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+      - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
+      - ${HF_DIR:?set HF_DIR in .env}:${HF_DIR}:ro
+      - ${REF_MG_DIR:?set REF_MG_DIR in .env}:${REF_MG_DIR}:ro
+      - ${MG_SAVE_DIR:?set MG_SAVE_DIR in .env}:${MG_SAVE_DIR}
+    command:
+      - python
+      - load_hf_save_mg.py
+      - --hf-dir
+      - ${HF_DIR}
+      - --ref-mg-dir
+      - ${REF_MG_DIR}
+      - --ref-iteration
+      - ${REF_ITERATION:?set REF_ITERATION in .env}
+      - --save-dir
+      - ${MG_SAVE_DIR}
+      - --iteration
+      - ${MG_ITERATION:-1}
