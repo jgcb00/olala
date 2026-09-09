@@ -35,31 +35,47 @@ echo "== env check =="
 
 echo
 echo "== toolchain =="
-# The 12.x nvcc is not decoration: tilelang and CuTeDSL compile the mamba3
-# kernels on the first forward pass, and a missing or 13.x-only toolkit is a
-# failure at that point rather than at startup.
+# tilelang and CuTeDSL compile the mamba3 kernels on the first forward pass, so
+# a toolkit and a host g++ have to be here. WHICH toolkit is the open question
+# this block exists to answer, rather than assert.
+#
+# The image ships only the base's CUDA 13.2, on the evidence that tilelang
+# declares nvidia-cuda-nvcc>=13.0.48 and the snapshot already carries that
+# compiler as wheels (nvidia-cuda-nvcc 13.2.86, nvvm, crt, tileiras) plus
+# cuda-pathfinder, which resolves CUDA components out of site-packages before
+# the system. An earlier build apt-added CUDA 12.8 alongside; that is gone.
+#
+# But serve.sh globs /usr/local/cuda-12.* and exports CUDA_HOME, and on the dev
+# box that picks 12.9 -- so a cu12 nvcc on PATH is the configuration that has
+# actually been RUN. Here the glob misses. If a mamba3 JIT ever fails with a
+# compiler error, this is the first place to look, and the answer is a toolkit
+# matching torch's cu128, not a guess.
 echo "  CUDA_HOME    ${CUDA_HOME:-unset}"
 if [ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]; then
-    echo "  nvcc         $("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
+    echo "  nvcc (PATH)  $("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')  at $CUDA_HOME"
 else
     echo "  nvcc         MISSING at \$CUDA_HOME/bin/nvcc -- the mamba3 JIT will fail" >&2
     exit 1
 fi
-case "$("$CUDA_HOME/bin/nvcc" --version)" in
-    *"release 12."*) ;;
-    *) echo "  WARN: \$CUDA_HOME is not a 12.x toolkit; torch here is a cu128 build" >&2;;
-esac
 echo "  c++          $(c++ --version 2>/dev/null | head -1 || echo 'MISSING -- nvcc has no host compiler')"
 
-# LD_LIBRARY_PATH must not reach the base image's own torch: its libtorch would
-# shadow ours through the loader's search order and break the ABI silently.
-case "${LD_LIBRARY_PATH:-}" in
-    *dist-packages/torch*)
-        echo "  ERROR: LD_LIBRARY_PATH still contains the base image's torch/lib:" >&2
-        echo "         $LD_LIBRARY_PATH" >&2
-        exit 1;;
-    *) echo "  LD_LIBRARY_PATH clean of the base image's torch";;
-esac
+# What the JIT stack itself will pick, which need not be the one on PATH.
+"$PY" - <<'PYEOF'
+import shutil
+try:
+    import cuda.pathfinder as cp
+    print(f"  pathfinder   cuda.pathfinder {getattr(cp, '__version__', '(no __version__)')}"
+          " -- CUDA components resolve from site-packages first")
+except Exception as exc:
+    print(f"  pathfinder   unavailable ({type(exc).__name__}) -- the JIT falls back to CUDA_HOME")
+for mod in ("nvidia.cuda_nvcc", "nvidia.cuda_nvrtc", "nvidia.cuda_nvcc_cu12"):
+    try:
+        m = __import__(mod, fromlist=["__path__"])
+        print(f"  wheel nvcc   {mod} at {list(m.__path__)[0]}")
+    except Exception:
+        pass
+print(f"  nvcc on PATH {shutil.which('nvcc') or 'not found'}")
+PYEOF
 
 echo
 echo "== gpu =="

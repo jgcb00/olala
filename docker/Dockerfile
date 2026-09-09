@@ -41,9 +41,16 @@
 #
 # So `uv venv` here creates a venv WITHOUT system site-packages: the base
 # image's torch in /usr/local/lib/python3.12/dist-packages is never on the path.
-# What the base image is actually used for is everything around torch --
-# python3.12, the NCCL 2.30 / OpenMPI / UCX / EFA / RDMA userspace that
-# multi-node verl runs need, nsight, and a devel CUDA toolchain with a host g++.
+# What the base image is actually used for is everything around torch:
+# python3.12 (the interpreter the snapshot's cp312 wheels need), a devel CUDA
+# toolchain with a host g++ for the runtime JIT, the OpenMPI / UCX / EFA /
+# libibverbs userspace a multi-node verl run reaches the fabric through, and
+# nsight.
+#
+# NOT its NCCL, despite what an earlier version of this comment claimed: the
+# snapshot pins nvidia-nccl-cu12==2.28.9, so torch loads its own and the base
+# image's 2.30 is never used. The RDMA/EFA system libraries underneath it are
+# used, since NCCL dlopens libibverbs from the system.
 #
 # Two consequences are handled explicitly below, and both are silent failures if
 # you forget them:
@@ -58,30 +65,37 @@
 
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
 
-# A CUDA 12.x toolkit, because the base image only has 13.2 and the mamba3
-# kernels JIT at RUNTIME through tilelang/CuTeDSL against a cu128 torch. This is
-# not a build-time convenience: without a 12.x nvcc the image starts fine and
-# then dies on the first forward pass.
+# NO EXTRA CUDA TOOLKIT IS INSTALLED. An earlier version of this file apt-added
+# CUDA 12.8 alongside the base image's 13.2, on the strength of the comment at
+# setup_olala_env.sh:88 -- "torch is +cu128 and the mamba3 kernels JIT at
+# runtime via tilelang/CuTe, so a 12.x toolkit must stay on PATH". Checking that
+# claim against the snapshot says otherwise, so the layer (791 MB, twice) is
+# gone:
 #
-# Measured on 26.05-py3: these six packages add 791 MB and land nvcc 12.8.93 in
-# /usr/local/cuda-12.8. They install ALONGSIDE 13.2 -- /usr/local/cuda still
-# points at 13.2 afterwards, which is why CUDA_HOME is set explicitly in the
-# runtime stage rather than left to the symlink. setup_olala_env.sh's own
-# auto-detection finds this tree too: it globs /usr/local/cuda-12.* and sorts
-# -V -r, and apt's update-alternatives symlink /usr/local/cuda-12 has no dot so
-# it does not shadow the real one.
+#   - tilelang, which is what JITs the mamba3 kernels, declares
+#     `nvidia-cuda-nvcc>=13.0.48` -- the CUDA *13* package line, not cu12.
+#   - the snapshot already installs that compiler as wheels:
+#     nvidia-cuda-nvcc==13.2.86, nvidia-cuda-crt==13.3.73, nvidia-nvvm==13.2.86,
+#     nvidia-cuda-tileiras==13.2.86.
+#   - cuda-pathfinder==1.5.5 is in the snapshot too. That is NVIDIA's resolver,
+#     and it looks inside site-packages BEFORE the system.
 #
-# Deliberately not the full toolkit. If a JIT step ever asks for cuBLAS or
-# cuRAND headers, add libcublas-dev-12-8 / libcurand-dev-12-8 here.
-# Declared before the first FROM so both stages can default from it.
-ARG CUDA12_HOME=/usr/local/cuda-12.8
-ARG CUDA12_PKGS="cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8 cuda-nvrtc-dev-12-8 cuda-driver-dev-12-8 cuda-profiler-api-12-8"
+# So the JIT compiler ships in the venv and it is a 13.x one, which this base
+# has natively. What is genuinely cu12 is the numerics half -- torch cu128,
+# nvidia-cublas-cu12 12.8.4.1, nvidia-cuda-runtime-cu12 12.8.90,
+# flashinfer-jit-cache 0.6.12+cu128, cuda-python 12.9.7 -- and every one of
+# those is a bundled wheel that needs no system toolkit at all.
+#
+# THE ONE THING THIS CHANGES, and it is not yet proven either way: serve.sh
+# globs /usr/local/cuda-12.* and, unlike setup_olala_env.sh, actually exports
+# CUDA_HOME and prepends it to PATH. On the dev box (12.6/12.9/13.1/13.2/13.3
+# installed) that glob picks 12.9, so a 12.x nvcc winning on PATH is the
+# configuration that has been RUN -- not one shown to be required. Here the glob
+# misses and serve.sh falls back to /usr/local/cuda = 13.2. verify.sh reports
+# which nvcc the JIT stack actually resolves, so the first GPU run settles it.
 
 
 FROM ${BASE_IMAGE} AS builder
-
-ARG CUDA12_HOME
-ARG CUDA12_PKGS
 
 # Hopper. Only consulted by build steps that compile CUDA here; the mamba3
 # kernels are TileLang/Triton and target the live device at runtime, so this
@@ -103,21 +117,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # snapshot must not see it.
 ENV PIP_CONSTRAINT=
 
-# ---- 1. The CUDA 12.x toolkit ----------------------------------------------
-# The keyring is REQUIRED, not a precaution: the base image ships CUDA 13.2 but
-# carries no /etc/apt/sources.list.d entry for developer.download.nvidia.com, so
-# without this there is no apt source that has a 12.8 to install. ubuntu2404 is
-# right per the base image's org.opencontainers.image.version label (24.04
-# noble).
-RUN curl -4 -fsSL -o /tmp/cuda-keyring.deb \
-        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-    && dpkg -i /tmp/cuda-keyring.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ${CUDA12_PKGS} \
-    && rm -rf /var/lib/apt/lists/* /tmp/cuda-keyring.deb \
-    && "${CUDA12_HOME}/bin/nvcc" --version
-
-# ---- 2. uv, pinned to the version the dev box builds with ------------------
+# ---- 1. uv, pinned to the version the dev box builds with ------------------
 COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /usr/local/bin/uv
 
 # UV_LINK_MODE=copy because UV_CACHE_DIR is a build cache mount below: uv
@@ -129,7 +129,7 @@ ENV UV_LINK_MODE=copy \
     UV_CACHE_DIR=/root/.cache/uv \
     PYTHONUNBUFFERED=1
 
-# ---- 3. The build script and its inputs ------------------------------------
+# ---- 2. The build script and its inputs ------------------------------------
 # Only these two files, so editing the README or docker/build.sh does not
 # invalidate the ~1 h of layers below. OLALA_HOME is left at its default
 # ($REPO/env) rather than moved to /opt/olala: serve.sh derives OLALA_HOME from
@@ -138,31 +138,30 @@ ENV UV_LINK_MODE=copy \
 WORKDIR ${APP}
 COPY setup_olala_env.sh serve.sh ./
 
-# CUDA_HOME and PATH must be set HERE, not left to the script. The script's own
-# CUDA_HOME detection (the `/usr/local/cuda-12.*` glob) is a plain shell
-# assignment that it never exports -- it feeds the step-1 warning and the final
-# summary and nothing else -- so it does NOT reach any setup.py the install
-# shells out to.
+# CUDA_HOME is NOT set here: the base image already sets it to /usr/local/cuda
+# (13.2), which is the only toolkit present, and that is what we want any source
+# build to use.
 #
-# That matters because two steps can compile CUDA from source:
+# Worth knowing that the script will not help you here either. Its own CUDA_HOME
+# detection -- the `/usr/local/cuda-12.*` glob -- is a plain shell assignment it
+# NEVER EXPORTS: it feeds the step-1 warning and the final summary, and nothing
+# else. It therefore does not reach any setup.py the install shells out to. In
+# this image the glob finds nothing, CUDA_HOME falls back to /usr/local/cuda,
+# and step 1's `nvcc` check passes against 13.2 without a warning.
+#
+# Two steps can compile CUDA from source, and both will use 13.2:
 #
 #   step 3  causal-conv1d==1.6.2.post1 is SDIST-ONLY on PyPI. Its setup.py first
-#           guesses a prebuilt wheel URL from the torch in the build env and only
-#           compiles when that 404s -- and under build isolation that torch is
-#           whatever `torch` (unpinned, in its build-system requires) resolves
-#           to, not necessarily the 2.11 in the venv. So the fallback compile is
-#           reachable.
+#           guesses a prebuilt wheel URL from the torch in the build env and
+#           only compiles when that 404s, so the compile path is reachable.
 #   step 5  mamba_ssm has the same download-then-compile pattern.
 #
-# Without this, either of those would build against the base image's
-# /usr/local/cuda -- 13.2, first on PATH -- while torch is a cu128 build.
-# Pointing both at the 12.8 tree keeps a source build consistent with the venv,
-# and makes the script's detection a no-op rather than a second opinion.
-ENV CUDA_HOME=${CUDA12_HOME} \
-    PATH=${CUDA12_HOME}/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin \
-    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+# If either turns out to need a cu12 host toolchain, that is the signal to
+# revisit -- and the fix is a toolkit matching torch, not the 12.8 guess this
+# file used to carry.
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
-# ---- 4. Run the install, one step per layer --------------------------------
+# ---- 3. Run the install, one step per layer --------------------------------
 # ONLY=<n> rather than FROM=1, because two of the eleven steps cannot run in a
 # build (the third skipped one, 11, is just the summary):
 #   step 7  verifies a checkpoint loads. There is no checkpoint in the image --
@@ -201,7 +200,7 @@ RUN ONLY=6 bash setup_olala_env.sh
 RUN --mount=type=cache,target=/root/.cache/uv \
     ONLY=8 bash setup_olala_env.sh
 
-# ---- 5. trl + bitsandbytes, and the check that this build is actually an env
+# ---- 4. trl + bitsandbytes, and the check that this build is actually an env
 # Step 10 of the script, not a bespoke RUN. This used to install trl here and
 # only here, which meant `bash setup_olala_env.sh` on a dev box produced an
 # environment WITHOUT trl while the image had it -- a difference in the one
@@ -219,7 +218,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY docker/check_env.py ${APP}/check_env.py
 RUN cd /tmp && ${APP}/env/.venv/bin/python ${APP}/check_env.py
 
-# ---- 6. Record the pins, then prune, inside the builder --------------------
+# ---- 5. Record the pins, then prune, inside the builder --------------------
 # Both halves must happen HERE. A file deleted in a later layer of the final
 # image still occupies its bytes in the layer that created it, so pruning after
 # the stage boundary would save nothing.
@@ -262,19 +261,8 @@ RUN ${APP}/env/.venv/bin/python -m compileall -q -j 0 \
 # precompiled base wheel and the .git dirs out of what gets pushed.
 FROM ${BASE_IMAGE}
 
-ARG CUDA12_HOME
-ARG CUDA12_PKGS
-
 ENV DEBIAN_FRONTEND=noninteractive \
     APP=/opt/olala-env
-
-# Not a build-time leftover: this is the toolkit the runtime JIT uses.
-RUN curl -4 -fsSL -o /tmp/cuda-keyring.deb \
-        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
-    && dpkg -i /tmp/cuda-keyring.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ${CUDA12_PKGS} \
-    && rm -rf /var/lib/apt/lists/* /tmp/cuda-keyring.deb
 
 # One layer holding only the final state. THE DESTINATION PATH MUST MATCH THE
 # BUILDER EXACTLY: env/renderers is an editable install and env/scattermoe is
@@ -285,15 +273,15 @@ COPY docker/verify.sh ${APP}/verify.sh
 RUN chmod 0755 ${APP}/verify.sh ${APP}/setup_olala_env.sh ${APP}/serve.sh
 
 # ---- The runtime contract -------------------------------------------------
-# CUDA_HOME is the 12.8 tree, not the base image's 13.2 /usr/local/cuda: the JIT
-# has to match the cu128 torch. Both toolkits are present; only the default
-# moves.
-ENV CUDA_HOME=${CUDA12_HOME} \
-    VIRTUAL_ENV=${APP}/env/.venv
+# CUDA_HOME is left as the base image sets it, /usr/local/cuda (13.2): it is the
+# only toolkit here, and it is the major tilelang asks for. The cu12 half of the
+# stack -- torch cu128 and every nvidia-*-cu12 library -- is bundled wheels
+# inside the venv and does not consult it.
+ENV VIRTUAL_ENV=${APP}/env/.venv
 
-# The venv first, then the 12.8 toolchain, then the base image's PATH minus its
-# torch_tensorrt/bin entry -- that torch is not on the path any more.
-ENV PATH=${APP}/env/.venv/bin:${CUDA12_HOME}/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin
+# The venv first, then the base image's PATH minus its torch_tensorrt/bin entry
+# -- that torch is not on the path any more.
+ENV PATH=${APP}/env/.venv/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin
 
 # THE IMPORTANT ONE. The base image's LD_LIBRARY_PATH starts with
 # /usr/local/lib/python3.12/dist-packages/torch/lib -- its own torch 2.12. Torch

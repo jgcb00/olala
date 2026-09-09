@@ -84,19 +84,18 @@ built against torch 2.11's C++ ABI; the snapshot's `flash-attn` is a
 not re-resolvable, so it cannot be re-solved onto another torch.
 
 So the image builds the pinned venv **without** system site-packages, and uses
-the base image for what surrounds torch: python3.12, the NCCL 2.30 / OpenMPI /
-UCX / EFA / RDMA userspace that multi-node verl runs need, nsight, and a devel
-CUDA toolchain with a host `g++`.
+the base image for what surrounds torch: python3.12 (the interpreter the
+snapshot's `cp312` wheels need), a devel CUDA toolchain with a host `g++` for the
+runtime JIT, the OpenMPI / UCX / EFA / libibverbs userspace a multi-node verl run
+reaches the fabric through, and nsight.
 
-Three consequences, all of them silent if you get them wrong, and all handled
-in the Dockerfile:
+Not its NCCL: the snapshot pins `nvidia-nccl-cu12==2.28.9`, so torch loads its
+own and the base image's 2.30 is never used. The RDMA/EFA system libraries under
+it *are* used, since NCCL dlopens `libibverbs` from the system.
 
-* **A CUDA 12.x toolkit is installed alongside 13.2** (nvcc 12.8.93, +791 MB),
-  and `CUDA_HOME` points at it. The mamba3 kernels JIT through tilelang/CuTeDSL
-  on the *first forward pass*, against a cu128 torch. With only a 13.2 nvcc the
-  container starts fine and then dies mid-inference. Both toolkits stay
-  installed and `/usr/local/cuda` still resolves to 13.2, so `CUDA_HOME` is set
-  explicitly rather than left to the symlink.
+Two consequences, both silent if you get them wrong, both handled in the
+Dockerfile:
+
 * **`LD_LIBRARY_PATH` is rewritten** to drop the base image's
   `dist-packages/torch/lib`. Torch wheels resolve `libtorch`/`libc10` through
   `DT_RUNPATH`, which the loader searches *after* `LD_LIBRARY_PATH` — leaving
@@ -104,7 +103,39 @@ in the Dockerfile:
 * **`PIP_CONSTRAINT` is cleared.** The base image points it at NVIDIA's
   constraint file, which pins torch to the NGC build.
 
-`verify.sh` asserts all three.
+`verify.sh` asserts both.
+
+## Which CUDA toolkit the JIT uses
+
+**No extra toolkit is installed.** An earlier version of this image apt-added
+CUDA 12.8 alongside the base's 13.2 (+791 MB, in both stages), on the strength of
+the comment at `setup_olala_env.sh:88` — *"torch is +cu128 and the mamba3 kernels
+JIT at runtime via tilelang/CuTe, so a 12.x toolkit must stay on PATH"*. Checked
+against the snapshot, that does not hold:
+
+* `tilelang` — which is what JITs the mamba3 kernels, i.e. the reason the comment
+  gives — declares **`nvidia-cuda-nvcc>=13.0.48`**, the CUDA *13* package line.
+* The snapshot already installs that compiler as wheels: `nvidia-cuda-nvcc==13.2.86`,
+  `nvidia-cuda-crt==13.3.73`, `nvidia-nvvm==13.2.86`, `nvidia-cuda-tileiras==13.2.86`.
+* `cuda-pathfinder==1.5.5` is in there too — NVIDIA's resolver, which looks inside
+  site-packages **before** the system.
+
+So the JIT compiler ships in the venv and it is a 13.x one, which this base has
+natively. What genuinely is cu12 — torch cu128, `nvidia-cublas-cu12==12.8.4.1`,
+`nvidia-cuda-runtime-cu12==12.8.90`, `flashinfer-jit-cache==0.6.12+cu128`,
+`cuda-python==12.9.7` — is all bundled wheels that consult no system toolkit.
+
+**The open question.** `serve.sh` globs `/usr/local/cuda-12.*` and, unlike the
+setup script, *does* `export CUDA_HOME` and prepend it to `PATH`. On the dev box
+(12.6/12.9/13.1/13.2/13.3 installed) that picks 12.9 — so a cu12 nvcc winning on
+`PATH` is the configuration that has been **run**, not one shown to be required.
+Here the glob misses and `serve.sh` falls back to `/usr/local/cuda` = 13.2.
+
+`verify.sh` reports which nvcc is on `PATH`, whether `cuda-pathfinder` is present,
+and which wheel-provided nvcc the venv carries — so the first real GPU run
+settles it. If a mamba3 JIT ever fails with a compiler error, that is the first
+place to look, and the fix is a toolkit matching torch's cu128, not the 12.8
+guess this file used to carry.
 
 ## Build shape
 
@@ -133,10 +164,10 @@ site-packages has the wheel the checkout is build detritus.
 
 One package in the snapshot compiles: `causal-conv1d` is sdist-only on PyPI, and
 its `setup.py` tries a prebuilt-wheel download first and falls back to a CUDA
-build. `CUDA_HOME` and `PATH` are pointed at the 12.8 tree for the whole builder
-stage so that fallback matches the cu128 torch instead of the base image's 13.2
-nvcc — the script's own `CUDA_HOME` detection is a plain shell variable it never
-exports, so it does not reach any `setup.py`.
+build. That fallback will use the base image's 13.2 — note the script's own
+`CUDA_HOME` detection cannot help, being a plain shell variable it never exports,
+so it never reaches any `setup.py`. `mamba_ssm` in step 5 has the same
+download-then-compile shape.
 
 Cold builds are long: most of the time is `uv pip sync` of the ~20 GB snapshot
 plus the vLLM install pulling torch 2.11 a second time into a throwaway build
