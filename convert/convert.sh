@@ -6,6 +6,13 @@
 #   ./convert.sh hf2mg          # HF -> Megatron (CPU by design)
 #   ./convert.sh                # same as: mg2hf
 #
+# The tokenizer copied into a Megatron -> HF export is OLALA_TOKENIZER_DIR. Set
+# it in .env, or per run:
+#
+#   ./convert.sh mg2hf cpu --tokenizer /path/to/tokenizer-channels-v4
+#
+# It is mounted read-only at its own host path, so it may live anywhere.
+#
 # Knobs (LOAD_DIR / SAVE_DIR / ITERATION / GPU / HF_DIR / REF_MG_DIR / ...)
 # live in .env next to this file; start from .env.example. Override inline:
 #
@@ -26,6 +33,18 @@ if ! grep -q '^OLALA_DIR=' .env; then
     export OLALA_DIR="$(cd .. && pwd)"
     echo ">> OLALA_DIR not in .env; using $OLALA_DIR"
 fi
+
+# --tokenizer may appear anywhere; strip it out, keep the positionals.
+positional=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --tokenizer) [ -n "${2:-}" ] || { echo "--tokenizer needs a path" >&2; exit 2; }
+                     export OLALA_TOKENIZER_DIR=$2; shift 2 ;;
+        --tokenizer=*) export OLALA_TOKENIZER_DIR=${1#*=}; shift ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+set -- "${positional[@]+"${positional[@]}"}"
 
 direction=${1:-mg2hf}
 mode=${2:-gpu}
@@ -48,7 +67,7 @@ case "$direction" in
         service=hf2mg
         ;;
     -h|--help|help)
-        sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *)
@@ -67,6 +86,16 @@ esac
 if [ -n "$dest" ] && [ ! -d "$dest" ]; then
     echo ">> mkdir -p $dest"
     mkdir -p "$dest"
+fi
+
+# Checked here so a wrong path fails with a sentence, not a docker mount error.
+if [ "$direction" = mg2hf ]; then
+    tok=${OLALA_TOKENIZER_DIR:-}
+    [ -n "$tok" ] || { echo "ERROR: OLALA_TOKENIZER_DIR is unset (set it in .env or pass --tokenizer)" >&2; exit 1; }
+    [ -d "$tok" ] || { echo "ERROR: tokenizer dir not found: $tok" >&2; exit 1; }
+    [ -f "$tok/tokenizer_config.json" ] \
+        || { echo "ERROR: no tokenizer_config.json in $tok" >&2; exit 1; }
+    echo ">> tokenizer   $tok"
 fi
 
 echo ">> docker compose run --rm $service"

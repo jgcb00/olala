@@ -65,6 +65,9 @@ x-convert-base: &convert-base
     - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
     # Megatron-LM + the tokenizers, at their host paths so the env defaults resolve.
     - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+    # The tokenizer copied into the export, mounted in its own right so it may
+    # live anywhere -- not only under DRAGON_SFT_DIR.
+    - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
 
 services:
   # --------------------------------------------------------------- Megatron -> HF
@@ -80,6 +83,7 @@ services:
     volumes:
       - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
       - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+      - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
       - ${LOAD_DIR:?set LOAD_DIR in .env}:${LOAD_DIR}:ro
       - ${SAVE_DIR:?set SAVE_DIR in .env}:${SAVE_DIR}
     command:
@@ -100,6 +104,7 @@ services:
     volumes:
       - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
       - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+      - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
       - ${LOAD_DIR:?set LOAD_DIR in .env}:${LOAD_DIR}:ro
       - ${SAVE_DIR:?set SAVE_DIR in .env}:${SAVE_DIR}
     command:
@@ -121,6 +126,7 @@ services:
     volumes:
       - ${OLALA_DIR:?set OLALA_DIR in .env}:/work
       - ${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:${DRAGON_SFT_DIR:-/data/home/gaetan.caillaut/dragon-sft}:ro
+      - ${OLALA_TOKENIZER_DIR:?set OLALA_TOKENIZER_DIR in .env}:${OLALA_TOKENIZER_DIR}:ro
       - ${HF_DIR:?set HF_DIR in .env}:${HF_DIR}:ro
       - ${REF_MG_DIR:?set REF_MG_DIR in .env}:${REF_MG_DIR}:ro
       - ${MG_SAVE_DIR:?set MG_SAVE_DIR in .env}:${MG_SAVE_DIR}

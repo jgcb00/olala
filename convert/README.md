@@ -8,7 +8,13 @@ cp .env.example .env        # then edit the paths
 ./convert.sh mg2hf          # Megatron -> HF, 1 GPU: converts AND verifies
 ./convert.sh mg2hf cpu      # Megatron -> HF, no GPU: converts only
 ./convert.sh hf2mg          # HF -> Megatron (CPU by design)
+
+# the tokenizer copied into an export, per run rather than via .env:
+./convert.sh mg2hf cpu --tokenizer /path/to/tokenizer-channels-v4
 ```
+
+`LOAD_DIR` is the **parent** of `iter_XXXXXXX/`, not the iter dir itself —
+Megatron appends `iter_{ITERATION:07d}`.
 
 ## The model code has one home
 
@@ -107,6 +113,7 @@ own — `docker compose pull mg2hf` to force it. Override the tag with
 | `convert.sh` | entry point: direction + gpu/cpu |
 | `docker-compose.yml` | `mg2hf`, `mg2hf-cpu`, `hf2mg` |
 | `.env.example` | every knob, documented |
+| `OLALA_TOKENIZER_DIR` | the tokenizer an export ships; mounted read-only at its own host path, so it may live anywhere. `--tokenizer` overrides it per run |
 | `Dockerfile` | conversion image |
 | `_olala_pkg.py` | binds the repo root to the package name `olala` |
 | `load_mg_save_hf.py` | Megatron → HF, plus the audit and forward check |
