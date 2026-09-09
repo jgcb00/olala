@@ -138,13 +138,33 @@ ENV UV_LINK_MODE=copy \
 WORKDIR ${APP}
 COPY setup_olala_env.sh serve.sh ./
 
-# CUDA_HOME is left unset on purpose: the script picks the highest
-# /usr/local/cuda-12.* that has an nvcc, which is the tree installed above.
-ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+# CUDA_HOME and PATH must be set HERE, not left to the script. The script's own
+# CUDA_HOME detection (the `/usr/local/cuda-12.*` glob) is a plain shell
+# assignment that it never exports -- it feeds the step-1 warning and the final
+# summary and nothing else -- so it does NOT reach any setup.py the install
+# shells out to.
+#
+# That matters because two steps can compile CUDA from source:
+#
+#   step 3  causal-conv1d==1.6.2.post1 is SDIST-ONLY on PyPI. Its setup.py first
+#           guesses a prebuilt wheel URL from the torch in the build env and only
+#           compiles when that 404s -- and under build isolation that torch is
+#           whatever `torch` (unpinned, in its build-system requires) resolves
+#           to, not necessarily the 2.11 in the venv. So the fallback compile is
+#           reachable.
+#   step 5  mamba_ssm has the same download-then-compile pattern.
+#
+# Without this, either of those would build against the base image's
+# /usr/local/cuda -- 13.2, first on PATH -- while torch is a cu128 build.
+# Pointing both at the 12.8 tree keeps a source build consistent with the venv,
+# and makes the script's detection a no-op rather than a second opinion.
+ENV CUDA_HOME=${CUDA12_HOME} \
+    PATH=${CUDA12_HOME}/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 
 # ---- 4. Run the install, one step per layer --------------------------------
-# ONLY=<n> rather than FROM=1, because two of the ten steps cannot run in a
-# build:
+# ONLY=<n> rather than FROM=1, because two of the eleven steps cannot run in a
+# build (the third skipped one, 11, is just the summary):
 #   step 7  verifies a checkpoint loads. There is no checkpoint in the image --
 #           it is a 13 GB volume -- so this is a runtime check, and
 #           docker/verify.sh runs it against a mounted export.

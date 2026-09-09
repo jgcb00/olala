@@ -109,7 +109,8 @@ in the Dockerfile:
 ## Build shape
 
 One `RUN` per step of `setup_olala_env.sh`, invoked as `ONLY=<n>`, so the image
-and the dev box run the same code. Two of the ten steps are skipped:
+and the dev box run the same code. Two of the eleven steps are skipped (a third,
+11, is just the summary):
 
 * **step 7** loads a checkpoint. There is none in the image — `verify.sh` runs
   it against a mounted export instead.
@@ -129,6 +130,13 @@ layer that created it, so the vLLM build tree (several GB), the precompiled base
 wheel and the `.git` directories can only be dropped across a stage boundary.
 `env/vllm-fork` goes entirely — step 4 installs vLLM non-editable, so once
 site-packages has the wheel the checkout is build detritus.
+
+One package in the snapshot compiles: `causal-conv1d` is sdist-only on PyPI, and
+its `setup.py` tries a prebuilt-wheel download first and falls back to a CUDA
+build. `CUDA_HOME` and `PATH` are pointed at the 12.8 tree for the whole builder
+stage so that fallback matches the cu128 torch instead of the base image's 13.2
+nvcc — the script's own `CUDA_HOME` detection is a plain shell variable it never
+exports, so it does not reach any `setup.py`.
 
 Cold builds are long: most of the time is `uv pip sync` of the ~20 GB snapshot
 plus the vLLM install pulling torch 2.11 a second time into a throwaway build
