@@ -10,7 +10,9 @@ Files here:
 - `requirements.txt` — frozen snapshot of the validated environment
   (everything except vllm, which is installed from the `jgcb00/vllm` fork,
   branch `dragon-v0.26` — the only vLLM that registers `OlalaForCausalLM`,
-  which is what the converter now writes into `config.json`).
+  the architecture the converter now writes into `config.json`. Pin
+  f0fbc70ca or later: earlier tips reproduced pretraining's
+  artificial_seq_len SSM resets, which the model must not have).
   Install with `uv pip sync` (NOT `install`: the snapshot is intentionally
   not re-resolvable — numpy 2.4.6 vs mistral-common's `<2.4` pin).
 - `selective_scan_cuda.py` — import-only stub to drop into `site-packages`.
@@ -28,7 +30,7 @@ mkdir -p $OLALA_HOME && cd $OLALA_HOME
 uv venv venv --python /usr/bin/python3.12
 
 # pinned sources
-git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 7bb4e2575
+git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout f0fbc70ca
 git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 761b409
 git clone --filter=blob:none https://github.com/shawntan/scattermoe.git scattermoe && git -C scattermoe checkout 47b5e15
 git clone --filter=blob:none https://github.com/jgcb00/olala.git olala
