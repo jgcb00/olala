@@ -84,10 +84,21 @@ DRAGON_AGENTIC_DIR=${DRAGON_AGENTIC_DIR:-$REPO}
 CKPT=${CKPT:-$REPO/checkpoints/sft}
 
 # ---- Toolchain --------------------------------------------------------------
-# torch is +cu128 and the mamba3 kernels JIT at runtime via tilelang/CuTe, so a
-# 12.x toolkit must stay on PATH. Auto-pick the highest 12.x; override with CUDA_HOME.
+# The mamba3 kernels JIT at runtime via tilelang/CuTe, so a CUDA toolkit must
+# stay on PATH. Auto-pick the NEWEST installed; override with CUDA_HOME.
+#
+# Not "the highest 12.x", which is what this used to say on the theory that the
+# JIT had to match torch's cu128 build. tilelang declares
+# nvidia-cuda-nvcc>=13.0.48 -- the CUDA 13 line -- and install/requirements.txt
+# already ships that compiler as wheels (nvidia-cuda-nvcc, nvvm, crt, tileiras,
+# 13.x) alongside cuda-pathfinder, which looks in site-packages before the
+# system. Kept identical to serve.sh on purpose: the two disagreeing about which
+# toolkit the env uses is exactly the drift this repo exists to prevent.
+#
+# NOTE this value is NOT exported. It feeds the step-1 warning and the summary,
+# nothing else -- no setup.py the install shells out to ever sees it.
 if [ -z "${CUDA_HOME:-}" ]; then
-    for d in $(ls -d /usr/local/cuda-12.* 2>/dev/null | sort -V -r); do
+    for d in $(ls -d /usr/local/cuda-[0-9]* 2>/dev/null | sort -V -r); do
         [ -x "$d/bin/nvcc" ] && { CUDA_HOME=$d; break; }
     done
 fi

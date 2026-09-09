@@ -86,13 +86,15 @@ ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
 # flashinfer-jit-cache 0.6.12+cu128, cuda-python 12.9.7 -- and every one of
 # those is a bundled wheel that needs no system toolkit at all.
 #
-# THE ONE THING THIS CHANGES, and it is not yet proven either way: serve.sh
-# globs /usr/local/cuda-12.* and, unlike setup_olala_env.sh, actually exports
-# CUDA_HOME and prepends it to PATH. On the dev box (12.6/12.9/13.1/13.2/13.3
-# installed) that glob picks 12.9, so a 12.x nvcc winning on PATH is the
-# configuration that has been RUN -- not one shown to be required. Here the glob
-# misses and serve.sh falls back to /usr/local/cuda = 13.2. verify.sh reports
-# which nvcc the JIT stack actually resolves, so the first GPU run settles it.
+# serve.sh and setup_olala_env.sh now glob /usr/local/cuda-[0-9]* and take the
+# NEWEST toolkit rather than the highest 12.x, so the image and a dev box agree:
+# here that resolves to the base's 13.2, and on the dev box to its 13.3. Before
+# that change serve.sh pinned itself to 12.9 and the two disagreed.
+#
+# Still worth knowing it is a NEW choice on both. Nothing has yet JIT-compiled a
+# mamba3 kernel against a 13.x toolkit -- every run to date used the 12.9 the old
+# glob picked. verify.sh reports which nvcc is on PATH and which the venv's own
+# wheels provide, so the first GPU run on either settles it.
 
 
 FROM ${BASE_IMAGE} AS builder
@@ -143,11 +145,11 @@ COPY setup_olala_env.sh serve.sh ./
 # build to use.
 #
 # Worth knowing that the script will not help you here either. Its own CUDA_HOME
-# detection -- the `/usr/local/cuda-12.*` glob -- is a plain shell assignment it
-# NEVER EXPORTS: it feeds the step-1 warning and the final summary, and nothing
-# else. It therefore does not reach any setup.py the install shells out to. In
-# this image the glob finds nothing, CUDA_HOME falls back to /usr/local/cuda,
-# and step 1's `nvcc` check passes against 13.2 without a warning.
+# detection -- the `/usr/local/cuda-[0-9]*` glob -- is a plain shell assignment
+# it NEVER EXPORTS: it feeds the step-1 warning and the final summary, and
+# nothing else. It therefore does not reach any setup.py the install shells out
+# to. In this image it resolves to /usr/local/cuda-13.2 and step 1's `nvcc`
+# check passes without a warning.
 #
 # Two steps can compile CUDA from source, and both will use 13.2:
 #

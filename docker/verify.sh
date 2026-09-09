@@ -45,11 +45,11 @@ echo "== toolchain =="
 # cuda-pathfinder, which resolves CUDA components out of site-packages before
 # the system. An earlier build apt-added CUDA 12.8 alongside; that is gone.
 #
-# But serve.sh globs /usr/local/cuda-12.* and exports CUDA_HOME, and on the dev
-# box that picks 12.9 -- so a cu12 nvcc on PATH is the configuration that has
-# actually been RUN. Here the glob misses. If a mamba3 JIT ever fails with a
-# compiler error, this is the first place to look, and the answer is a toolkit
-# matching torch's cu128, not a guess.
+# serve.sh and setup_olala_env.sh glob /usr/local/cuda-[0-9]* and take the
+# newest, so the image and a dev box agree -- 13.2 here, 13.3 there. That is a
+# NEW choice on both: every run to date used the 12.9 the old cuda-12.* glob
+# picked, so nothing has yet JIT-compiled a mamba3 kernel against 13.x. If one
+# ever fails with a compiler error, this is the first place to look.
 echo "  CUDA_HOME    ${CUDA_HOME:-unset}"
 if [ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]; then
     echo "  nvcc (PATH)  $("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')  at $CUDA_HOME"

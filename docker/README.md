@@ -125,11 +125,18 @@ natively. What genuinely is cu12 — torch cu128, `nvidia-cublas-cu12==12.8.4.1`
 `nvidia-cuda-runtime-cu12==12.8.90`, `flashinfer-jit-cache==0.6.12+cu128`,
 `cuda-python==12.9.7` — is all bundled wheels that consult no system toolkit.
 
-**The open question.** `serve.sh` globs `/usr/local/cuda-12.*` and, unlike the
-setup script, *does* `export CUDA_HOME` and prepend it to `PATH`. On the dev box
-(12.6/12.9/13.1/13.2/13.3 installed) that picks 12.9 — so a cu12 nvcc winning on
-`PATH` is the configuration that has been **run**, not one shown to be required.
-Here the glob misses and `serve.sh` falls back to `/usr/local/cuda` = 13.2.
+Both `serve.sh` and `setup_olala_env.sh` glob `/usr/local/cuda-[0-9]*` and take
+the **newest** toolkit, not the highest 12.x, so the image and a dev box agree —
+13.2 here, 13.3 there. Pinning to 12.x also had a cost worth noting:
+`serve.sh` prepends `$CUDA_HOME/lib64` to `LD_LIBRARY_PATH`, which is searched
+before a wheel's `DT_RUNPATH`, and a 12.x tree carries `libcudart.so.12` /
+`libcublas.so.12` — the same sonames the cu12 wheels provide — so it shadowed the
+very libraries torch was built against with a different minor. A 13.x tree bumps
+every soname, so nothing collides.
+
+**The open question.** This is a *new* choice on both sides: every run to date
+used the 12.9 the old glob picked, so nothing has yet JIT-compiled a mamba3
+kernel against a 13.x toolkit.
 
 `verify.sh` reports which nvcc is on `PATH`, whether `cuda-pathfinder` is present,
 and which wheel-provided nvcc the venv carries — so the first real GPU run

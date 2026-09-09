@@ -38,9 +38,11 @@ PUSH=0 ./docker/build.sh          # build only
 and **bitsandbytes** are not in the snapshot — it was frozen for verl, which
 needs neither — so step 10 adds them; the image runs that step rather than
 installing them itself, so a dev-box build and the image cannot differ. Based on
-`nvcr.io/nvidia/pytorch:26.05-py3` for the NCCL/RDMA
-userspace — but *not* for its torch, which is 2.12/CUDA 13.2 and cannot load the
-vLLM fork's precompiled binaries. See [docker/README.md](docker/README.md).
+`nvcr.io/nvidia/pytorch:26.05-py3` for python3.12, a CUDA toolchain with a host
+`g++`, and the RDMA/EFA userspace — but *not* for its torch, which is 2.12/CUDA
+13.2 and cannot load the vLLM fork's precompiled binaries, nor for its NCCL,
+since the snapshot pins `nvidia-nccl-cu12`. See
+[docker/README.md](docker/README.md).
 
 ## What it pins
 

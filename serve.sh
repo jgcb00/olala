@@ -37,9 +37,26 @@ done
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$GPU}
 
 # The mamba3 kernels JIT at RUNTIME via tilelang/CuTe, so a CUDA toolkit must be
-# on PATH here, not just at build time.
+# on PATH here, not just at build time. Take the NEWEST one installed.
+#
+# This used to glob /usr/local/cuda-12.* on the theory that the JIT had to match
+# torch's cu128 build. It does not: tilelang declares nvidia-cuda-nvcc>=13.0.48
+# -- the CUDA 13 package line -- and the frozen snapshot already ships that
+# compiler as wheels (nvidia-cuda-nvcc, nvvm, crt, tileiras, all 13.x) plus
+# cuda-pathfinder, which resolves CUDA components out of site-packages before
+# the system. The cu12 half of the stack (torch cu128 and every nvidia-*-cu12
+# library) is bundled wheels that consult no system toolkit at all.
+#
+# Pinning to 12.x also had a cost. LD_LIBRARY_PATH below is searched BEFORE a
+# wheel's DT_RUNPATH, and a 12.x tree carries libcudart.so.12 / libcublas.so.12
+# -- the same sonames the cu12 wheels provide -- so it shadowed the exact
+# libraries torch was built against with a different minor. A 13.x tree bumps
+# every soname, so nothing collides.
+#
+# [0-9] rather than a bare *, to skip non-version siblings like cuda-samples.
+# `sort -V -r` puts a real 13.2 above the bare cuda-13 major symlink.
 if [ -z "${CUDA_HOME:-}" ]; then
-    for d in $(ls -d /usr/local/cuda-12.* 2>/dev/null | sort -V -r); do
+    for d in $(ls -d /usr/local/cuda-[0-9]* 2>/dev/null | sort -V -r); do
         [ -x "$d/bin/nvcc" ] && { CUDA_HOME=$d; break; }
     done
 fi
