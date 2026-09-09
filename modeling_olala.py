@@ -1941,34 +1941,17 @@ class OlalaMamba2(nn.Module):
 
         return y, None, None
 
-def _pack_cu_seqlens(cu_seqlens, batch, seqlen, device, window=0):
+def _pack_cu_seqlens(cu_seqlens, batch, seqlen, device):
     """cu_seqlens for a (batch, seqlen) input packed into ONE varlen row.
 
     Row i occupies [i*seqlen, (i+1)*seqlen), so rows stay independent exactly as
-    they are in the dense path. Inside a row we rebuild what Megatron's
-    dragon_mamba3.py feeds the same kernel: the caller's document boundaries,
-    merged with a state reset every `window` tokens (config.artificial_seq_len,
-    0 = disabled).
-
-    Kept sync-free in the common cases -- torch.unique has a data-dependent
-    output size and forces a device->host stall, once per mamba layer.
+    they are in the dense path. Inside a row the caller's document boundaries
+    (if any) are passed straight through; nothing else is added.
     """
-    windowed = 0 < window < seqlen
     if cu_seqlens is None:
-        if not windowed:
-            inner = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
-        else:
-            inner = torch.arange(0, seqlen + 1, window, dtype=torch.int32, device=device)
-            if seqlen % window:  # both are Python ints: no sync
-                inner = torch.cat([inner, torch.tensor([seqlen], dtype=torch.int32, device=device)])
+        inner = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
     else:
         inner = cu_seqlens.to(device=device, dtype=torch.int32).flatten()
-        if windowed:
-            # only case that needs a merge, and the only one that stalls
-            inner = torch.unique(torch.cat([
-                inner, torch.arange(0, seqlen + 1, window, dtype=torch.int32, device=device),
-                torch.tensor([0, seqlen], dtype=torch.int32, device=device),
-            ]), sorted=True)
 
     if batch == 1:
         return inner.contiguous()
@@ -1977,20 +1960,6 @@ def _pack_cu_seqlens(cu_seqlens, batch, seqlen, device, window=0):
         (inner[:-1].unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1),
         torch.full((1,), batch * seqlen, dtype=torch.int32, device=device),
     ])
-
-
-def _row_window_boundaries(cu_seqlens, lengths, window):
-    """Add artificial_seq_len boundaries INSIDE each row of a packed batch.
-
-    Windows restart per row, matching training: there one row is the whole
-    packed sequence (Megatron asserts micro_batch_size == 1), so the boundary
-    is measured from that row's own start, not from the start of the pack.
-    """
-    bounds = []
-    for start, length in zip(cu_seqlens[:-1].tolist(), lengths.tolist()):
-        bounds.extend(range(start, start + length, window))
-    bounds.append(int(cu_seqlens[-1]))
-    return torch.tensor(bounds, dtype=torch.int32, device=cu_seqlens.device)
 
 
 class OlalaMamba3MimoFast(nn.Module):
@@ -2134,17 +2103,6 @@ class OlalaMamba3MimoFast(nn.Module):
                 cache_params.mamba3_v_states[layer_idx],
             )
 
-            # Window reset. Training clears the SSM state at every multiple of
-            # artificial_seq_len (Megatron folds those boundaries into
-            # cu_seqlens), so the token at absolute position k*w opens a fresh
-            # segment. past_length is that position, since it counts the tokens
-            # already consumed. Without this, a generation crossing the window
-            # carries state training would have thrown away.
-            _w = getattr(self.config, "artificial_seq_len", 0)
-            _pos = cache_params.past_length[layer_idx]
-            if _w > 0 and _pos > 0 and _pos % _w == 0:
-                state = tuple(torch.zeros_like(t) for t in state)
-
             y_t, *state = self.step(hidden_states[:, 0, :], *state)
 
             (
@@ -2242,13 +2200,7 @@ class OlalaMamba3MimoFast(nn.Module):
         _use_varlen = os.environ.get("OLALA_MAMBA3_VARLEN", "1") != "0"
         _varlen_kw = {}
         if _use_varlen:
-            # When the model packed the batch, cu_seqlens already carries the
-            # row boundaries AND their per-row window resets; re-applying the
-            # window here would place it in PACKED coordinates, which is a
-            # different (wrong) set of boundaries.
-            _win = 0 if unpadded else getattr(self.config, "artificial_seq_len", 0)
-            _varlen_kw["cu_seqlens"] = _pack_cu_seqlens(
-                cu_seqlens, kb, kl, x.device, window=_win)
+            _varlen_kw["cu_seqlens"] = _pack_cu_seqlens(cu_seqlens, kb, kl, x.device)
             if kb > 1:
                 C     = rearrange(C,     "b l r g n -> 1 (b l) r g n")
                 B     = rearrange(B,     "b l r g n -> 1 (b l) r g n")
@@ -2287,10 +2239,8 @@ class OlalaMamba3MimoFast(nn.Module):
         if is_prefill:
             # varlen returns one state per SEGMENT, the cache holds one per ROW.
             # Segments are row-major (row r owns r*w .. r*w+w-1), so the state
-            # generation must continue from is the LAST segment of each row --
-            # which is the point of a window reset: everything before the last
-            # boundary is deliberately forgotten. w > 1 whenever
-            # artificial_seq_len splits a row, or the caller packed documents.
+            # generation must continue from is the LAST segment of each row.
+            # w > 1 whenever the caller packed several documents into a row.
             n_seg = (_varlen_kw["cu_seqlens"].numel() - 1) if _varlen_kw else kb
             if n_seg % kb:
                 raise ValueError(
@@ -3202,9 +3152,6 @@ class OlalaModel(OlalaPreTrainedModel):
             position_ids = (_mask.cumsum(-1) - 1).reshape(-1)[_keep].unsqueeze(0)
             cache_position = position_ids[0]
             cu_seqlens = F.pad(_lengths.cumsum(0), (1, 0)).to(torch.int32)
-            _w = getattr(self.config, "artificial_seq_len", 0)
-            if _w > 0:
-                cu_seqlens = _row_window_boundaries(cu_seqlens, _lengths, _w)
             max_seqlen = int(_lengths.max())
             if input_ids is not None:
                 input_ids = input_ids.reshape(-1)[_keep].unsqueeze(0)

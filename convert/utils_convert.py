@@ -872,11 +872,6 @@ def load_hf_config(config_mg, vocab_size, wsize):
         logits_scaling_ngpt=False,
     )    
     config_hf.slw_wsize = wsize
-    # Megatron resets the mamba SSM state every artificial_seq_len tokens (it
-    # merges those boundaries into the cu_seqlens handed to mamba3_mimo, see
-    # dragon_mamba3.py). Carry it so the HF model reproduces the same resets;
-    # without it a >artificial_seq_len context silently diverges from training.
-    config_hf.artificial_seq_len = getattr(config_mg, "artificial_seq_len", 0)
     return config_hf
 
 
