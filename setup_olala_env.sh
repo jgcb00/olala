@@ -37,8 +37,8 @@ VENV=${VENV:-$OLALA_HOME/.venv}          # NOTE: .venv here, `venv` in the guide
 PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python3.12}
 
 # ---- Pinned sources (SHAs, not branches: a moving branch changes the build) --
-VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/gcaillaut/vllm.git}
-VLLM_FORK_REF=${VLLM_FORK_REF:-7bb4e2575ad43b111f65eec6f4367b479bf01c25}   # branch olala-v0.26
+VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/jgcb00/vllm.git}
+VLLM_FORK_REF=${VLLM_FORK_REF:-f0fbc70ca4a46748cd6c79c91b59fd03bf312ce3}   # branch dragon-v0.26 (Olala rename, no artificial_seq_len resets)
 VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # upstream base for the precompiled wheel
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
@@ -55,8 +55,8 @@ SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
 # The model code, the converter and the applier. This is also where the HF
 # checkpoint's modeling_olala.py comes from, so the pin decides what a
 # re-export ships.
-OLALA_URL=${OLALA_URL:-https://github.com/gcaillaut/olala.git}
-OLALA_REF=${OLALA_REF:-e9b89e541a199d84a8c43c75fe072c4e8702e2c7}   # feat/checkpoint-backports
+OLALA_URL=${OLALA_URL:-https://github.com/jgcb00/olala.git}
+OLALA_REF=${OLALA_REF:-09b67092cd2410bb006ed3831ac87311e05ef89c}   # main (Olala rename merged, artificial_seq_len dropped)
 
 # Build from a LOCAL olala checkout instead of cloning (handy while iterating:
 # no push needed, and no risk of testing a stale remote). Empty = clone OLALA_URL.

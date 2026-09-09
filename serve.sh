@@ -139,11 +139,10 @@ exec "$VENV/bin/vllm" serve "$CKPT" \
 #
 #   M3_SCAN_BLOCK                nothing in the fork reads it.
 #
-#   OLALA_WINDOW_DECODE_RESET    the fork already defaults it to "0", and exports
-#                   from iter_0090000 on carry artificial_seq_len=0, which gates
-#                   every reset path off regardless. Setting it to 1 on such a
-#                   checkpoint would inject SSM state clears the model never
-#                   trained with -- a correctness risk, not a tuning knob.
+#   OLALA_WINDOW_DECODE_RESET    gone. artificial_seq_len was a pretraining-only
+#                   Megatron optimisation, never a property of the model; the
+#                   jgcb00/vllm pin (f0fbc70ca+) and jgcb00/olala main carry no
+#                   SSM window resets at all, so there is nothing to gate.
 #
 # no --chat-template   vLLM reads chat_template.jinja from the checkpoint, and
 #                   that template carries the tool-metadata fix from

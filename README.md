@@ -48,8 +48,8 @@ since the snapshot pins `nvidia-nccl-cu12`. See
 
 | source | pin |
 |---|---|
-| [gcaillaut/olala](https://github.com/gcaillaut/olala) | `e9b89e5` — model code, converter, parsers, renderer, the applier |
-| [gcaillaut/vllm](https://github.com/gcaillaut/vllm) `olala-v0.26` | `7bb4e2575` — the fork that knows `OlalaForCausalLM` |
+| [jgcb00/olala](https://github.com/jgcb00/olala) `main` | `09b6709` — model code, converter, parsers, renderer, the applier |
+| [jgcb00/vllm](https://github.com/jgcb00/vllm) `dragon-v0.26` | `f0fbc70ca` — the fork that knows `OlalaForCausalLM` |
 | mamba | upstream `state-spaces/mamba`, pip, `--no-deps` |
 | scattermoe | `47b5e15` |
 | renderers | `d4707862` |
