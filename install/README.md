@@ -8,7 +8,9 @@ The step-by-step guide (with troubleshooting table) lives on Notion:
 Files here:
 
 - `requirements.txt` — frozen snapshot of the validated environment
-  (everything except vllm, which is installed from the `jgcb00/vllm` fork).
+  (everything except vllm, which is installed from the `jgcb00/vllm` fork,
+  branch `dragon-v0.26` — the only vLLM that registers `OlalaForCausalLM`,
+  which is what the converter now writes into `config.json`).
   Install with `uv pip sync` (NOT `install`: the snapshot is intentionally
   not re-resolvable — numpy 2.4.6 vs mistral-common's `<2.4` pin).
 - `selective_scan_cuda.py` — import-only stub to drop into `site-packages`.
@@ -26,10 +28,10 @@ mkdir -p $OLALA_HOME && cd $OLALA_HOME
 uv venv venv --python /usr/bin/python3.12
 
 # pinned sources
-git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 8a124b6b0
+git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 7bb4e2575
 git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 761b409
 git clone --filter=blob:none https://github.com/shawntan/scattermoe.git scattermoe && git -C scattermoe checkout 47b5e15
-git clone --filter=blob:none https://github.com/gcaillaut/olala.git olala
+git clone --filter=blob:none https://github.com/jgcb00/olala.git olala
 
 # exact package snapshot
 uv pip sync --python venv/bin/python olala/install/requirements.txt \
