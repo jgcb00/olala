@@ -11,6 +11,19 @@ bash setup_olala_env.sh            # everything, into ./env
 
 Run it **from the repo root** — `REPO` is `$(pwd)`.
 
+Then serve the checkpoint:
+
+```bash
+./serve.sh                      # ./checkpoints/sft on :8010, GPU 0
+PORT=8020 GPU=1 ./serve.sh
+CKPT=/path/to/export ./serve.sh
+```
+
+`serve.sh` uses the same venv, the same olala checkout and the same parsers the
+env was built with, so what you serve matches what you trained against. It warns
+before starting if `MAX_LEN` is not a multiple of 144, or if `MAX_NUM_SEQS`
+exceeds what the KV cache holds at that length — both explained in its NOTES.
+
 ## What it pins
 
 | source | pin |
