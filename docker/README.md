@@ -22,7 +22,9 @@ Registry: `git.corp.linguacustodia.com:5050/gcaillaut/olala-env/olala`
 `vllm` (the Olala fork, which is the only vLLM that knows `OlalaForCausalLM`),
 `verl`, `transformers`, `trl`, plus the mamba3 kernel stack
 (tilelang/CuTeDSL/quack), `scattermoe`, `flash-attn`, `ray`, `peft`,
-`accelerate`, `datasets` and the `olala` renderer and parsers. Versions and the
+`accelerate`, `datasets`, `tensorboard`, `bitsandbytes` and the `olala` renderer
+and parsers — i.e. everything the antidoom FTPO pipeline needs except antidoom
+itself, which layers on top. Versions and the
 resolved source SHAs are in `/opt/olala-env/PINS`.
 
 Not in the image: **the weights**. A checkpoint is a 13 GB raw HF export and is
@@ -112,6 +114,10 @@ and the dev box run the same code. Two of the ten steps are skipped:
 * **step 7** loads a checkpoint. There is none in the image — `verify.sh` runs
   it against a mounted export instead.
 * **step 9** installs `dragon-agentic` editable. Not this repo.
+
+Step 10 (`trl` + `bitsandbytes`) *is* run, through `ONLY=10`. It used to be a
+bespoke `RUN` here, which made the image and a dev-box build differ in whether
+trl was present at all.
 
 The step *numbers* are therefore load-bearing. If `setup_olala_env.sh` ever
 renumbers its steps, `ONLY=<n>` matches nothing and exits 0 — which is what

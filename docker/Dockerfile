@@ -94,6 +94,7 @@ ARG TORCH_CUDA_ARCH_LIST=9.0a
 # snapshot at 5.8.0 / 1.14.0 / 5.0.0 / 3.1.6 / 25.0, which is why it can go in
 # with --no-deps and move nothing else.
 ARG TRL_VERSION=1.12.0
+ARG BITSANDBYTES_VERSION=0.49.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     APP=/opt/olala-env
@@ -180,12 +181,15 @@ RUN ONLY=6 bash setup_olala_env.sh
 RUN --mount=type=cache,target=/root/.cache/uv \
     ONLY=8 bash setup_olala_env.sh
 
-# ---- 5. TRL, and the check that this build is actually an env --------------
-# --no-deps like everything after step 3: TRL's own floors are all satisfied by
-# the snapshot, and letting it resolve would be free rein to move transformers
-# or datasets off the frozen set.
+# ---- 5. trl + bitsandbytes, and the check that this build is actually an env
+# Step 10 of the script, not a bespoke RUN. This used to install trl here and
+# only here, which meant `bash setup_olala_env.sh` on a dev box produced an
+# environment WITHOUT trl while the image had it -- a difference in the one
+# thing this repo exists to keep identical. bitsandbytes joins it: antidoom's
+# FTPO config asks for paged_adamw_32bit.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python ${APP}/env/.venv/bin/python --no-deps "trl==${TRL_VERSION}"
+    TRL_VERSION=${TRL_VERSION} BITSANDBYTES_VERSION=${BITSANDBYTES_VERSION} \
+    ONLY=10 bash setup_olala_env.sh
 
 # The build's smoke test, and it is not optional. Every install above is
 # --no-deps into a venv assembled from a non-resolvable snapshot, so nothing

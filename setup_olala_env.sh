@@ -64,6 +64,11 @@ OLALA_LOCAL=${OLALA_LOCAL:-}
 
 # Must match the `renderers` pin used by dragon-agentic, or the olala renderer is
 # developed against different internals than the rest of the env uses.
+# Not sources, so no SHA -- both are ordinary PyPI wheels. Pinned regardless,
+# because the point of this script is that a commit determines the environment.
+TRL_VERSION=${TRL_VERSION:-1.12.0}
+BITSANDBYTES_VERSION=${BITSANDBYTES_VERSION:-0.49.2}
+
 RENDERERS_URL=${RENDERERS_URL:-https://github.com/PrimeIntellect-ai/renderers.git}
 RENDERERS_REF=${RENDERERS_REF:-d4707862ac83aa3773c21f4096aec72bd17b91e4}
 
@@ -327,11 +332,44 @@ print('  dragon registered in verl:', 'dragon' in _agent_loop_registry)")
 fi
 
 # -----------------------------------------------------------------------------
-if step 10 "summary"; then
+# The two libraries the frozen snapshot does not carry. It was frozen for verl,
+# which needs neither, but the antidoom FTPO pipeline needs both:
+#
+#   trl            the DPOTrainer that antidoom's FTPOTrainer subclasses. The
+#                  Dockerfile installed this itself, which meant a dev-box build
+#                  had verl but no trl -- the two environments differed in a way
+#                  nothing checked.
+#   bitsandbytes   only for the paged optimizers. antidoom's config asks for
+#                  `optim: paged_adamw_32bit`; without it HF Trainer raises at
+#                  optimizer construction, after the model is already loaded.
+#                  `--set train.optim=adamw_torch` avoids needing it at all.
+#
+# --no-deps, like everything after step 3. Both resolve fine against the
+# snapshot -- trl's floors on transformers/datasets/accelerate are met, and
+# bitsandbytes wants only torch and numpy -- but letting either resolve would be
+# free rein to move the frozen set. check_env.py imports both, so a version that
+# genuinely needs something absent fails the build rather than a job.
+#
+# LAST, deliberately. The Dockerfile drives this script with ONLY=<n>, and a
+# step inserted earlier would renumber the ones after it: `ONLY=8` would then
+# match nothing, exit 0, and silently produce an image with no renderers.
+if step 10 "install trl + bitsandbytes (--no-deps)"; then
+    uv pip install -q --python "$VENV/bin/python" --no-deps \
+        "trl==${TRL_VERSION}" "bitsandbytes==${BITSANDBYTES_VERSION}" \
+        || die "could not install trl/bitsandbytes"
+    (cd /tmp && "$VENV/bin/python" -c "
+import bitsandbytes, trl
+print(f'  trl {trl.__version__}, bitsandbytes {bitsandbytes.__version__}')") \
+        || die "trl/bitsandbytes installed but do not import"
+fi
+
+# -----------------------------------------------------------------------------
+if step 11 "summary"; then
     (cd /tmp && "$VENV/bin/python" - <<'EOF'
 from importlib.metadata import version, PackageNotFoundError
-for n in ("torch","vllm","verl","transformers","ray","tilelang","transferqueue",
-          "flashinfer-python","flash-attn","rl-insight","renderers","dragon-agentic"):
+for n in ("torch","vllm","verl","transformers","trl","bitsandbytes","ray",
+          "tilelang","transferqueue","flashinfer-python","flash-attn",
+          "rl-insight","renderers","dragon-agentic"):
     try: print(f"  {n:20} {version(n)}")
     except PackageNotFoundError: print(f"  {n:20} —")
 EOF

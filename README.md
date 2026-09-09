@@ -34,9 +34,11 @@ Same env, same pins, built by the same script — `docker/` runs
 PUSH=0 ./docker/build.sh          # build only
 ```
 
-`git.corp.linguacustodia.com:5050/gcaillaut/olala-env/olala:<short sha>`. It adds
-**TRL** on top of the snapshot (which was frozen for verl and does not include
-it), and is based on `nvcr.io/nvidia/pytorch:26.05-py3` for the NCCL/RDMA
+`git.corp.linguacustodia.com:5050/gcaillaut/olala-env/olala:<short sha>`. **TRL**
+and **bitsandbytes** are not in the snapshot — it was frozen for verl, which
+needs neither — so step 10 adds them; the image runs that step rather than
+installing them itself, so a dev-box build and the image cannot differ. Based on
+`nvcr.io/nvidia/pytorch:26.05-py3` for the NCCL/RDMA
 userspace — but *not* for its torch, which is 2.12/CUDA 13.2 and cannot load the
 vLLM fork's precompiled binaries. See [docker/README.md](docker/README.md).
 
@@ -49,6 +51,8 @@ vLLM fork's precompiled binaries. See [docker/README.md](docker/README.md).
 | mamba | upstream `state-spaces/mamba`, pip, `--no-deps` |
 | scattermoe | `47b5e15` |
 | renderers | `d4707862` |
+| trl | `1.12.0` — not in the snapshot, which was frozen for verl |
+| bitsandbytes | `0.49.2` — for the paged optimizers |
 
 SHAs, not branches: a moving branch changes the build. Override any of them
 inline (`OLALA_REF=... bash setup_olala_env.sh`).
@@ -68,7 +72,11 @@ inline (`OLALA_REF=... bash setup_olala_env.sh`).
 4. vllm (Olala fork, precompiled binaries) · 5. mamba_ssm + scattermoe +
 the selective_scan stub · 6. patch the packages that still need it ·
 7. verify the checkpoint loads · 8. renderers + the olala renderer ·
-9. dragon-agentic (editable) · 10. summary
+9. dragon-agentic (editable) · 10. trl + bitsandbytes · 11. summary
+
+Step 10 is last because the Dockerfile drives this script with `ONLY=<n>`:
+inserting a step earlier renumbers the ones after it, and `ONLY=8` would then
+match nothing and exit 0.
 
 ## Notes
 

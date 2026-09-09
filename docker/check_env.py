@@ -60,6 +60,15 @@ def imports():
     import transformers  # noqa: F401
     import trl  # noqa: F401
     import verl  # noqa: F401
+    # Everything the antidoom FTPO pipeline needs on top of the snapshot. peft,
+    # datasets, tensorboard and accelerate are IN the snapshot; these two are
+    # not, and are added by step 10.
+    import bitsandbytes  # noqa: F401
+    # A dependency of the checkpoint's own modeling code rather than of any
+    # package here: modeling_olala.py imports scattermoe inside a try/except
+    # that only passes, so a broken install surfaces as
+    # `NameError: ScatterMoE is not defined` at model construction instead.
+    import peft  # noqa: F401
     import vllm  # noqa: F401
     return None
 
@@ -139,6 +148,8 @@ def main():
 
     print("  env check passed")
     for name in (
+        "trl",
+        "bitsandbytes",
         "torch", "vllm", "verl", "transformers", "trl", "peft", "accelerate",
         "datasets", "ray", "tilelang", "transferqueue", "flashinfer-python",
         "flash-attn", "renderers",
