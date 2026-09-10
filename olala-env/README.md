@@ -4,12 +4,19 @@ Builds the Olala 7A1B verl training environment (GRPO/DAPO, FSDP + vLLM hybrid
 engine) from pinned sources. One script, no other inputs.
 
 ```bash
-git clone https://github.com/gcaillaut/olala-env.git
-cd olala-env
+git clone https://github.com/jgcb00/olala.git
+cd olala/olala-env
 bash setup_olala_env.sh            # everything, into ./env
 ```
 
-Run it **from the repo root** — `REPO` is `$(pwd)`.
+Run it **from this directory** — `REPO` is `$(pwd)`. The build clones the
+pinned `OLALA_REF` into `env/olala`; to build against the checkout you are
+standing in instead, `OLALA_LOCAL=.. bash setup_olala_env.sh`.
+
+`tests/` holds the checks run on 2026-09-10: `hf_gen_test.py` (HF load,
+generate, decode-vs-full-forward and batched-vs-single agreement),
+`mg2hf_cpu_nodocker.sh` (Megatron -> HF conversion without the olala-sft
+image, which not every account can pull) and `compare_exports.py`.
 
 Then serve the checkpoint:
 

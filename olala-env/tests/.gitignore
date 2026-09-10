@@ -1,0 +1,4 @@
+# Test artefacts: converted exports and checkpoint copies, GBs each.
+hf-export-*/
+ckpt-*/
+__pycache__/
