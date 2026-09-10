@@ -691,7 +691,12 @@ class OlalaAttention(nn.Module):
         # Row boundaries from a packed batch need the varlen path just as
         # document boundaries do; eager/flex have none, which is why
         # OlalaModel.forward only packs under fa2/fa3.
-        _varlen_attn = self.config.intra_doc_masking or kwargs.get("unpadded", False)
+        # Varlen whenever cu_seqlens is set, whoever set it: the model-level
+        # attention_mask unpadding, the position_ids derivation for a packed
+        # (1, T) row (verl use_remove_padding), or the caller. Gating this on
+        # `unpadded` alone (as the rebase did) left the other two running dense
+        # over the whole packed row -- documents attending to each other.
+        _varlen_attn = self.config.intra_doc_masking or cu_seqlens is not None
         if ATTN_IMPL == "eager":
             assert not _varlen_attn
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
@@ -1097,7 +1102,12 @@ class OlalaDifferentialAttentionV2(nn.Module):
         # Row boundaries from a packed batch need the varlen path just as
         # document boundaries do; eager/flex have none, which is why
         # OlalaModel.forward only packs under fa2/fa3.
-        _varlen_attn = self.config.intra_doc_masking or kwargs.get("unpadded", False)
+        # Varlen whenever cu_seqlens is set, whoever set it: the model-level
+        # attention_mask unpadding, the position_ids derivation for a packed
+        # (1, T) row (verl use_remove_padding), or the caller. Gating this on
+        # `unpadded` alone (as the rebase did) left the other two running dense
+        # over the whole packed row -- documents attending to each other.
+        _varlen_attn = self.config.intra_doc_masking or cu_seqlens is not None
         if ATTN_IMPL == "eager":
             assert not _varlen_attn
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
@@ -1393,7 +1403,12 @@ class OlalaDifferentialTensorProductAttentionV2(nn.Module):
         # Row boundaries from a packed batch need the varlen path just as
         # document boundaries do; eager/flex have none, which is why
         # OlalaModel.forward only packs under fa2/fa3.
-        _varlen_attn = self.config.intra_doc_masking or kwargs.get("unpadded", False)
+        # Varlen whenever cu_seqlens is set, whoever set it: the model-level
+        # attention_mask unpadding, the position_ids derivation for a packed
+        # (1, T) row (verl use_remove_padding), or the caller. Gating this on
+        # `unpadded` alone (as the rebase did) left the other two running dense
+        # over the whole packed row -- documents attending to each other.
+        _varlen_attn = self.config.intra_doc_masking or cu_seqlens is not None
         if ATTN_IMPL == "eager":
             assert not _varlen_attn
             attention_interface = lambda q, k, v, wsize, **kw: eager_attention_forward(q, k, v, window_size=(wsize, 0), **kw)
