@@ -1,0 +1,27 @@
+# The build context is the repo root, and this repo BUILDS INTO ITSELF: a dev
+# box that has run setup_olala_env.sh has ~40 GB sitting in env/. Without this
+# file every `docker build` hands all of it to the daemon before the first
+# instruction runs.
+#
+# The Dockerfile only needs setup_olala_env.sh, serve.sh and docker/, so this
+# list can afford to be blunt. Keep it in step with .gitignore.
+
+# The built environment on the host. The image builds its own; copying the
+# host's would also bake in absolute paths from a different layout.
+env/
+
+# Checkpoints are inputs, not source -- 13 GB per export, mounted at runtime.
+checkpoints/
+
+# Not used by the build. The commit is read by docker/build.sh on the host and
+# passed in as an OCI label, so the image never needs the history.
+.git
+.gitignore
+
+*.bak*
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info
+.venv
+runs/
