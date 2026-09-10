@@ -1941,6 +1941,26 @@ class OlalaMamba2(nn.Module):
 
         return y, None, None
 
+def _packed_doc_cu_seqlens(position_ids, device):
+    """cu_seqlens for ONE packed row of documents, from position_ids resets.
+
+    Frameworks with use_remove_padding (verl) feed a (1, T) row holding many
+    documents, position_ids restarting at 0 at each document start, and no
+    attention_mask worth the name. Returns (cu_seqlens int32, max_seqlen), or
+    (None, None) when the row holds a single document -- dense attention and a
+    single SSM segment are already exact there.
+    """
+    starts = (position_ids[0] == 0).nonzero(as_tuple=False).flatten()
+    if starts.numel() <= 1:
+        return None, None
+    cu_seqlens = torch.cat([
+        starts.to(torch.int32),
+        torch.tensor([position_ids.shape[-1]], dtype=torch.int32, device=starts.device),
+    ]).to(device=device, dtype=torch.int32)
+    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    return cu_seqlens, max_seqlen
+
+
 def _pack_cu_seqlens(cu_seqlens, batch, seqlen, device):
     """cu_seqlens for a (batch, seqlen) input packed into ONE varlen row.
 
@@ -3175,6 +3195,25 @@ class OlalaModel(OlalaPreTrainedModel):
                     "end of each row. Use padding_side='right', pack the batch "
                     "yourself and pass cu_seqlens, or generate one sequence at a time."
                 )
+
+        # ---- packed-row document boundaries ---------------------------
+        # Training frameworks with use_remove_padding (verl dynamic batching)
+        # feed one packed (1, T) row holding many documents, position_ids
+        # resetting to 0 at each document start. Without cu_seqlens the
+        # attention layers run DENSE flash attention over the whole row and the
+        # mamba3 mixers carry SSM state across documents: a training/inference
+        # logprob mismatch (rollout_probs_diff blowup) whenever packing is on.
+        # Derive cu_seqlens once here and hand it down; every mixer honours it.
+        # An externally provided cu_seqlens is normalised instead: verl passes
+        # its packed offsets as int64 and never max_seqlen, flash_attn wants
+        # int32 and both. (Restored from the pre-rename modeling, where verl
+        # training was validated; the rebase had dropped it.)
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)
+            if max_seqlen is None:
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        elif past_key_values is None and B == 1 and position_ids is not None:
+            cu_seqlens, max_seqlen = _packed_doc_cu_seqlens(position_ids, hidden_states.device)
 
         all_hidden_states = () if output_hidden_states else None
 
