@@ -1,0 +1,9 @@
+# The built environment: venv, cloned sources, the vllm wheel. ~40 GB.
+env/
+
+# Checkpoints are inputs, not source.
+checkpoints/
+
+*.bak*
+__pycache__/
+*.pyc

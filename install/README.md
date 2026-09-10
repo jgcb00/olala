@@ -1,5 +1,9 @@
 # From-scratch install of the Olala 7A1B verl training environment
 
+> **Prefer `../olala-env/`**: `bash setup_olala_env.sh` does every step below
+> from pinned SHAs, idempotently, and `serve.sh` serves the result. This file
+> is the manual sequence it automates.
+
 Validated end-to-end on 2026-08-26 (hippo, CUDA 12.9, Python 3.12.3):
 fresh env in `/data/home/j-g.barthelemy/olala`, 1-GPU and 2-GPU GRPO smoke runs.
 The step-by-step guide (with troubleshooting table) lives on Notion:
