@@ -50,7 +50,7 @@ since the snapshot pins `nvidia-nccl-cu12`. See
 |---|---|
 | [jgcb00/olala](https://github.com/jgcb00/olala) `main` | `09b6709` — model code, converter, parsers, renderer, the applier |
 | [jgcb00/vllm](https://github.com/jgcb00/vllm) `dragon-v0.26` | `f0fbc70ca` — the fork that knows `OlalaForCausalLM` |
-| mamba | upstream `state-spaces/mamba`, pip, `--no-deps` |
+| [jgcb00/mamba](https://github.com/jgcb00/mamba) | `761b409` — the fork with the pool-indexed `mamba3_step_fn` the vLLM decode path needs |
 | scattermoe | `47b5e15` |
 | renderers | `d4707862` |
 | trl | `1.12.0` — not in the snapshot, which was frozen for verl |

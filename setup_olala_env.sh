@@ -43,11 +43,15 @@ VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # up
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
 
-# Mamba-3 comes from UPSTREAM state-spaces/mamba now, matching
-# 7A1B/training/Dockerfile ("Mamba-3 capable release; supersedes the old
-# tilelang-based build path"). The old jgcb00/mamba fork existed for the
-# saved_tensors single-unpack fix, which is in upstream.
-MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/state-spaces/mamba}
+# Mamba-3 must come from the jgcb00/mamba fork, NOT upstream state-spaces/mamba:
+# the vLLM fork's decode path calls mamba3_step_fn(state_batch_indices=...),
+# the pool-indexed step kernel that only the fork carries. With upstream the
+# env builds fine and every CPU check passes, then `vllm serve` dies at
+# cudagraph profiling with "unexpected keyword argument 'state_batch_indices'"
+# (seen 2026-09-10). 761b409 is the ref jgcb00/olala's install/README.md pins.
+# MAMBA_SKIP_CUDA_BUILD: the mamba3 kernels are TileLang/CuTe/Triton; the
+# selective_scan CUDA extension is replaced by the stub in step 5.
+MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@761b4090e180aaffdca5e0123c684f58e8ac5ee2}
 
 SCATTERMOE_URL=${SCATTERMOE_URL:-https://github.com/shawntan/scattermoe.git}
 SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
@@ -243,7 +247,7 @@ if step 5 "install mamba_ssm, wire scattermoe, drop the selective_scan stub"; th
     # and letting it resolve would downgrade the snapshot's 0.1.9 (and drag
     # apache-tvm-ffi with it, which is what the Dockerfile's known-limitation
     # table is about).
-    uv pip install --python "$VENV/bin/python" --no-deps --no-build-isolation "$MAMBA_PIP"
+    MAMBA_SKIP_CUDA_BUILD=TRUE uv pip install --python "$VENV/bin/python" --no-deps --no-build-isolation "$MAMBA_PIP"
     echo "$SCATTERMOE_DIR" > "$SP/scattermoe.pth"
     cp "$FIXES_DIR/install/selective_scan_cuda.py" "$SP/"
     (cd /tmp && "$VENV/bin/python" -c "
