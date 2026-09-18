@@ -223,10 +223,10 @@ def convert_hf_to_mg(config_mg, config_hf, hf, sink, print0=print):
             f"which this converter does not compute.")
         # Adding special tokens is routine in an SFT/TRL pipeline, and it would
         # silently shift every row here. Refuse rather than mis-map the vocab.
-        if rows != config_mg.vocab_size:
+        if rows != config_hf.vocab_size:
             raise ValueError(
                 f"{hf_key} has {rows} rows but the reference was trained with "
-                f"vocab_size={config_mg.vocab_size}. The tokenizer changed between "
+                f"vocab_size={config_hf.vocab_size}. The tokenizer changed between "
                 f"the reference and this HF checkpoint; the embedding rows would not "
                 f"line up. Use a reference from the same tokenizer.")
         sink.set_rows(mg_key, w)
