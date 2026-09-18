@@ -66,6 +66,8 @@ class OlalaToolParser(ToolParser):
         super().__init__(tokenizer, tools)
         # Per-stream state: chars of `arguments` already sent per call (by index).
         self._sent_args_chars: list[int] = []
+        # Chars of final-channel content already streamed (see _content_delta).
+        self._sent_content_chars = 0
         # Ids synthesised for calls the model emitted without one, kept stable
         # across deltas (make_tool_call_id() would return a new id per chunk).
         self._synth_ids: dict[int, str] = {}
@@ -107,6 +109,36 @@ class OlalaToolParser(ToolParser):
             if raw.endswith(self.CHANNEL_END):
                 raw = raw[: -len(self.CHANNEL_END)]
         return raw.strip() or None
+
+    def _final_content_so_far(self, text: str) -> str:
+        """The user-facing slice of `text`, markers removed.
+
+        Same two input shapes as _final_content(), but monotonic and unstripped:
+        the result only ever grows as `text` does, so the streaming path can
+        diff it against what it has already sent.
+        """
+        if self.FINAL_MARKER in text:
+            text = text.split(self.FINAL_MARKER, 1)[1]
+        # The final channel is closed by <|channel_end|>; the tools channel and
+        # anything after it are never user-facing text.
+        for stop in (self.CHANNEL_END, self.TOOLS_MARKER):
+            cut = text.find(stop)
+            if cut != -1:
+                text = text[:cut]
+        return text
+
+    def _content_delta(self, current_text: str) -> str:
+        """New final-channel chars since the last delta."""
+        content = self._final_content_so_far(current_text)
+        if self._sent_content_chars == 0:
+            # Non-streaming .strip()s its content. Leading whitespace can be
+            # dropped the same way here; trailing whitespace cannot, since it is
+            # only knowable as trailing once the channel closes.
+            delta = content.lstrip()
+        else:
+            delta = content[self._sent_content_chars :]
+        self._sent_content_chars = len(content)
+        return delta
 
     @staticmethod
     def _held_back(text: str, tag: str) -> int:
@@ -202,10 +234,15 @@ class OlalaToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: "ChatCompletionRequest | ResponsesRequest",
     ) -> DeltaMessage | None:
-        tools_raw = self._tools_content(current_text)
-        if tools_raw is None:
-            return None
+        # Content first. Once the reasoning parser reports reasoning-end -- which
+        # for this format is the START of the final channel, not its end -- vLLM
+        # stops calling it and hands this parser the whole remaining stream
+        # (DelegatingParser.parse_delta). Emitting only tool calls therefore
+        # dropped every final-channel token. The shipped parsers (hermes et al.)
+        # return content from here for exactly this reason.
+        content_delta = self._content_delta(current_text)
 
+        tools_raw = self._tools_content(current_text)
         deltas: list[DeltaToolCall] = []
 
         # One uniform pass over every <call> opener, complete or not. The old
@@ -215,7 +252,7 @@ class OlalaToolParser(ToolParser):
         # partial branch recorded a length that included "</arguments></call",
         # so once the call closed, args[sent:] was empty and the junk already
         # streamed to the client was never corrected.
-        opens = list(self.CALL_OPEN_RE.finditer(tools_raw))
+        opens = list(self.CALL_OPEN_RE.finditer(tools_raw)) if tools_raw else []
 
         for i, open_m in enumerate(opens):
             # This call's body runs to the next opener (or end of the channel).
@@ -253,7 +290,9 @@ class OlalaToolParser(ToolParser):
                     )
                 )
 
-        return DeltaMessage(tool_calls=deltas) if deltas else None
+        if not content_delta and not deltas:
+            return None
+        return DeltaMessage(content=content_delta or None, tool_calls=deltas)
 
     # ------------------------------------------------------------------
     # Request adjustment
@@ -263,4 +302,26 @@ class OlalaToolParser(ToolParser):
         self, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> "ChatCompletionRequest | ResponsesRequest":
         request.skip_special_tokens = False
+
+        # ChatCompletionRequest defaults tool_choice to "none", so every request
+        # that sends no tools arrives here as "none" -- and DelegatingParser.
+        # _extract_tool_calls_streaming() short-circuits that case with
+        #     return (DeltaMessage(content=delta_text) if delta_text else None)
+        # without consulting either parser. Since reasoning-end is reported at
+        # the START of the final channel (see OlalaParser.is_reasoning_end), the
+        # reasoning parser has already stopped by then too, so nothing strips
+        # the channel markers and <|channel_end|> reaches the client inside
+        # `content`.
+        #
+        # Promoting to "auto" routes the stream back through this parser, which
+        # emits clean content. Confined to requests that declared no tools, so
+        # it cannot override a caller who deliberately disabled tool calling:
+        # the model has no tool list to call from, and the tools channel stays
+        # empty. A request that sends tools AND sets tool_choice="none"
+        # explicitly still takes the bypass and still leaks; that shape needs
+        # the fix in vLLM itself.
+        if not getattr(request, "tools", None) and (
+            getattr(request, "tool_choice", None) == "none"
+        ):
+            request.tool_choice = "auto"
         return request
