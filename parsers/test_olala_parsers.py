@@ -17,6 +17,7 @@ parsers/olala/ or --live will still exercise the old code.
 """
 
 import argparse
+import copy
 import json
 import os
 import pathlib
@@ -108,6 +109,7 @@ def offline() -> None:
         r = types.SimpleNamespace()
         r.tools = list(tools) if tools else None
         r.tool_choice = tool_choice
+        r.include_reasoning = True  # parse_delta reads this; parse() does not
         return r
 
     def nonstream(raw, request):
@@ -149,7 +151,44 @@ def offline() -> None:
             prev_text, prev_ids = cur_text, cur_ids
         return calls
 
-    def case(label, raw, *, calls, content, request=None, cmp_stream=True):
+    def stream_full(raw, request):
+        """Drive vLLM's whole streaming chain (DelegatingParser.parse_delta),
+        not just the tool parser, and accumulate deltas the way a client does.
+
+        This is what a real `stream: true` request runs. The tool-parser-only
+        stream() above cannot see content at all, which is how a leak of
+        <|channel_end|> into `content` went unnoticed.
+        """
+        p = Combined(tok, request.tools)
+        # The server calls adjust_request() before generation; so must this, or
+        # the test misses what the parsers do to tool_choice / special tokens.
+        request = p.adjust_request(copy.copy(request))
+        ids = tok.encode(raw, add_special_tokens=False)
+        reasoning, content, calls = "", "", {}
+        for k, tid in enumerate(ids):
+            dm = p.parse_delta(
+                tok.decode([tid], skip_special_tokens=False),
+                [tid],
+                request,
+                prompt_token_ids=[] if k == 0 else None,
+                finished=(k == len(ids) - 1),
+            )
+            if dm is None:
+                continue
+            if dm.reasoning:
+                reasoning += dm.reasoning
+            if dm.content:
+                content += dm.content
+            for tc in dm.tool_calls or []:
+                slot = calls.setdefault(tc.index, {"name": None, "arguments": ""})
+                if tc.function and tc.function.name:
+                    slot["name"] = tc.function.name
+                if tc.function and tc.function.arguments:
+                    slot["arguments"] += tc.function.arguments
+        return reasoning, (content or None), calls
+
+    def case(label, raw, *, calls, content, request=None, cmp_stream=True,
+             stream_content_gap=False):
         request = request or req()
         print(f"\n--- {label}")
         reasoning, got_content, tool_calls = nonstream(raw, request)
@@ -163,6 +202,29 @@ def offline() -> None:
         for field, val in (("content", got_content), ("reasoning", reasoning)):
             leaked = [m for m in MARKERS if val and m in val]
             check(not leaked, f"non-stream: no markers in {field} (found {leaked})")
+
+        # Full streaming chain: content must match non-streaming and stay clean.
+        _, st_content, st_calls = stream_full(raw, request)
+        leaked = [m for m in MARKERS if st_content and m in st_content]
+        if stream_content_gap:
+            # Known vLLM gap: DelegatingParser._extract_tool_calls_streaming()
+            # answers tool_choice="none" with DeltaMessage(content=delta_text)
+            # without consulting either parser, so raw channel markers reach the
+            # client. OlalaToolParser.adjust_request() covers the common form of
+            # this (a request that sends no tools, which defaults to "none"),
+            # but a request that sends tools AND sets "none" explicitly means it,
+            # so the parser must leave it alone -- that shape needs the vLLM-side
+            # fix. Reported, not asserted, so the gap stays visible.
+            print(f"   KNOWN-GAP  stream: content == {st_content!r} (vLLM bypasses the parsers)")
+        else:
+            check(st_content == content, f"stream: content == {content!r}, got {st_content!r}")
+            check(not leaked, f"stream: no markers in content (found {leaked})")
+            if cmp_stream:
+                # Skipped alongside stream(): a truncated call streams as an
+                # open call (name known, args still arriving) where
+                # non-streaming reports none, so the counts legitimately differ.
+                check(len(st_calls) == calls,
+                      f"stream: {calls} call(s) via parse_delta, got {len(st_calls)}")
 
         if not cmp_stream:
             return
@@ -257,6 +319,7 @@ def offline() -> None:
         content="Sure.",
         request=req(tool_choice="none"),
         cmp_stream=False,
+        stream_content_gap=True,
     )
 
     case(
@@ -265,6 +328,18 @@ def offline() -> None:
         calls=0,
         content="Hello.",
         request=req(tools=None),
+        cmp_stream=False,
+    )
+
+    # The shape a plain chat request actually takes: ChatCompletionRequest
+    # defaults tool_choice to "none" whenever no tools are sent, which is the
+    # path that leaks channel markers into streamed content.
+    case(
+        "plain chat request (no tools -> tool_choice='none')",
+        f"{A}<|channel_end|><|channel_start|>final<|content|>Hello.<|channel_end|>",
+        calls=0,
+        content="Hello.",
+        request=req(tools=None, tool_choice="none"),
         cmp_stream=False,
     )
 
