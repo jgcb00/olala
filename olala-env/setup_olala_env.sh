@@ -48,10 +48,12 @@ VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
 # the pool-indexed step kernel that only the fork carries. With upstream the
 # env builds fine and every CPU check passes, then `vllm serve` dies at
 # cudagraph profiling with "unexpected keyword argument 'state_batch_indices'"
-# (seen 2026-09-10). 761b409 is the ref jgcb00/olala's install/README.md pins.
+# (seen 2026-09-10). 5a05349 (tip of mamba3-spec-step) is the ref jgcb00/olala's
+# install/README.md pins; it adds the int64 offsets fix in
+# grouped_head_reduction.py (Q/K grad reduction wrapped past 2^31 for S > ~87k).
 # MAMBA_SKIP_CUDA_BUILD: the mamba3 kernels are TileLang/CuTe/Triton; the
 # selective_scan CUDA extension is replaced by the stub in step 5.
-MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@761b4090e180aaffdca5e0123c684f58e8ac5ee2}
+MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@5a05349d4aab11ef568c2a38b732aa64202edfe0}
 
 SCATTERMOE_URL=${SCATTERMOE_URL:-https://github.com/shawntan/scattermoe.git}
 SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
