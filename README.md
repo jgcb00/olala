@@ -80,7 +80,7 @@ because it moved:
 * **vllm** `olala/mamba3.py` and `models/olala.py` — both are committed in the
   vllm fork at the pinned ref.
 * **mamba** `mamba3_mimo.py` and `mamba3_siso_combined.py` — the `saved_tensors`
-  single-unpack fix is upstream in the pinned ref (`52f97ac`, jgcb00/mamba `dev`, which also
+  single-unpack fix is upstream in the pinned ref (`9ddd93d`, jgcb00/mamba `dev`, which also
   carries the int64 `grouped_head_reduction` offsets fix for sequences > ~87k tokens).
 * **checkpoint** `modeling_olala.py` — the converter ships this repo's copy.
 * **checkpoint weights** — see above.
