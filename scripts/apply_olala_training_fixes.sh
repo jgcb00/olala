@@ -19,7 +19,7 @@
 #   - vllm olala/mamba3.py + models/olala.py : both fixes are committed in the
 #     vllm fork at the pinned ref. Nothing to patch.
 #   - mamba mamba3_mimo.py + mamba3_siso_combined.py : the saved_tensors fix is
-#     upstream in the pinned mamba ref (5a05349, "single-unpack" + int64 offsets).
+#     upstream in the pinned mamba ref (52f97ac, dev: "single-unpack" + int64 offsets).
 #   - checkpoint modeling_olala.py : the converter (../convert/) builds the HF
 #     model from THIS repo's modeling and save_pretrained() ships it, so an
 #     export already carries every fix. Re-export instead of patching.

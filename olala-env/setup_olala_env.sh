@@ -38,22 +38,29 @@ PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python3.12}
 
 # ---- Pinned sources (SHAs, not branches: a moving branch changes the build) --
 VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/jgcb00/vllm.git}
-VLLM_FORK_REF=${VLLM_FORK_REF:-f0fbc70ca4a46748cd6c79c91b59fd03bf312ce3}   # branch dragon-v0.26 (Olala rename, no artificial_seq_len resets)
+# branch dragon-v0.26: Olala rename, no artificial_seq_len resets, TPA-factorized
+# KV cache + CUDA Mamba-3 step (sm_90 JIT kernels), fp32 SSM state by default,
+# Mamba-3 kernels vendored (vLLM no longer imports mamba_ssm), JIT sources
+# shipped in the wheel (17480704d), loud OLALA SLOW PATH banners on fallback.
+VLLM_FORK_REF=${VLLM_FORK_REF:-397db68f9b1e8114fd8bb8acef80ebb955a0abc0}
 VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # upstream base for the precompiled wheel
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
 
-# Mamba-3 must come from the jgcb00/mamba fork, NOT upstream state-spaces/mamba:
-# the vLLM fork's decode path calls mamba3_step_fn(state_batch_indices=...),
-# the pool-indexed step kernel that only the fork carries. With upstream the
-# env builds fine and every CPU check passes, then `vllm serve` dies at
-# cudagraph profiling with "unexpected keyword argument 'state_batch_indices'"
-# (seen 2026-09-10). 5a05349 (tip of mamba3-spec-step) is the ref jgcb00/olala's
-# install/README.md pins; it adds the int64 offsets fix in
-# grouped_head_reduction.py (Q/K grad reduction wrapped past 2^31 for S > ~87k).
+# mamba_ssm is for the TRAINER only (modeling_olala.py, FSDP forward/backward):
+# since jgcb00/vllm 4530aeeb7 the vLLM fork vendors its Mamba-3 inference
+# kernels (vllm/model_executor/layers/mamba/ops/mamba3/) and never imports
+# mamba_ssm -- step 4 checks that. Keep the jgcb00/mamba fork pin (the ref
+# jgcb00/olala's install/README.md pins); kernel fixes now land in both repos.
+# 52f97ac = jgcb00/mamba `dev` (the fork's default branch): two-level scan on by
+# default where it pays (M3_SCAN_BLOCK=0 restores the stock scan), sequence-
+# parallel angle_dt, no host syncs in the varlen backward, int64 offsets in
+# grouped_head_reduction (S > ~87k), single saved_tensors unpack.
 # MAMBA_SKIP_CUDA_BUILD: the mamba3 kernels are TileLang/CuTe/Triton; the
-# selective_scan CUDA extension is replaced by the stub in step 5.
-MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@5a05349d4aab11ef568c2a38b732aa64202edfe0}
+# selective_scan CUDA extension is replaced by the stub in step 5. (Since
+# upstream #977, in dev, a CUDA build is opt-in via MAMBA_KEEP_CUDA_BUILD, so
+# the variable is now a no-op kept for older pins.)
+MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@52f97ac947eead2293452e0157506418c6e55bd5}
 
 SCATTERMOE_URL=${SCATTERMOE_URL:-https://github.com/shawntan/scattermoe.git}
 SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
@@ -237,9 +244,44 @@ import vllm; from vllm.model_executor.models.registry import _VLLM_MODELS as R
 assert vllm.__version__.startswith('0.'), vllm.__version__
 assert 'OlalaForCausalLM' in R, f'OlalaForCausalLM not registered; registry has: {[k for k in R if \"lala\" in k or \"ragon\" in k]}'
 print(f'  vllm {vllm.__version__} | OlalaForCausalLM registered: True')")
+    # The fork's own pieces that a non-editable install could silently drop:
+    # the vendored Mamba-3 ops (importable WITHOUT mamba_ssm, which is only
+    # installed in step 5) and the .cu sources of the two JIT kernels. A
+    # missing .cu is not fatal at serve time -- vLLM falls back to dense KV +
+    # CuteDSL step with a warning -- which is exactly why it is checked here.
+    (cd /tmp && "$VENV/bin/python" -c "
+import os, sys
+class _NoMamba:
+    def find_spec(self, name, path=None, target=None):
+        if name.split('.')[0] == 'mamba_ssm': raise ModuleNotFoundError('mamba_ssm must not be needed by vLLM')
+sys.meta_path.insert(0, _NoMamba())
+import vllm.model_executor.layers.mamba.ops.mamba3.mimo, vllm.model_executor.layers.mamba.ops.mamba3.rotary_step
+import vllm.model_executor.layers.mamba.olala.mamba3 as m
+csrc = os.path.join(os.path.dirname(m.__file__), 'csrc')
+missing = [f for f in ('tpa_factor_decode.cu', 'mamba3_step.cu') if not os.path.isfile(os.path.join(csrc, f))]
+assert not missing, f'JIT sources not installed: {missing}'
+print('  vendored Mamba-3 ops import without mamba_ssm | JIT sources shipped')") \
+        || die "vLLM fork install is incomplete (see above)"
+    # The two JIT kernels (TPA factor attention, CUDA Mamba-3 step) build at the
+    # first serve with torch.utils.cpp_extension, which REQUIRES an nvcc of the
+    # same CUDA major as torch (cu128 -> a 12.x toolkit). The fork picks one
+    # itself (OLALA_JIT_CUDA_HOME, else torch's CUDA_HOME if it matches, else
+    # the newest /usr/local/cuda-<major>.*); report what it will use. Hopper
+    # only (sm_90: H100/H200/GH200) -- other GPUs fall back, still correct.
+    (cd /tmp && "$VENV/bin/python" -c "
+import torch
+from vllm.model_executor.layers.mamba.olala.jit import jit_cuda_home, _nvcc_major
+home = jit_cuda_home(); want = int(torch.version.cuda.split('.')[0])
+got = _nvcc_major(home) if home else None
+if got == want:
+    print(f'  JIT toolkit {home} (CUDA {got}, matches torch cu{torch.version.cuda})')
+else:
+    print(f'  WARN: no CUDA {want}.x nvcc found for the JIT kernels (torch cu{torch.version.cuda}, got {home} -> {got}).')
+    print(f'        vLLM will serve Olala on its slow fallback paths. Install a CUDA {want}.x toolkit or set OLALA_JIT_CUDA_HOME.')")
 fi
 
 # -----------------------------------------------------------------------------
+# For the trainer (modeling_olala.py); vLLM does not use it (step 4 checks).
 # mamba3 kernels are TileLang/Triton — no CUDA build, a .pth is enough. The
 # selective_scan stub is needed because the real extension targets the torch 2.9
 # ABI; Olala never calls selective scan.
@@ -400,6 +442,16 @@ Env ready under $OLALA_HOME
 
 Never run \`uv sync\` here: it would reinstall upstream vllm over the Olala fork
 and downgrade transferqueue. After step 3, only \`uv pip install --no-deps\`.
+
+vLLM fork notes (pin ${VLLM_FORK_REF:0:9}):
+  - its knobs are OLALA_* (OLALA_TPA_FACTOR, OLALA_MAMBA3_STEP, ...; the old
+    DRAGON_* names are gone) -- see the fork's README.md;
+  - the Mamba-3 SSM state is fp32 by default (bf16 drifts -> repetition loops);
+    --mamba-ssm-cache-dtype bfloat16 is ~15% faster at high concurrency;
+  - the TPA factor cache needs tensor_parallel_size=1 and an sm_90 GPU; with
+    TP>1 or another GPU it silently uses the dense KV cache (correct, slower);
+  - the first serve JIT-builds two CUDA kernels (~2 min, cached in
+    ~/.cache/olala_tpa_factor, override with OLALA_TPA_BUILD_DIR).
 
 Next — the launcher (guide step 8). Copy the example and adapt it:
 

@@ -15,8 +15,15 @@ Files here:
   (everything except vllm, which is installed from the `jgcb00/vllm` fork,
   branch `dragon-v0.26` — the only vLLM that registers `OlalaForCausalLM`,
   the architecture the converter now writes into `config.json`. Pin
-  f0fbc70ca or later: earlier tips reproduced pretraining's
-  artificial_seq_len SSM resets, which the model must not have).
+  397db68f9 (f0fbc70ca or later at the very least: earlier tips reproduced
+  pretraining's artificial_seq_len SSM resets, which the model must not have;
+  17480704d+ also ships the JIT CUDA sources of the decode kernels in the
+  wheel, which a non-editable install needs). Since 4530aeeb7 the fork
+  vendors its Mamba-3 kernels: `mamba_ssm` below is for the trainer only. Its
+  two JIT CUDA kernels need an sm_90 GPU and an nvcc of torch's CUDA major
+  (cu128 -> 12.x; set `OLALA_JIT_CUDA_HOME` if the default toolkit is CUDA
+  13), otherwise vLLM falls back to slower paths and logs an
+  `OLALA SLOW PATH` banner).
   Install with `uv pip sync` (NOT `install`: the snapshot is intentionally
   not re-resolvable — numpy 2.4.6 vs mistral-common's `<2.4` pin).
 - `selective_scan_cuda.py` — import-only stub to drop into `site-packages`.
@@ -34,8 +41,8 @@ mkdir -p $OLALA_HOME && cd $OLALA_HOME
 uv venv venv --python /usr/bin/python3.12
 
 # pinned sources
-git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout f0fbc70ca
-git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 5a05349
+git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 397db68f9
+git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 52f97ac
 git clone --filter=blob:none https://github.com/shawntan/scattermoe.git scattermoe && git -C scattermoe checkout 47b5e15
 git clone --filter=blob:none https://github.com/jgcb00/olala.git olala
 
