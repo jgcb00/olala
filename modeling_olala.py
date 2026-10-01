@@ -134,6 +134,13 @@ try:
 except ImportError:
     linear_cross_entropy = None
 
+# Fused Triton kernels for the Differential-TPA training path (see tpa_fused.py).
+# OLALA_TPA_FUSED=0 forces the eager path back.
+try:
+    from .tpa_fused import tpa_kv, tpa_q, tpa_diff_combine
+except ImportError:
+    tpa_kv = tpa_q = tpa_diff_combine = None
+
 # attention backend selection
 ATTN_IMPL = "eager"
 try:
@@ -1243,6 +1250,10 @@ class OlalaDifferentialTensorProductAttentionV2(nn.Module):
         ve=None,
         **kwargs,
     ):
+        if self._use_fused(hidden_states, position_ids, cache_params, ve):
+            q, k, v = self._fused_qkv(hidden_states, position_ids)
+            return self._attend(q, k, v, hidden_states, cu_seqlens, max_seqlen, fused=True, **kwargs)
+
         b, q_len, _ = hidden_states.shape
         use_precomputed_states = (cache_params is not None and q_len == 1)
 
@@ -1389,6 +1400,60 @@ class OlalaDifferentialTensorProductAttentionV2(nn.Module):
         if cache_params is not None:
             key_states, value_states = cache_params.update(key_states, value_states, self.layer_idx)
 
+        return self._attend(query_states, key_states, value_states, hidden_states, cu_seqlens, max_seqlen, **kwargs)
+
+    def _use_fused(self, hidden_states, position_ids, cache_params, ve) -> bool:
+        """The fused Triton path covers training and full-sequence scoring for
+        this layer's production config; anything else (KV cache, value
+        embeddings, conv, RoPE, XSA, no flash-attn) takes the eager path."""
+        return (
+            tpa_kv is not None
+            and hidden_states.is_cuda
+            and cache_params is None
+            and ve is None
+            and self.config.token_shift_attn
+            and not self.config.token_conv1d_attn
+            and self.qk_norm
+            and self.rotary_emb is None
+            and not self.config.xsa
+            and ATTN_IMPL in ("fa2", "fa3")
+            and (position_ids is not None or not self.scalable_softmax)
+            and os.environ.get("OLALA_TPA_FUSED", "1") != "0"
+        )
+
+    def _fused_qkv(self, hidden_states, position_ids):
+        """Q/K/V ready for flash-attn, from three fused kernels: the rank-R K/V
+        products with token shift (+ K norm), and the Q norm with the
+        scalable-softmax scale. Same math as the eager path above."""
+        b, q_len, _ = hidden_states.shape
+        H, R, D = self.num_key_value_heads, self.rank, self.head_dim
+        pos = None
+        if position_ids is not None:
+            pos = position_ids.expand(b, q_len).reshape(-1).contiguous()
+
+        def eps_of(norm):
+            return norm.rms.eps if norm.rms.eps is not None else torch.finfo(hidden_states.dtype).eps
+
+        kn, qn = self.k_norm.norm, self.q_norm.norm
+        key_states = tpa_kv(
+            self.W_A_k(hidden_states).view(b, q_len, H, R), self.W_B_k(hidden_states).view(b, q_len, R, D),
+            self.shift_proj_k(hidden_states), pos, kn.weight,
+            row_len=q_len, eps=eps_of(kn), zero_centered=kn.zero_centered_gamma,
+        )
+        value_states = tpa_kv(
+            self.W_A_v(hidden_states).view(b, q_len, H, R), self.W_B_v(hidden_states).view(b, q_len, R, D),
+            self.shift_proj_v(hidden_states), pos, None, row_len=q_len,
+        )
+        query_states = tpa_q(
+            self.c_q(hidden_states).view(b, q_len, self.num_attention_heads, D), qn.weight,
+            pos=pos, scaler=self.softmax_scaler if self.scalable_softmax else None,
+            wsize=self.config.slw_wsize, eps=eps_of(qn), zero_centered=qn.zero_centered_gamma,
+        )
+        return query_states, key_states, value_states
+
+    def _attend(self, query_states, key_states, value_states, hidden_states, cu_seqlens, max_seqlen, fused=False, **kwargs):
+        wsize = self.config.slw_wsize
+
         # attention computation.
         # Row boundaries from a packed batch need the varlen path just as
         # document boundaries do; eager/flex have none, which is why
@@ -1438,6 +1503,9 @@ class OlalaDifferentialTensorProductAttentionV2(nn.Module):
             v_self = F.normalize(v_self.float(), dim=-1, eps=1e-6).to(attn_output.dtype)
             attn_output = attn_output - (attn_output * v_self).sum(dim=-1, keepdim=True) * v_self
 
+        if fused:
+            return tpa_diff_combine(attn_output, self.lambda_proj(hidden_states), self.snr), None, None
+
         attn_output = attn_output.reshape(attn_output.size(0), attn_output.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.head_dim) # (B, L, num_noise_heads, snr+1, D)
         attn_sig = attn_output[:, :, :, :self.snr, :] # (B, L, num_noise_heads, snr, D)
         attn_noi = attn_output[:, :, :, self.snr:self.snr+1, :] # (B, L, num_noise_heads, 1, D)
@@ -1445,9 +1513,6 @@ class OlalaDifferentialTensorProductAttentionV2(nn.Module):
         lambda_val = self.lambda_proj(hidden_states).unsqueeze(-1).unsqueeze(-1) # (B, L, H, 1, 1)
         attn_output = attn_sig - torch.sigmoid(lambda_val) * attn_noi # (B, L, num_noise_heads, snr, D) (each noise head is broadcasted/repeated SNR times)
         attn_output = attn_output.view(attn_output.size(0), attn_output.size(1), -1, self.head_dim) # (B, L, num_signal_heads, D)
-
-        #if cache_params is not None:
-        #    cache_params.trim(self.layer_idx)
 
         return attn_output, None, None
 

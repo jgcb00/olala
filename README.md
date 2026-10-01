@@ -89,6 +89,7 @@ because it moved:
 | path | role |
 |---|---|
 | `modeling_olala.py`, `configuration_olala.py` | the model. One copy; the converter exports it |
+| `tpa_fused.py`, `test_tpa_fused.py` | fused Triton fwd+bwd kernels for the Differential-TPA layer (exported with the model; `OLALA_TPA_FUSED=0` disables) and their parity test |
 | `convert/` | Megatron ⇄ HF, GPU or CPU, both directions |
 | `scripts/apply_olala_training_fixes.sh` | the six third-party patches |
 | `install/` | frozen requirements, the `selective_scan_cuda` stub, launcher example |
