@@ -38,17 +38,18 @@ PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python3.12}
 
 # ---- Pinned sources (SHAs, not branches: a moving branch changes the build) --
 VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/jgcb00/vllm.git}
-VLLM_FORK_REF=${VLLM_FORK_REF:-f0fbc70ca4a46748cd6c79c91b59fd03bf312ce3}   # branch dragon-v0.26 (Olala rename, no artificial_seq_len resets)
+VLLM_FORK_REF=${VLLM_FORK_REF:-17480704da897c0106d76ab3fd0410241ef2ecf5}   # branch dragon-v0.26 (vendored Mamba-3 kernels, fp32 SSM state, CUDA decode step, TPA factor cache)
 VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # upstream base for the precompiled wheel
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
 
-# Mamba-3 must come from the jgcb00/mamba fork, NOT upstream state-spaces/mamba:
-# the vLLM fork's decode path calls mamba3_step_fn(state_batch_indices=...),
-# the pool-indexed step kernel that only the fork carries. With upstream the
-# env builds fine and every CPU check passes, then `vllm serve` dies at
-# cudagraph profiling with "unexpected keyword argument 'state_batch_indices'"
-# (seen 2026-09-10). 761b409 is the ref jgcb00/olala's install/README.md pins.
+# Mamba-3 must come from the jgcb00/mamba fork, NOT upstream state-spaces/mamba,
+# for the HF/training model (verl). The vLLM fork no longer imports mamba_ssm
+# (since 4530aeeb7 it vendors its Mamba-3 inference kernels), but before that
+# its decode path needed the fork's pool-indexed mamba3_step_fn: with upstream
+# `vllm serve` died at cudagraph profiling with "unexpected keyword argument
+# 'state_batch_indices'" (seen 2026-09-10). 761b409 is the ref jgcb00/olala's
+# install/README.md pins.
 # MAMBA_SKIP_CUDA_BUILD: the mamba3 kernels are TileLang/CuTe/Triton; the
 # selective_scan CUDA extension is replaced by the stub in step 5.
 MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@761b4090e180aaffdca5e0123c684f58e8ac5ee2}

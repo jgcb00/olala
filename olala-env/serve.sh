@@ -71,6 +71,9 @@ export VLLM_USE_FLASHINFER_SAMPLER=${VLLM_USE_FLASHINFER_SAMPLER:-0}
 
 export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$OLALA_HOME/.cache/vllm}
 export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-$OLALA_HOME/.cache/tilelang}
+# JIT build dir of the fork's CUDA decode kernels (Mamba-3 step, TPA factor
+# attention); nvcc from CUDA_HOME above, built once on first serve.
+export OLALA_TPA_BUILD_DIR=${OLALA_TPA_BUILD_DIR:-$OLALA_HOME/.cache/olala_tpa_factor}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 
 # ---- Two checks that cost nothing and save an afternoon --------------------
@@ -141,7 +144,7 @@ exec "$VENV/bin/vllm" serve "$CKPT" \
 #
 #   OLALA_WINDOW_DECODE_RESET    gone. artificial_seq_len was a pretraining-only
 #                   Megatron optimisation, never a property of the model; the
-#                   jgcb00/vllm pin (f0fbc70ca+) and jgcb00/olala main carry no
+#                   jgcb00/vllm pin (f0fbc70ca+, now 17480704d) and jgcb00/olala main carry no
 #                   SSM window resets at all, so there is nothing to gate.
 #
 # no --chat-template   vLLM reads chat_template.jinja from the checkpoint, and
