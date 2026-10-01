@@ -144,7 +144,7 @@ exec "$VENV/bin/vllm" serve "$CKPT" \
 #
 #   OLALA_WINDOW_DECODE_RESET    gone. artificial_seq_len was a pretraining-only
 #                   Megatron optimisation, never a property of the model; the
-#                   jgcb00/vllm pin (f0fbc70ca+, now 1ca050dd5) and jgcb00/olala main carry no
+#                   jgcb00/vllm pin (f0fbc70ca+, now 397db68f9) and jgcb00/olala main carry no
 #                   SSM window resets at all, so there is nothing to gate.
 #
 # no --chat-template   vLLM reads chat_template.jinja from the checkpoint, and

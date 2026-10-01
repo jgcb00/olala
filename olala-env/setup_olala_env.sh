@@ -40,8 +40,9 @@ PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python3.12}
 VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/jgcb00/vllm.git}
 # branch dragon-v0.26: Olala rename, no artificial_seq_len resets, TPA-factorized
 # KV cache + CUDA Mamba-3 step (sm_90 JIT kernels), fp32 SSM state by default,
-# Mamba-3 kernels vendored (vLLM no longer imports mamba_ssm).
-VLLM_FORK_REF=${VLLM_FORK_REF:-1ca050dd527176204d0531fcb58ad1ce6fe1da94}
+# Mamba-3 kernels vendored (vLLM no longer imports mamba_ssm), JIT sources
+# shipped in the wheel (17480704d), loud OLALA SLOW PATH banners on fallback.
+VLLM_FORK_REF=${VLLM_FORK_REF:-397db68f9b1e8114fd8bb8acef80ebb955a0abc0}
 VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # upstream base for the precompiled wheel
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
