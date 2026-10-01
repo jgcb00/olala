@@ -27,7 +27,7 @@ for k in sorted(set(tn) & set(tr)):
 print(f"bit-identical: {same} | value mismatch: {value_mismatch} | shape mismatch: {shape_mismatch}")
 for w in worst[:8]: print("  ", w)
 def h(p): return hashlib.md5(open(p, "rb").read()).hexdigest()[:12]
-for f in ("modeling_olala.py", "configuration_olala.py", "tokenizer.json", "chat_template.jinja", "tokenizer_config.json"):
+for f in ("modeling_olala.py", "configuration_olala.py", "tpa_fused.py", "tokenizer.json", "chat_template.jinja", "tokenizer_config.json"):
     try: print(f"{f:26} new {h(f'{new}/{f}')}  ref {h(f'{ref}/{f}')}  {'same' if h(f'{new}/{f}')==h(f'{ref}/{f}') else 'DIFFERENT'}")
     except FileNotFoundError as e: print(f"{f:26} missing: {e.filename}")
 print("MAIN modeling:", h(sys.argv[3]) if len(sys.argv) > 3 else "-")
