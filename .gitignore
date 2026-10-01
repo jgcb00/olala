@@ -8,6 +8,8 @@ __pycache__/
 !scripts/*.sh
 !install/*.example.sh
 !convert/convert.sh
+# olala-env ships its builder, serve script, docker helpers and test recipes.
+!olala-env/**/*.sh
 
 # Machine-specific; convert/.env.example is the versioned template.
 convert/.env
