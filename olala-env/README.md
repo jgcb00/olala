@@ -56,8 +56,8 @@ since the snapshot pins `nvidia-nccl-cu12`. See
 | source | pin |
 |---|---|
 | [jgcb00/olala](https://github.com/jgcb00/olala) `main` | `09b6709` — model code, converter, parsers, renderer, the applier |
-| [jgcb00/vllm](https://github.com/jgcb00/vllm) `dragon-v0.26` | `17480704d` — the fork that knows `OlalaForCausalLM`; vendors its Mamba-3 kernels, fp32 SSM state by default |
-| [jgcb00/mamba](https://github.com/jgcb00/mamba) | `761b409` — the fork with the Mamba-3 training kernels (HF model / verl; vLLM no longer imports it) |
+| [jgcb00/vllm](https://github.com/jgcb00/vllm) `dragon-v0.26` | `397db68f9` — the fork that knows `OlalaForCausalLM`; TPA-factorized KV + CUDA Mamba-3 step (sm_90 JIT kernels, need a CUDA toolkit of torch's major), fp32 SSM state, Mamba-3 kernels vendored |
+| [jgcb00/mamba](https://github.com/jgcb00/mamba) | `761b409` — the trainer's Mamba-3 kernels (vLLM vendors its own and no longer imports `mamba_ssm`) |
 | scattermoe | `47b5e15` |
 | renderers | `d4707862` |
 | trl | `1.12.0` — not in the snapshot, which was frozen for verl |
