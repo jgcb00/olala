@@ -52,9 +52,15 @@ VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
 # kernels (vllm/model_executor/layers/mamba/ops/mamba3/) and never imports
 # mamba_ssm -- step 4 checks that. Keep the jgcb00/mamba fork pin (the ref
 # jgcb00/olala's install/README.md pins); kernel fixes now land in both repos.
+# 52f97ac = jgcb00/mamba `dev` (the fork's default branch): two-level scan on by
+# default where it pays (M3_SCAN_BLOCK=0 restores the stock scan), sequence-
+# parallel angle_dt, no host syncs in the varlen backward, int64 offsets in
+# grouped_head_reduction (S > ~87k), single saved_tensors unpack.
 # MAMBA_SKIP_CUDA_BUILD: the mamba3 kernels are TileLang/CuTe/Triton; the
-# selective_scan CUDA extension is replaced by the stub in step 5.
-MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@761b4090e180aaffdca5e0123c684f58e8ac5ee2}
+# selective_scan CUDA extension is replaced by the stub in step 5. (Since
+# upstream #977, in dev, a CUDA build is opt-in via MAMBA_KEEP_CUDA_BUILD, so
+# the variable is now a no-op kept for older pins.)
+MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@52f97ac947eead2293452e0157506418c6e55bd5}
 
 SCATTERMOE_URL=${SCATTERMOE_URL:-https://github.com/shawntan/scattermoe.git}
 SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
