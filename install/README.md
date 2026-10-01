@@ -42,7 +42,7 @@ uv venv venv --python /usr/bin/python3.12
 
 # pinned sources
 git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 397db68f9
-git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 9ddd93d
+git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 347a46c
 git clone --filter=blob:none https://github.com/shawntan/scattermoe.git scattermoe && git -C scattermoe checkout 47b5e15
 git clone --filter=blob:none https://github.com/jgcb00/olala.git olala
 
