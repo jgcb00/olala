@@ -46,6 +46,12 @@ class OlalaToolParser(ToolParser):
     # "required"/named are best-effort, not guaranteed.
     supports_required_and_named = False
 
+    # Streaming tool_choice="none" with tools would otherwise get raw
+    # delta_text from vLLM (markers and tools-channel XML included). With this
+    # set, vLLM (jgcb00/vllm dragon-v0.26) still runs extract_tool_calls_streaming
+    # for the clean content and drops the calls. Older vLLM ignores it.
+    parse_content_when_tool_choice_none = True
+
     # Matches a fully closed <call>...</call> block.
     COMPLETE_CALL_RE = re.compile(
         r'<call\s+id="([^"]*)">'
@@ -317,11 +323,18 @@ class OlalaToolParser(ToolParser):
         # emits clean content. Confined to requests that declared no tools, so
         # it cannot override a caller who deliberately disabled tool calling:
         # the model has no tool list to call from, and the tools channel stays
-        # empty. A request that sends tools AND sets tool_choice="none"
-        # explicitly still takes the bypass and still leaks; that shape needs
-        # the fix in vLLM itself.
-        if not getattr(request, "tools", None) and (
-            getattr(request, "tool_choice", None) == "none"
+        # empty. A request that sends tools AND sets tool_choice="none" is
+        # handled by vLLM (parse_content_when_tool_choice_none below).
+        #
+        # Streaming only: non-streaming output is already clean (the reasoning
+        # parser cuts the answer at <|channel_end|>), and serving.py has no
+        # branch for "no tools but tool_choice=auto", so promoting a
+        # non-streaming request logs "cannot determine if tools should be
+        # extracted" on every request.
+        if (
+            getattr(request, "stream", False)
+            and not getattr(request, "tools", None)
+            and getattr(request, "tool_choice", None) == "none"
         ):
             request.tool_choice = "auto"
         return request
