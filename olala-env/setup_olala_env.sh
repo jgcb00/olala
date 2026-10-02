@@ -42,7 +42,7 @@ VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/jgcb00/vllm.git}
 # KV cache + CUDA Mamba-3 step (sm_90 JIT kernels), fp32 SSM state by default,
 # Mamba-3 kernels vendored (vLLM no longer imports mamba_ssm), JIT sources
 # shipped in the wheel (17480704d), loud OLALA SLOW PATH banners on fallback.
-VLLM_FORK_REF=${VLLM_FORK_REF:-397db68f9b1e8114fd8bb8acef80ebb955a0abc0}
+VLLM_FORK_REF=${VLLM_FORK_REF:-65d56cf318bf7e9e918a92576d3564e2a7888f66}
 VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # upstream base for the precompiled wheel
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
@@ -52,16 +52,17 @@ VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}
 # kernels (vllm/model_executor/layers/mamba/ops/mamba3/) and never imports
 # mamba_ssm -- step 4 checks that. Keep the jgcb00/mamba fork pin (the ref
 # jgcb00/olala's install/README.md pins); kernel fixes now land in both repos.
-# 347a46c = jgcb00/mamba `dev` (the fork's default branch): two-level scan on by
+# 039a089 = jgcb00/mamba `dev` (the fork's default branch): two-level scan on by
 # default where it pays (M3_SCAN_BLOCK=0 restores the stock scan), sequence-
 # parallel angle_dt, no host syncs in the varlen backward, int64 offsets in
 # grouped_head_reduction (S > ~87k), single saved_tensors unpack, and an opt-in
-# hand-written CUDA backward, bwd_fwd + bwd_bwd (M3_CUDA_BWD=1, sm_90, JIT-built on first use).
+# hand-written CUDA backward, bwd_fwd + bwd_bwd (M3_CUDA_BWD=1, sm_90, JIT-built on first use),
+# and an accurate rotary phase (exact tanh in angle_dt, decode phase wrapped mod 2*pi).
 # MAMBA_SKIP_CUDA_BUILD: the mamba3 kernels are TileLang/CuTe/Triton; the
 # selective_scan CUDA extension is replaced by the stub in step 5. (Since
 # upstream #977, in dev, a CUDA build is opt-in via MAMBA_KEEP_CUDA_BUILD, so
 # the variable is now a no-op kept for older pins.)
-MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@347a46c6a9ee522487fa6d2090f8994e829d5220}
+MAMBA_PIP=${MAMBA_PIP:-git+https://github.com/jgcb00/mamba@039a08975e34ad4107124c9c98502702affdb51b}
 
 SCATTERMOE_URL=${SCATTERMOE_URL:-https://github.com/shawntan/scattermoe.git}
 SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
