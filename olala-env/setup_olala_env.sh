@@ -71,7 +71,7 @@ SCATTERMOE_REF=${SCATTERMOE_REF:-47b5e15}
 # checkpoint's modeling_olala.py comes from, so the pin decides what a
 # re-export ships.
 OLALA_URL=${OLALA_URL:-https://github.com/jgcb00/olala.git}
-OLALA_REF=${OLALA_REF:-09b67092cd2410bb006ed3831ac87311e05ef89c}   # main (Olala rename merged, artificial_seq_len dropped)
+OLALA_REF=${OLALA_REF:-61be47cbf05dafc492a95424651a5b41767eb411}   # main (PR #18: current parsers; older refs serve the stale tool parser)
 
 # Build from a LOCAL olala checkout instead of cloning (handy while iterating:
 # no push needed, and no risk of testing a stale remote). Empty = clone OLALA_URL.
