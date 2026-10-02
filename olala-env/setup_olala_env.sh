@@ -42,7 +42,7 @@ VLLM_FORK_URL=${VLLM_FORK_URL:-https://github.com/jgcb00/vllm.git}
 # KV cache + CUDA Mamba-3 step (sm_90 JIT kernels), fp32 SSM state by default,
 # Mamba-3 kernels vendored (vLLM no longer imports mamba_ssm), JIT sources
 # shipped in the wheel (17480704d), loud OLALA SLOW PATH banners on fallback.
-VLLM_FORK_REF=${VLLM_FORK_REF:-65d56cf318bf7e9e918a92576d3564e2a7888f66}
+VLLM_FORK_REF=${VLLM_FORK_REF:-2ea0708f56497115360404ded88e094e98f9412f}
 VLLM_FORK_BASE=${VLLM_FORK_BASE:-568afb3a13806beb53bb2e6bd518269357b237c0}  # upstream base for the precompiled wheel
 VLLM_BASE_VERSION=${VLLM_BASE_VERSION:-0.26.0}                              # stamped via VLLM_VERSION_OVERRIDE
 VLLM_WHEEL_VARIANT=${VLLM_WHEEL_VARIANT:-cu129}

@@ -109,6 +109,7 @@ def offline() -> None:
         r = types.SimpleNamespace()
         r.tools = list(tools) if tools else None
         r.tool_choice = tool_choice
+        r.stream = False
         r.include_reasoning = True  # parse_delta reads this; parse() does not
         return r
 
@@ -162,7 +163,9 @@ def offline() -> None:
         p = Combined(tok, request.tools)
         # The server calls adjust_request() before generation; so must this, or
         # the test misses what the parsers do to tool_choice / special tokens.
-        request = p.adjust_request(copy.copy(request))
+        request = copy.copy(request)
+        request.stream = True
+        request = p.adjust_request(request)
         ids = tok.encode(raw, add_special_tokens=False)
         reasoning, content, calls = "", "", {}
         for k, tid in enumerate(ids):
@@ -187,8 +190,7 @@ def offline() -> None:
                     slot["arguments"] += tc.function.arguments
         return reasoning, (content or None), calls
 
-    def case(label, raw, *, calls, content, request=None, cmp_stream=True,
-             stream_content_gap=False):
+    def case(label, raw, *, calls, content, request=None, cmp_stream=True):
         request = request or req()
         print(f"\n--- {label}")
         reasoning, got_content, tool_calls = nonstream(raw, request)
@@ -206,25 +208,16 @@ def offline() -> None:
         # Full streaming chain: content must match non-streaming and stay clean.
         _, st_content, st_calls = stream_full(raw, request)
         leaked = [m for m in MARKERS if st_content and m in st_content]
-        if stream_content_gap:
-            # Known vLLM gap: DelegatingParser._extract_tool_calls_streaming()
-            # answers tool_choice="none" with DeltaMessage(content=delta_text)
-            # without consulting either parser, so raw channel markers reach the
-            # client. OlalaToolParser.adjust_request() covers the common form of
-            # this (a request that sends no tools, which defaults to "none"),
-            # but a request that sends tools AND sets "none" explicitly means it,
-            # so the parser must leave it alone -- that shape needs the vLLM-side
-            # fix. Reported, not asserted, so the gap stays visible.
-            print(f"   KNOWN-GAP  stream: content == {st_content!r} (vLLM bypasses the parsers)")
-        else:
-            check(st_content == content, f"stream: content == {content!r}, got {st_content!r}")
-            check(not leaked, f"stream: no markers in content (found {leaked})")
-            if cmp_stream:
-                # Skipped alongside stream(): a truncated call streams as an
-                # open call (name known, args still arriving) where
-                # non-streaming reports none, so the counts legitimately differ.
-                check(len(st_calls) == calls,
-                      f"stream: {calls} call(s) via parse_delta, got {len(st_calls)}")
+        check(st_content == content, f"stream: content == {content!r}, got {st_content!r}")
+        check(not leaked, f"stream: no markers in content (found {leaked})")
+        if request is not None and request.tool_choice == "none":
+            check(not st_calls, f"stream: tool_choice='none' streams no calls, got {len(st_calls)}")
+        if cmp_stream:
+            # Skipped alongside stream(): a truncated call streams as an
+            # open call (name known, args still arriving) where
+            # non-streaming reports none, so the counts legitimately differ.
+            check(len(st_calls) == calls,
+                  f"stream: {calls} call(s) via parse_delta, got {len(st_calls)}")
 
         if not cmp_stream:
             return
@@ -319,7 +312,6 @@ def offline() -> None:
         content="Sure.",
         request=req(tool_choice="none"),
         cmp_stream=False,
-        stream_content_gap=True,
     )
 
     case(
@@ -342,6 +334,20 @@ def offline() -> None:
         request=req(tools=None, tool_choice="none"),
         cmp_stream=False,
     )
+
+    # The no-tools promotion to "auto" is streaming-only: promoting a
+    # non-streaming request makes serving.py log "cannot determine if tools
+    # should be extracted" on every request, and its output is already clean.
+    print("\n--- adjust_request promotes tool_choice for streaming requests only")
+    for stream_flag, want in ((True, "auto"), (False, "none")):
+        r = req(tools=None, tool_choice="none")
+        r.stream = stream_flag
+        got = Combined(tok, None).adjust_request(r).tool_choice
+        check(got == want, f"stream={stream_flag}: tool_choice -> {want!r}, got {got!r}")
+    r = req(tool_choice="none")
+    r.stream = True
+    got = Combined(tok, r.tools).adjust_request(r).tool_choice
+    check(got == "none", f"tools + 'none' stays 'none', got {got!r}")
 
     # tool_choice="required" must route through auto parsing (this format is XML,
     # so vLLM's JSON-based required/named handling cannot read it).
