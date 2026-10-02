@@ -56,8 +56,8 @@ since the snapshot pins `nvidia-nccl-cu12`. See
 | source | pin |
 |---|---|
 | [jgcb00/olala](https://github.com/jgcb00/olala) `main` | `09b6709` — model code, converter, parsers, renderer, the applier |
-| [jgcb00/vllm](https://github.com/jgcb00/vllm) `dragon-v0.26` | `397db68f9` — the fork that knows `OlalaForCausalLM`; TPA-factorized KV + CUDA Mamba-3 step (sm_90 JIT kernels, need a CUDA toolkit of torch's major), fp32 SSM state, Mamba-3 kernels vendored |
-| [jgcb00/mamba](https://github.com/jgcb00/mamba) | `347a46c` (`dev`) — the trainer's Mamba-3 kernels: two-level scan on by default, sequence-parallel `angle_dt`, no host syncs in the varlen backward, int64 `grouped_head_reduction` offsets, opt-in CUDA backward, `bwd_fwd` + `bwd_bwd` (`M3_CUDA_BWD=1`) (vLLM vendors its own and no longer imports `mamba_ssm`) |
+| [jgcb00/vllm](https://github.com/jgcb00/vllm) `dragon-v0.26` | `65d56cf31` — the fork that knows `OlalaForCausalLM`; TPA-factorized KV + CUDA Mamba-3 step (sm_90 JIT kernels, need a CUDA toolkit of torch's major), fp32 SSM state, Mamba-3 kernels vendored, prefill/decode rotary phase agree to <5e-5 rad at 16k |
+| [jgcb00/mamba](https://github.com/jgcb00/mamba) | `039a089` (`dev`) — the trainer's Mamba-3 kernels: two-level scan on by default, sequence-parallel `angle_dt`, no host syncs in the varlen backward, int64 `grouped_head_reduction` offsets, opt-in CUDA backward, `bwd_fwd` + `bwd_bwd` (`M3_CUDA_BWD=1`), accurate rotary phase (exact tanh) (vLLM vendors its own and no longer imports `mamba_ssm`) |
 | scattermoe | `47b5e15` |
 | renderers | `d4707862` |
 | trl | `1.12.0` — not in the snapshot, which was frozen for verl |

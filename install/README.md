@@ -15,7 +15,7 @@ Files here:
   (everything except vllm, which is installed from the `jgcb00/vllm` fork,
   branch `dragon-v0.26` — the only vLLM that registers `OlalaForCausalLM`,
   the architecture the converter now writes into `config.json`. Pin
-  397db68f9 (f0fbc70ca or later at the very least: earlier tips reproduced
+  65d56cf31 (f0fbc70ca or later at the very least: earlier tips reproduced
   pretraining's artificial_seq_len SSM resets, which the model must not have;
   17480704d+ also ships the JIT CUDA sources of the decode kernels in the
   wheel, which a non-editable install needs). Since 4530aeeb7 the fork
@@ -41,8 +41,8 @@ mkdir -p $OLALA_HOME && cd $OLALA_HOME
 uv venv venv --python /usr/bin/python3.12
 
 # pinned sources
-git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 397db68f9
-git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 347a46c
+git clone --filter=blob:none https://github.com/jgcb00/vllm.git  vllm-fork  && git -C vllm-fork  checkout 65d56cf31
+git clone --filter=blob:none https://github.com/jgcb00/mamba.git mamba      && git -C mamba      checkout 039a089
 git clone --filter=blob:none https://github.com/shawntan/scattermoe.git scattermoe && git -C scattermoe checkout 47b5e15
 git clone --filter=blob:none https://github.com/jgcb00/olala.git olala
 
